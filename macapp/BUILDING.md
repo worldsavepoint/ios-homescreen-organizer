@@ -269,6 +269,8 @@ The check initializes the server, compares its version with the project version,
 
 ## Corresponding Source
 
+The AVIF source pins use the official libaom 3.14.1 and libwebp 1.6.0 release archives. The libyuv snapshot comes from the fixed-commit GitHub mirror; `macapp/sources/native.json` records its primary Chromium repository and commit separately from that download URL. The pinned libaom and libyuv inputs retain the upstream file contents and executable bits, and the libwebp release supplies the matching C sources, build inputs and grants with its generated Autotools files.
+
 The app includes `THIRD-PARTY-NOTICES.txt` and `ThirdPartyLicenses/` in its Resources directory. The MCPB includes the same explanatory notice at its root and copies each signed notice tree to `licenses/<architecture>/ThirdPartyLicenses/`. The original source remains available under Jonathan Kats’s MIT license.
 
 Each native build writes `build/<architecture>/source-inputs.zip` alongside the build directory’s app. CI uploads these sanitized inputs in separate architecture artifacts. A canonical source inventory is included in the signed app and copied into the MCPB. After both native builds and MCPB assembly, create the single matching source download with the exact clean checkout:
