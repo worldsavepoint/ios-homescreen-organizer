@@ -696,6 +696,7 @@ def fake_engine(tmp_path):
     path = tmp_path / 'engine "引用" folder\'s'
     path.write_text(f"#!{sys.executable}\n" + '''import json, os, signal, sys, time
 from pathlib import Path
+time.sleep(float(os.environ.get("TEST_ENGINE_STARTUP_DELAY", "0")))
 Path(os.environ["TEST_PID"]).write_text(str(os.getpid()))
 with open(os.environ["TEST_LOG"], "a") as log:
     log.write(json.dumps({"args": sys.argv[1:], "data": os.environ["HOMESCREEN_DATA"], "readonly": os.environ.get("HOMESCREEN_READ_ONLY"), "apply": os.environ.get("HOMESCREEN_ALLOW_APPLY")}) + "\\n")
@@ -739,7 +740,8 @@ time.sleep(60)
                                            ("capability", "protocolError"), ("info", "protocolError")])
 def test_service_check_protocol_isolated_environment_and_cleanup(native_mcp_binary, sandbox, tmp_path, behavior, code):
     engine = fake_engine(tmp_path)
-    sandbox.update(TEST_ENGINE=behavior, TEST_TIMEOUT="1.5", HOMESCREEN_READ_ONLY="0", HOMESCREEN_ALLOW_APPLY="1",
+    timeout = "1.5" if behavior == "timeout" else "5"
+    sandbox.update(TEST_ENGINE=behavior, TEST_TIMEOUT=timeout, HOMESCREEN_READ_ONLY="0", HOMESCREEN_ALLOW_APPLY="1",
                    HOMESCREEN_DATA=str(tmp_path / "user-data"))
     result = execute(native_mcp_binary, sandbox, "check", "codex", engine)
     assert result["code"] == code
@@ -756,6 +758,13 @@ def test_service_check_protocol_isolated_environment_and_cleanup(native_mcp_bina
     if behavior == "success":
         assert [message["method"] for message in log[1:]] == ["initialize", "notifications/initialized", "tools/list"]
         assert result["tools"] == ["diff", "move", "read_phone", "show_layout"]
+
+
+@pytest.mark.parametrize("behavior", ["closed", "version"])
+def test_service_check_semantics_allow_delayed_engine_startup(native_mcp_binary, sandbox, tmp_path, behavior):
+    sandbox["TEST_ENGINE_STARTUP_DELAY"] = "1.8"
+    test_service_check_protocol_isolated_environment_and_cleanup(
+        native_mcp_binary, sandbox, tmp_path, behavior, "protocolError")
 
 
 def test_service_check_launch_failure(native_mcp_binary, sandbox, tmp_path):
