@@ -115,6 +115,29 @@ def test_explicit_read_recovers_corrupt_saved_draft_without_losing_failed_recove
     assert Session(source, tmp_path).require().token() == session.require().token()
 
 
+@pytest.mark.parametrize(("key", "value", "valid"), [
+    ("DeviceName", b"bad", False), ("ProductType", 42, False), ("ProductVersion", ["17"], False),
+    ("extra", b"bad", False), ("DeviceName", "Synthetic", True), ("ProductType", None, True),
+])
+def test_stored_device_info_keeps_the_json_recovery_view_available(tmp_path, key, value, valid):
+    source = MemorySource()
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    body = plistlib.loads(session.draft_path.read_bytes())
+    body["info"][key] = value
+    damaged = plistlib.dumps(body, fmt=plistlib.FMT_BINARY)
+    session.draft_path.write_bytes(damaged)
+    session = Session(source, tmp_path)
+    viewed = ui.view(session)
+    assert ui.JSONResponse(viewed).status_code == 200
+    assert viewed["loaded"] is valid
+    assert session.draft_path.read_bytes() == damaged
+    if not valid:
+        assert "read" in viewed["draft_error"]
+        asyncio.run(session.read())
+        assert ui.JSONResponse(ui.view(session)).status_code == 200 and session.require()
+
+
 def test_hidden_clip_uses_latest_explicit_observation_after_reopen(tmp_path):
     path = tmp_path / "fixture.plist"
     clip = {"displayIdentifier": "clip", "displayName": "First", "webClipURL": "/one"}

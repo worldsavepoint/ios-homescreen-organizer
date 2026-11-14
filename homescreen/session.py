@@ -639,6 +639,10 @@ class Session:
                 if self._draft_key not in (None, "unselected", device):
                     raise ValueError("draft belongs to another device")
                 self.device_id = device  # Recovery can still list this device's backups.
+                if any(info.get(key) is not None and not isinstance(info[key], str)
+                       for key in ("DeviceName", "ProductType", "ProductVersion")):
+                    raise ValueError("invalid draft device info")
+                json.dumps(info, allow_nan=False)
                 placement = _MISSING
                 if "source_placement" in blob:
                     if not isinstance(blob["source_placement"], dict):
