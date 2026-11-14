@@ -772,3 +772,65 @@ def test_tagged_zip_and_dmg_are_rejected_without_path_marker(tmp_path):
     tagged.mkdir()
     with pytest.raises(ValueError, match="metadata"):
         verify_image(image, archive, tagged)
+
+
+@pytest.mark.parametrize("reason", [b"Resource temporarily unavailable", "无法识别映像", b"", None])
+def test_image_attach_failure_preserves_process_error_and_reports_stderr(tmp_path, monkeypatch, reason):
+    from macapp.release import verify_image
+    calls = []
+    error = subprocess.CalledProcessError(1, ["hdiutil", "attach"], output=b"native stdout", stderr=reason)
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["hdiutil", "attach"]:
+            raise error
+        assert args[:3] == ["ditto", "-x", "-k"]
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        verify_image(tmp_path / "release.dmg", tmp_path / "release.zip", tmp_path)
+    assert caught.value is error and not isinstance(error, ValueError)
+    assert error.returncode == 1 and error.output == b"native stdout" and error.stderr == reason
+    notes = " ".join(getattr(error, "__notes__", []))
+    assert notes.startswith("Image attachment failed. hdiutil stderr: ")
+    expected = reason.decode() if isinstance(reason, bytes) else reason
+    assert (expected or "<empty>") in notes
+    assert sum(args[:2] == ["hdiutil", "attach"] for args in calls) == 1
+
+
+def test_image_error_note_redacts_untrusted_paths_controls_and_excess_output(tmp_path, monkeypatch):
+    from macapp.release import verify_image
+    image = tmp_path / "private-source-marker/release.dmg"
+    reason = (f"hdiutil: {image}: failed\n/unknown/account secret/with spaces\n"
+              "\x1b[31m::error::injected\x1b[0m\r\x00\u202e" + "x" * 9000).encode()
+    error = subprocess.CalledProcessError(1, ["hdiutil", "attach"], stderr=reason)
+    def run(args, **kwargs):
+        if args[:2] == ["hdiutil", "attach"]:
+            raise error
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        verify_image(image, tmp_path / "release.zip", tmp_path)
+    note, = error.__notes__
+    assert str(tmp_path) not in note and "private-source-marker" not in note
+    assert "/unknown" not in note and "account secret" not in note
+    assert all(character.isprintable() for character in note) and len(note) <= 560
+    assert error.stderr == reason
+
+
+def test_release_cli_prints_only_safe_privacy_attribution(tmp_path, monkeypatch, capsys):
+    import check_package_paths
+    import macapp.release as module
+    from test_package_privacy import native_zip
+    path = native_zip(tmp_path, extra=bytes(tmp_path / "private-marker"))
+    def package(*args):
+        check_package_paths.check_archive(path, [tmp_path / "private-marker"])
+    monkeypatch.setattr(module, "package", package)
+    monkeypatch.setattr(sys, "argv", ["release.py", "package", "--arch", "arm64"])
+    with pytest.raises(SystemExit) as caught:
+        module.main()
+    assert caught.value.code == 1
+    output = capsys.readouterr().err
+    assert "Package location: ZIP!Screen Organizer.app/Contents/MacOS/HomeScreenOrganizer" in output
+    assert "path rule: recorded-build-root" in output
+    assert "Release payload contains a local build path" in output
+    assert str(tmp_path) not in output and "private-marker" not in output

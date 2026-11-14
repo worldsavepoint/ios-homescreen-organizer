@@ -98,11 +98,34 @@ def check_archive(path, blocked, *, engine=ENGINE):
 
     roots = {os.fsencode(form) for root in blocked for form in (root.absolute(), root.resolve())}
     # A directory can be followed by a slash, a string terminator or a token delimiter.
-    patterns = [re.compile(re.escape(root) + rb"(?=$|[/\x00-\x20\x7f\"':,;=])") for root in roots]
+    home = {os.fsencode(form) for form in (Path.home().absolute(), Path.home().resolve())}
+    interpreter = {os.fsencode(form) for root in (Path(sys.prefix), Path(sys.base_prefix))
+                   for form in (root.absolute(), root.resolve())}
+    runner = {os.fsencode(form) for root in ([Path(os.environ["RUNNER_TEMP"])] if os.environ.get("RUNNER_TEMP") else [])
+              for form in (root.absolute(), root.resolve())}
+    patterns = [("builder-home" if root in home else "runner-temp" if root in runner else
+                 "interpreter-prefix" if root in interpreter else "recorded-build-root",
+                 re.compile(re.escape(root) + rb"(?=$|[/\x00-\x20\x7f\"':,;=])"))
+                for root in sorted(roots, key=lambda root: (-len(root), root))]
+    location = "archive bytes"
+    deferred = []
 
-    def check(data):
-        if any(pattern.search(data) for pattern in patterns):
-            raise BuildPathError("Release payload contains a local build path")
+    def public_member(name):
+        if (not re.fullmatch(r"[A-Za-z0-9_./ +!()-]{1,512}", name) or name.startswith("/")
+                or any(part == ".." for part in name.split("/"))
+                or any(root in name.encode() for root in roots)):
+            return "<redacted member>"
+        return name
+
+    def check(data, *, defer=False):
+        for rule, pattern in patterns:
+            if pattern.search(data):
+                error = BuildPathError("Release payload contains a local build path")
+                error.add_note("Package location: " + location + "; path rule: " + rule)
+                if defer:
+                    deferred.append(error)
+                    return
+                raise error
 
     def check_value(value):
         if isinstance(value, str):
@@ -124,7 +147,9 @@ def check_archive(path, blocked, *, engine=ENGINE):
                 check_value(item)
 
     def check_payload(name, data, regular):
-        check(data)
+        stream = io.BytesIO(data)
+        nested_zip = regular and (name.lower().endswith((".zip", ".whl")) or zipfile.is_zipfile(stream))
+        check(data, defer=regular and (name == engine or nested_zip))
         if regular:
             lower = name.lower()
             if lower.endswith(".pyc") and data.startswith(MAGIC_NUMBER) and any(root in data for root in roots):
@@ -141,10 +166,9 @@ def check_archive(path, blocked, *, engine=ENGINE):
                     check_value(plistlib.loads(result.stdout))
                 else:
                     check_value(plistlib.loads(data, fmt=plistlib.FMT_XML))
-            stream = io.BytesIO(data)
-            if name.lower().endswith((".zip", ".whl")) or zipfile.is_zipfile(stream):
+            if nested_zip:
                 with zipfile.ZipFile(stream) as nested:
-                    check_zip(nested)
+                    check_zip(nested, location)
 
     def check_extra(extra):
         check(extra)
@@ -155,9 +179,12 @@ def check_archive(path, blocked, *, engine=ENGINE):
             check(extra[offset:offset + size])
             offset += size
 
-    def check_zip(archive):
+    def check_zip(archive, context="ZIP"):
+        nonlocal location
+        location = context + " metadata"
         check(archive.comment)
         for info in archive.infolist():
+            location = context + "!" + public_member(info.filename)
             check(info.filename.encode())
             check(info.comment)
             check_extra(info.extra)
@@ -171,20 +198,27 @@ def check_archive(path, blocked, *, engine=ENGINE):
             check_payload(info.filename, archive.read(info), kind in (0, stat.S_IFREG) and not info.is_dir())
 
     def check_engine(path):
+        nonlocal location
         module = sysconfig._get_sysconfigdata_name()
         found = False
         package = CArchiveReader(str(path))
+        location = "ZIP!" + public_member(engine) + "!CArchive metadata"
         for option in package.options:
             check(option.encode())
         for name, entry in package.toc.items():
+            location = "ZIP!" + public_member(engine) + "!CArchive!" + public_member(name)
             check(name.encode())
             data = package.extract(name)
-            check_payload(name, data, entry[-1] in ("x", "Z"))
+            if entry[-1] == "z":
+                check(data, defer=True)
+            else:
+                check_payload(name, data, entry[-1] in ("x", "Z"))
             if entry[-1] in ("s", "m", "M") and any(root in data for root in roots):
                 check_value(marshal.loads(data))
             if entry[-1] == "z":
                 pyz = package.open_embedded_archive(name)
                 for member in pyz.toc:
+                    location = "ZIP!" + public_member(engine) + "!PYZ!" + public_member(member)
                     check(member.encode())
                     raw = pyz.extract(member, raw=True) or b""
                     check(raw)
@@ -198,7 +232,7 @@ def check_archive(path, blocked, *, engine=ENGINE):
             raise ValueError
 
     try:
-        check(path.read_bytes())
+        check(path.read_bytes(), defer=True)
         with zipfile.ZipFile(path) as archive, tempfile.TemporaryDirectory() as folder:
             check_zip_metadata(archive)
             check_zip(archive)
@@ -206,10 +240,14 @@ def check_archive(path, blocked, *, engine=ENGINE):
                 executable = Path(folder) / "engine"
                 executable.write_bytes(archive.read(engine))
                 check_engine(executable)
+        if deferred:
+            raise deferred[0]
     except (BuildPathError, PackageMetadataError):
         raise
     except (Exception, SystemExit):
         # Archive readers include their input filename in parsing errors.
+        if deferred:
+            raise deferred[0]
         raise ValueError("Could not verify the native release archive") from None
 
 
@@ -248,6 +286,9 @@ def main():
     except (OSError, TypeError, KeyError, json.JSONDecodeError):
         parser.exit(1, "Could not verify native build locations\n")
     except ValueError as error:
+        if isinstance(error, BuildPathError):
+            for note in getattr(error, "__notes__", ()):
+                print(note, file=sys.stderr)
         parser.exit(1, f"{error}\n")
     print("Native archive build-path check passed")
 

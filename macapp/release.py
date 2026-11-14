@@ -193,13 +193,37 @@ def app_contents(app):
     return entries
 
 
+def image_error_note(error, image, mount):
+    stderr = error.stderr
+    detail = stderr[:4096].decode(errors="replace") if isinstance(stderr, bytes) else (stderr or "")[:4096]
+    roots = [image, image.parent, mount, mount.parent, ROOT, Path.home(), Path(tempfile.gettempdir())]
+    forms = set()
+    for root in roots:
+        forms.add(str(root.absolute()))
+        try:
+            forms.add(str(root.resolve()))
+        except (OSError, ValueError, RuntimeError):
+            pass
+    for form in sorted(forms, key=len, reverse=True):
+        detail = detail.replace(form, "<native-build>")
+    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
+    detail = "".join(character if character.isprintable() or character in "\r\n\t" else "?" for character in detail)
+    detail = re.sub(r"(?m)(?:[A-Za-z]:[\\/]|(?<![A-Za-z0-9])/) ?[^\r\n]*", "<path>", detail)
+    detail = " ".join(detail.split())[:512]
+    return "Image attachment failed. hdiutil stderr: " + (detail or "<empty>")
+
+
 def verify_image(image, archive, folder):
     unpacked = folder / "unpacked"
     mount = folder / "mount"
     mount.mkdir()
     subprocess.run(["ditto", "-x", "-k", archive, unpacked], check=True, capture_output=True)
-    subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, image],
-                   check=True, capture_output=True)
+    try:
+        subprocess.run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, image],
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        error.add_note(image_error_note(error, image, mount))
+        raise
     try:
         app = "Screen Organizer.app"
         if {entry.name for entry in mount.iterdir()} != {app, "Applications"}:
@@ -414,6 +438,10 @@ def main():
             parser.exit(1, "Could not prepare the verified native release\n")
         parser.exit(1, f"{exc}\n")
     except (ValueError, KeyError) as exc:
+        from check_package_paths import BuildPathError
+        if isinstance(exc, BuildPathError):
+            for note in getattr(exc, "__notes__", ()):
+                print(note, file=sys.stderr)
         parser.exit(1, f"{exc}\n")
 
 

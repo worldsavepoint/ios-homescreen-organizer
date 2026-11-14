@@ -341,3 +341,62 @@ def test_complete_local_app_allows_an_unrelated_prefix_sibling(tmp_path):
     with zipfile.ZipFile(path) as archive:
         archive.extractall(tmp_path / "local-output")
     check_app(tmp_path / "local-output/Screen Organizer.app", [root])
+
+
+@pytest.mark.parametrize("kind", ["native", "nested", "pyz", "comment", "raw", "raw-invalid"])
+def test_privacy_failure_reports_safe_location_without_losing_raw_findings(tmp_path, kind):
+    from macapp.check_package_paths import BuildPathError, check_archive
+    root = tmp_path / "private-marker"
+    path = native_zip(tmp_path, config=str(root) if kind == "pyz" else "clean",
+                      nested=bytes(root) if kind == "nested" else b"clean")
+    if kind == "native":
+        with zipfile.ZipFile(path, "a", zipfile.ZIP_STORED) as archive:
+            archive.writestr("Screen Organizer.app/Contents/Resources/engine/_internal/component.so", bytes(root))
+    elif kind == "comment":
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.comment = bytes(root)
+    elif kind == "raw":
+        path.write_bytes(path.read_bytes() + bytes(root))
+    elif kind == "raw-invalid":
+        path.write_bytes(b"invalid archive " + bytes(root))
+    with pytest.raises(BuildPathError) as caught:
+        check_archive(path, [root])
+    assert str(caught.value) == "Release payload contains a local build path"
+    note, = caught.value.__notes__
+    expected = {"native": "ZIP!Screen Organizer.app/Contents/Resources/engine/_internal/component.so",
+                "nested": "base_library.zip!fixture", "pyz": "PYZ!" + sysconfig._get_sysconfigdata_name(),
+                "comment": "ZIP metadata", "raw": "archive bytes", "raw-invalid": "archive bytes"}[kind]
+    assert expected in note and "path rule: recorded-build-root" in note
+    assert "private-marker" not in note and str(tmp_path) not in note
+
+
+@pytest.mark.parametrize("name", ["/private-marker/absolute", "Screen Organizer.app/../escape",
+                                 "Screen Organizer.app/control\n::error::value", "Screen Organizer.app/秘密"])
+def test_privacy_attribution_redacts_untrusted_member_labels(tmp_path, name):
+    from macapp.check_package_paths import BuildPathError, check_archive
+    root = tmp_path / "private-marker"
+    path = native_zip(tmp_path)
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr(name, bytes(root))
+    with pytest.raises(BuildPathError) as caught:
+        check_archive(path, [root])
+    note, = caught.value.__notes__
+    assert "<redacted member>" in note
+    assert name not in note and "::error::" not in note and "private-marker" not in note
+    assert all(character.isprintable() for character in note)
+
+
+@pytest.mark.parametrize("rule", ["builder-home", "runner-temp", "interpreter-prefix"])
+def test_privacy_attribution_names_the_rule_without_its_prefix(tmp_path, monkeypatch, rule):
+    from macapp.check_package_paths import BuildPathError, check_archive
+    root = tmp_path / "private-marker"
+    if rule == "builder-home":
+        monkeypatch.setenv("HOME", str(root))
+    elif rule == "runner-temp":
+        monkeypatch.setenv("RUNNER_TEMP", str(root))
+    else:
+        monkeypatch.setattr(sys, "prefix", str(root))
+    with pytest.raises(BuildPathError) as caught:
+        check_archive(native_zip(tmp_path, extra=bytes(root)), [root])
+    note, = caught.value.__notes__
+    assert "path rule: " + rule in note and str(root) not in note
