@@ -179,6 +179,7 @@ def _locations(lay: Layout, wanted: set[str], physical: set[str],
                page_cells: dict[int, _PageCells]) -> dict[str, tuple[str, dict[str, Any]]]:
     """Only materialize endpoints needed by Review or the visible usage list."""
     found = {}
+    labels = lay.folder_labels()
 
     def walk(nodes: list[Node], kind: str, where: str, page: int = 0, name: str = "") -> None:
         cells = page_cells.get(page, {}) if kind == "page" else {}
@@ -199,7 +200,7 @@ def _locations(lay: Layout, wanted: set[str], physical: set[str],
                 found[node.id] = (raw, descriptor)
             if node.kind == "folder":
                 for p, children in enumerate(node.children, 1):
-                    walk(children, "folder", f"folder {node.name!r} p{p}", p, node.name)
+                    walk(children, "folder", f"folder {labels[node.id]!r} p{p}", p, labels[node.id])
 
     walk(lay.dock, "dock", "dock")
     for page, nodes in enumerate(lay.pages, 1):
@@ -322,7 +323,7 @@ def view() -> dict[str, Any]:
 def _ops() -> dict[str, Callable[..., Callable[[Layout], Any]]]:
     return {
         "move": lambda id, target, index=None, before=None: lambda lay: lay.move(id, target, index, before),
-        "move_many": lambda ids, target, before=None: lambda lay: [lay.move(i, target, None, before) for i in ids],
+        "move_many": lambda ids, target, before=None: lambda lay: lay.move_many(ids, target, before),
         "swap": lambda a, b: lambda lay: lay.swap(a, b),
         "pin": lambda id, page, cell: lambda lay: lay.pin(id, page, cell),
         "unpin": lambda ids: lambda lay: [lay.unpin(i) for i in ids],

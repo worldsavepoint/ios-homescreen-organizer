@@ -366,7 +366,7 @@ def placed_structure(state: list[Any], library: list[Any] | None,
     for page in lay.pages:
         pos, _ = lay.place(page)
         order = sorted(page, key=lambda n: (pos[n.id][0], pos[n.id][1]) if n.id in pos else (99, 0))
-        pages.append([[node_structure(n), pos.get(n.id, (0, 0))[:2]] for n in order])
+        pages.append([[node_structure(n), pos[n.id][:2] if n.id in pos else None] for n in order])
     return json.dumps({"dock": [node_structure(n) for n in lay.dock], "pages": pages,
                        "library": lay.library_structure()},
                       default=list)

@@ -706,11 +706,7 @@ async function moveIds(ids, target, before) {
 
 async function dropOnto(item, ids, ctx) {
   if (item.kind === "folder") {
-    const pages = item.pages || [[]];
-    const last = pages.length;
-    const room = G().folder - (pages[last - 1] || []).length;
-    const target = `${item.id}:${room >= ids.length ? last : last + 1}`;
-    if (await op("move_many", { ids, target }, () => sel.clear())) toast(() => t("editor.movedInto", {name: item.name}));
+    if (await op("move_many", { ids, target: item.id }, () => sel.clear())) toast(() => t("editor.movedInto", {name: item.name}));
     return;
   }
   const name = await promptText(() => t("editor.newFolder"), () => t("editor.folderWith", {name: item.name, count: number(ids.length)}), t("editor.folderDefault"));

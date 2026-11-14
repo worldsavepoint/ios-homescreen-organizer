@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import plistlib
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -348,6 +349,8 @@ class Layout:
         self.nodes[nid] = node
         if kind == "folder":
             node.children = [[self._wrap(r, nid) for r in page] for page in raw.get("iconLists", [])]
+            if where == "dock" and not node.children:
+                node.children = [[]]
         return node
 
     @staticmethod
@@ -451,7 +454,10 @@ class Layout:
         if target.startswith("folder:"):
             parts = target.split(":")
             fid = ":".join(parts[:2])
-            page = int(parts[2]) if len(parts) > 2 else 1
+            if len(parts) > 3 or (len(parts) == 3 and (
+                    not parts[2].isascii() or not parts[2].isdecimal() or int(parts[2]) < 1)):
+                raise LayoutError("folder pages are numbered from 1")
+            page = int(parts[2]) if len(parts) == 3 else 1
             folder = self.get(fid)
             if folder.kind != "folder":
                 raise LayoutError(f"{fid} is not a folder")
@@ -460,18 +466,24 @@ class Layout:
             return folder.children[page - 1]
         raise LayoutError(f"bad target {target!r}; use dock, library, bank, page:N or folder:<id>[:N]")
 
+    @staticmethod
+    def _destination_problem(kind: str, target: str) -> str | None:
+        if target.startswith("folder:") and kind in ("folder", "widget"):
+            return f"a {kind} can't go inside a folder"
+        if target == "dock" and kind == "widget":
+            return "widgets can't go in the dock"
+        if target == "library" and kind not in ("app", "webclip"):
+            return f"only apps go in the App Library, not a {kind}"
+        return None
+
     def move(self, node_id: str, target: str, index: int | None = None, before: str | None = None) -> None:
         """Move an item to target, at index (0-based, default end) or just before item `before`."""
         node = self.get(node_id)
         if before == node_id:
             return
+        if problem := self._destination_problem(node.kind, target):
+            raise LayoutError(problem)
         dest = self._target(target)
-        if target.startswith("folder:") and node.kind in ("folder", "widget"):
-            raise LayoutError(f"a {node.kind} can't go inside a folder")
-        if target == "dock" and node.kind == "widget":
-            raise LayoutError("widgets can't go in the dock")
-        if target == "library" and node.kind not in ("app", "webclip"):
-            raise LayoutError(f"only apps go in the App Library, not a {node.kind}")
         src, i = self.locate(node_id)
         src.pop(i)
         self.pins.pop(node_id, None)
@@ -482,6 +494,19 @@ class Layout:
             index = ids.index(before)
         dest.insert(len(dest) if index is None else max(0, min(index, len(dest))), node)
 
+    def move_many(self, ids: list[str], target: str, before: str | None = None) -> None:
+        """Append a selection dropped on a folder across available subpages."""
+        if target.startswith("folder:") and target.count(":") == 1 and before is None:
+            folder = self.get(target)
+            for item in ids:
+                page = len(folder.children) or 1
+                if folder.children and len(folder.children[-1]) >= self.grid.folder:
+                    page += 1
+                self.move(item, f"{target}:{page}")
+        else:
+            for item in ids:
+                self.move(item, target, before=before)
+
     def swap(self, a: str, b: str) -> None:
         """Trade the places of two items."""
         na, nb = self.get(a), self.get(b)
@@ -489,12 +514,15 @@ class Layout:
         cb, ib = self.locate(b)
         for node, dest in ((na, cb), (nb, ca)):
             in_folder = any(dest is p for f in self.nodes.values() if f.kind == "folder" for p in f.children)
-            if in_folder and node.kind in ("folder", "widget"):
-                raise LayoutError(f"a {node.kind} can't go inside a folder")
-            if dest is self.dock and node.kind == "widget":
-                raise LayoutError("widgets can't go in the dock")
-            if self.library is not None and dest is self.library and node.kind not in ("app", "webclip"):
-                raise LayoutError(f"only apps go in the App Library, not a {node.kind}")
+            target = ""
+            if in_folder:
+                target = "folder:"
+            elif dest is self.dock:
+                target = "dock"
+            elif dest is self.library:
+                target = "library"
+            if problem := self._destination_problem(node.kind, target):
+                raise LayoutError(problem)
         ca[ia], cb[ib] = nb, na
         pa, pb = self.pins.pop(a, None), self.pins.pop(b, None)
         if pa is not None:
@@ -527,6 +555,8 @@ class Layout:
         for n in list(items):
             for leaf in ([c for p in n.children for c in p] if n.kind == "folder" else [n]):
                 self.library.append(leaf)
+            if n.kind == "folder":
+                del self.nodes[n.id]
         self.pages.pop(page - 1)
 
     def dissolve_folder(self, folder_id: str) -> None:
@@ -537,10 +567,13 @@ class Layout:
         c, i = self.locate(folder_id)
         c[i:i + 1] = [x for p in folder.children for x in p]
         self.pins.pop(folder_id, None)
+        del self.nodes[folder_id]
 
     def create_folder(self, name: str, item_ids: list[str], target: str, index: int | None = None) -> str:
         if not item_ids:
             raise LayoutError("a folder needs at least one item")
+        if problem := self._destination_problem("folder", target):
+            raise LayoutError(problem)
         fid = self._new_id("folder:")
         while fid in self.nodes:
             fid = self._new_id("folder:")
@@ -549,8 +582,7 @@ class Layout:
         self.nodes[fid] = folder
         dest = self._target(target)
         dest.insert(len(dest) if index is None else index, folder)
-        for item in item_ids:
-            self.move(item, fid)
+        self.move_many(item_ids, fid)
         return fid
 
     def rename_folder(self, folder_id: str, name: str) -> None:
@@ -585,9 +617,10 @@ class Layout:
             problems.append(f"left out (iOS would put these back randomly): {missing}")
         if extra:
             problems.append(f"not top-level items (inside a folder, or unknown): {extra}")
-        bad_lib = [i for i in library if self.nodes[i].kind not in ("app", "webclip")]
-        if bad_lib:
-            problems.append(f"only apps go in the App Library: {bad_lib}")
+        for target, ids in (("dock", dock), ("library", library)):
+            for nid in ids:
+                if nid in self.nodes and (problem := self._destination_problem(self.nodes[nid].kind, target)):
+                    problems.append(problem)
         if problems:
             raise LayoutError("; ".join(problems))
         old_page = {n.id: k for k, p in enumerate(self.pages) for n in p}
@@ -607,6 +640,10 @@ class Layout:
         for f in empties:
             c, i = self.locate(f.id)
             c.pop(i)
+            del self.nodes[f.id]
+        for n in self.dock:
+            if n.kind == "folder" and not n.children:
+                n.children = [[]]
         self.pages = [p for p in self.pages if p]
         self.tidy_pins()
 
@@ -619,6 +656,10 @@ class Layout:
             errs.append(f"the App Bank still holds {len(self.bank)} item(s); place them or send them to the App Library")
         if len(self.dock) > self.dock_slots:
             errs.append(f"dock has {len(self.dock)} items (max {self.dock_slots})")
+        for target, nodes in (("dock", self.dock), ("library", self.library or [])):
+            for node in nodes:
+                if problem := self._destination_problem(node.kind, target):
+                    errs.append(problem)
         # a page shaped as the device laid it out (same widgets in the same places, the same number
         # of single-cell items) is trusted: iPad widget sizes don't map onto the icon grid the way
         # iPhone ones do, so a widget page can look "too full" here
@@ -630,8 +671,10 @@ class Layout:
             used = sum(n.slots for n in page)
             if used > self.page_slots and shape(page) not in as_read:
                 errs.append(f"page {i} needs {used} slots (max {self.page_slots})")
-            elif any(n.id in self.pins for n in page):
+            elif any(n.id in self.pins for n in page) or (
+                    shape(page) not in as_read and any(n.kind == "widget" for n in page)):
                 errs += [f"page {i}: {p}" for p in self.place(page)[1]]
+        for page in [self.dock, *self.pages]:
             for n in page:
                 if n.kind == "folder":
                     for j, fp in enumerate(n.children, 1):
@@ -677,21 +720,27 @@ class Layout:
                 "pages": len(self.pages),
                 "app_library_only": None if self.library is None else len(self.library),
                 "apps": sum(1 for n in self.nodes.values() if n.kind in ("app", "webclip") and n.id in placed),
-                "folders": sum(1 for p in self.pages for n in p if n.kind == "folder"),
+                "folders": sum(1 for p in [self.dock, *self.pages] for n in p if n.kind == "folder"),
                 "widgets": sum(1 for p in self.pages for n in p if n.kind == "widget"),
             },
         }
 
+    def folder_labels(self) -> dict[str, str]:
+        folders = [n for n in self.nodes.values() if n.kind == "folder"]
+        counts = Counter(n.name for n in folders)
+        return {n.id: f"{n.name} [{n.id}]" if counts[n.name] > 1 else n.name for n in folders}
+
     def positions(self) -> dict[str, str]:
         """id -> human-readable position, for diffs."""
         pos: dict[str, str] = {}
+        labels = self.folder_labels()
 
         def walk(nodes: list[Node], where: str) -> None:
             for i, n in enumerate(nodes, 1):
                 pos[n.id] = f"{where} #{i}"
                 if n.kind == "folder":
                     for j, page in enumerate(n.children, 1):
-                        walk(page, f"folder {n.name!r} p{j}")
+                        walk(page, f"folder {labels[n.id]!r} p{j}")
 
         walk(self.dock, "dock")
         for i, page in enumerate(self.pages, 1):
@@ -703,7 +752,7 @@ class Layout:
         return pos
 
     def containers(self) -> dict[str, list[str]]:
-        """container name -> ordered ids in it."""
+        """Stable container identity -> ordered item IDs."""
         out: dict[str, list[str]] = {}
 
         def walk(nodes: list[Node], where: str) -> None:
@@ -711,7 +760,7 @@ class Layout:
             for n in nodes:
                 if n.kind == "folder":
                     for j, page in enumerate(n.children, 1):
-                        walk(page, f"folder {n.name!r} p{j}")
+                        walk(page, f"{n.id}:{j}")
 
         walk(self.dock, "dock")
         for i, page in enumerate(self.pages, 1):
