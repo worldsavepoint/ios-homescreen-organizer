@@ -112,6 +112,15 @@ def _stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _pending_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    record = {}
+    for key, value in pairs:
+        if key in record:
+            raise LayoutError("pending write evidence has repeated fields; its original record was retained")
+        record[key] = value
+    return record
+
+
 def _pack(state: list[Any], library: list[Any] | None, pins: list[dict[str, int]] | None = None) -> bytes:
     blob: dict[str, Any] = {"state": state}
     if library is not None:
@@ -1027,7 +1036,7 @@ class Session:
         legacy_pending = None
         if self._pending_path.exists():
             pending_bytes = self._pending_path.read_bytes()
-            pending = json.loads(pending_bytes)
+            pending = json.loads(pending_bytes, object_pairs_hook=_pending_object)
             clear_pending = pending.get("device_id") == device_id
             name = pending.get("backup")
             if (set(pending) == {"device_id", "backup", "status"}

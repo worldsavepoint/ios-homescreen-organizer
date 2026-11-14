@@ -525,6 +525,28 @@ def test_invalid_legacy_marker_keeps_its_gate(tmp_path, backup):
         asyncio.run(session.apply(session.require().token()))
 
 
+@pytest.mark.parametrize("members", [
+    '"device_id":"fixture-phone","backup":"other/previous.plist","backup":"previous.plist"',
+    '"device_id":"fixture-phone","backup":"previous.plist","backup":"other/previous.plist"',
+    '"device_id":"foreign","device_id":"fixture-phone","backup":"previous.plist"',
+    '"device_id":"fixture-phone","device_id":"foreign","backup":"previous.plist"',
+])
+def test_duplicate_legacy_marker_members_retain_the_raw_write_gate(tmp_path, members):
+    path = tmp_path / "phone.plist"
+    path.write_bytes(plistlib.dumps([[], [app("a", "A")]]))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    marker = ("{" + members + ',"status":"pending"}\n').encode()
+    session._pending_path.write_bytes(marker)
+    draft = session.draft_path.read_bytes()
+    with pytest.raises(LayoutError, match="repeated|duplicate"):
+        asyncio.run(session.read())
+    assert session._pending_path.read_bytes() == marker and session.draft_path.read_bytes() == draft
+    assert not list((session.dir / "unresolved-writes").glob("*.json"))
+    with pytest.raises(LayoutError, match="pending|unknown"):
+        asyncio.run(session.apply(session.require().token()))
+
+
 def test_failed_marker_retirement_unpublishes_new_legacy_evidence(tmp_path, monkeypatch):
     path = tmp_path / "fixture.plist"
     path.write_bytes(plistlib.dumps([[], [app("a", "A")]]))
