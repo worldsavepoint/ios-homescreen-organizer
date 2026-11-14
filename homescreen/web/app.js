@@ -85,7 +85,8 @@ function errorKey(message, code) {
   if (message === "list-format writes cannot send fixed positions; use ordinary page order") return "error.writeFormat";
   if (/^device grid changed(?: during read; no layout was loaded|; explicitly read the intended device again)$/.test(message) ||
       /^saved draft (?:identity is invalid|pin identity is unavailable|pin identity is ambiguous); call read again$/.test(message)) return "error.readAgain";
-  if (/^iOS 16 /.test(message)) return "error.ios16";
+  if (message === "iOS 16 does not preserve fixed icon positions; use ordinary page order") return "error.ios16";
+  if (message === "iOS 16 keeps these widgets ahead of folders; place the folder after the widgets") return "error.ios16FolderWidgets";
   if (/^ambiguous pin identifier on a (layout|backup) page$/.test(message)) return "error.ambiguousIdentifier";
   if (/ has no (known wire identifier|wire identifier for its pin); use ordinary page order$/.test(message)) return "error.pinIdentifier";
   if (message === "pinned backup has no saved grid dimensions; use a backup with grid provenance" ||
@@ -118,6 +119,7 @@ function showError(error) {
 let V = null;               // current view from the server
 const sel = new Set();      // selected item ids
 let openFolder = null;      // id of the folder shown in the drawer
+let folderOpener = null;
 let drag = null;            // { ids }
 let query = "";
 
@@ -216,37 +218,49 @@ function findItem(id) {
 }
 
 let pendingDiagnostic = null;
-function toast(message, kind = "", detail, backup) {
-  localized($("#operation-status"), message);
+function toast(message, kind = "", detail, backup, result) {
+  const latest = {message, kind, detail, backup, result};
+  localized($("#operation-status"), result ? () => [typeof message === "function" ? message() : message,
+    backup && t("editor.backupSaved", {backup}), t("editor.verificationScope")].filter(Boolean).join(" ") : message);
   const box = $("#toast");
   const previous = box.querySelector("details");
   if (!box.hidden && previous && (pendingDiagnostic || previous.open || box.contains(document.activeElement))) {
-    if (detail) pendingDiagnostic = {message, kind, detail, backup};
+    if (detail || result) {
+      pendingDiagnostic = latest;
+      box.querySelector(".pending-result")?.remove();
+      const pending = el("section", "pending-result");
+      pending.appendChild(localizedEl("p", null, message));
+      if (result) resultDetails(pending, result);
+      box.appendChild(pending);
+    }
     return;
   }
-  displayToast({message, kind, detail, backup});
+  displayToast(latest);
 }
 
-function displayToast({message, kind, detail, backup}) {
+function displayToast({message, kind, detail, backup, result}) {
   const box = $("#toast");
   pendingDiagnostic = null;
   clearTimeout(toast.timer);
   box.replaceChildren(localizedEl("span", null, message));
   box.className = "toast " + kind;
   box.hidden = false;
-  if (detail) {
+  if (detail || backup || result) {
     const close = localizedEl("button", null, () => t("common.close"));
     close.onclick = () => {
       if (pendingDiagnostic) {
         displayToast(pendingDiagnostic);
-        box.querySelector("summary").focus();
+        (box.querySelector("summary") || box.querySelector("button")).focus();
       } else {
         box.hidden = true;
         $("#read").focus();
       }
     };
-    box.appendChild(diagnostic(detail));
-    if (backup) box.appendChild(localizedEl("p", null, () => t("editor.backupSaved", {backup})));
+    if (result) resultDetails(box, result);
+    else {
+      if (detail) box.appendChild(diagnostic(detail));
+      if (backup) box.appendChild(localizedEl("p", null, () => t("editor.backupSaved", {backup})));
+    }
     box.appendChild(close);
   } else {
     toast.timer = setTimeout(() => { box.hidden = true; }, kind === "error" ? 6000 : 3000);
@@ -295,8 +309,15 @@ function modal({ title, body, actions, initialInput }) {
 
 async function promptText(title, label, value) {
   const wrap = el("div");
-  if (label) wrap.appendChild(localizedEl("p", null, label));
+  if (label) {
+    const description = localizedEl("p", null, label);
+    description.id = "folder-prompt-description";
+    wrap.appendChild(description);
+  }
   const inp = el("input");
+  inp.setAttribute("data-i18n-aria-label", "editor.folderName");
+  inp.setAttribute("aria-label", t("editor.folderName"));
+  if (label) inp.setAttribute("aria-describedby", "folder-prompt-description");
   inp.value = value || "";
   wrap.appendChild(inp);
   return modal({ title, body: wrap, initialInput: inp, actions: [
@@ -315,18 +336,29 @@ const confirmBox = (title, text, label = () => t("common.continue"), danger = fa
 function clearEditor() {
   sel.clear();
   openFolder = null;
+  folderOpener = null;
   drag = null;
 }
 
 function setView(v) {
-  if (!v.loaded || (V && V.device_id !== v.device_id)) clearEditor();
+  const deviceChanged = V && V.device_id !== v.device_id;
+  if (!v.loaded || deviceChanged) clearEditor();
   V = v;
   for (const id of [...sel]) if (!findItem(id)) sel.delete(id);
   if (openFolder && !findItem(openFolder)) openFolder = null;
-  render();
+  render(!deviceChanged);
 }
 
-function render() {
+function focusItem(item) {
+  if (!item) return;
+  const node = [...document.querySelectorAll("[data-focus-context]")].find(node =>
+    node.dataset.id === item.id && node.dataset.focusContext === item.context);
+  node?.focus({preventScroll: true});
+}
+
+function render(restoreFocus = true) {
+  const active = restoreFocus && document.activeElement?.closest("[data-focus-context]");
+  const focused = active && {id: active.dataset.id, context: active.dataset.focusContext};
   $("#read-only-notice").hidden = !(V && V.read_only);
   const loaded = V && V.loaded;
   $("#empty").hidden = loaded;
@@ -357,6 +389,25 @@ function render() {
   renderDrawer();
   renderSelection();
   renderFooter();
+  focusItem(focused);
+}
+
+function itemControl(node, item, context) {
+  node.setAttribute("role", "button");
+  node.setAttribute("tabindex", "0");
+  node.setAttribute("aria-label", item.name);
+  node.setAttribute("aria-pressed", String(sel.has(item.id)));
+  node.dataset.focusContext = context;
+  if (item.kind === "folder") {
+    node.setAttribute("aria-expanded", String(openFolder === item.id));
+    node.setAttribute("aria-controls", "drawer");
+  }
+  node.addEventListener("click", event => onItemClick(event, item, context));
+  node.addEventListener("keydown", event => {
+    if (!["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    if (!event.repeat) onItemClick(event, item, context);
+  });
 }
 
 function renderItem(item, container) {
@@ -386,7 +437,7 @@ function renderItem(item, container) {
   if (sel.has(item.id)) node.classList.add("selected");
   if (moved) node.classList.add("moved");
   if (query) node.classList.add(matches(item) || (item.pages || []).flat().some(matches) ? "hit" : "dim");
-  node.addEventListener("click", (e) => onItemClick(e, item));
+  itemControl(node, item, container.target);
   wireDrag(node, item, container);
   return node;
 }
@@ -461,13 +512,14 @@ function renderPages() {
     wireZone(card, ctx);
     box.appendChild(card);
   });
-  const add = localizedEl("div", "add-page", () => t("editor.newPage"));
+  const add = localizedEl("button", "add-page", () => t("editor.newPage"));
   add.title = t("editor.newPageHint");
   add.onclick = () => op("insert_page", { page: V.pages.length + 1 });
   wireZone(add, { target: `page:${V.pages.length + 1}`, newPage: true });
   box.appendChild(add);
 }
 
+let libraryCollator, libraryLocale;
 function renderLibrary() {
   const list = $("#library");
   list.replaceChildren();
@@ -476,7 +528,11 @@ function renderLibrary() {
     list.appendChild(localizedEl("div", "lib-empty", () => t("editor.libraryUnavailable")));
     return;
   }
-  const items = V.library.filter(matches).sort((a, b) => a.name.localeCompare(b.name, ScreenOrganizerI18n.locale));
+  if (libraryLocale !== ScreenOrganizerI18n.locale) {
+    libraryLocale = ScreenOrganizerI18n.locale;
+    libraryCollator = new Intl.Collator(libraryLocale);
+  }
+  const items = V.library.filter(matches).sort((a, b) => libraryCollator.compare(a.name, b.name));
   $("#lib-count").textContent = query ? t("editor.matchCount", {count: number(items.length), total: number(V.library.length)}) : number(V.library.length);
   if (!items.length) list.appendChild(el("div", "lib-empty", query ? t("editor.noMatches") : t("editor.libraryEmpty")));
   for (const it of items) {
@@ -486,7 +542,7 @@ function renderLibrary() {
     row.title = it.id;
     if (sel.has(it.id)) row.classList.add("selected");
     if (V.moved.includes(it.id)) row.classList.add("moved");
-    row.addEventListener("click", (e) => onItemClick(e, it));
+    itemControl(row, it, "library");
     wireDrag(row, it, { target: "library" });
     list.appendChild(row);
   }
@@ -598,7 +654,7 @@ function renderFooter() {
 
 // ---- interaction -----------------------------------------------------------------------
 
-function onItemClick(e, item) {
+function onItemClick(e, item, context) {
   e.stopPropagation();
   if (e.metaKey || e.ctrlKey || e.shiftKey) {
     if (item.kind === "widget") return;
@@ -606,7 +662,14 @@ function onItemClick(e, item) {
     render();
     return;
   }
-  if (item.kind === "folder") { openFolder = item.id; sel.clear(); render(); return; }
+  if (item.kind === "folder") {
+    openFolder = item.id;
+    folderOpener = {id: item.id, context};
+    sel.clear();
+    render();
+    $("#folder-name").focus();
+    return;
+  }
   if (sel.size && !sel.has(item.id)) sel.clear();
   sel.has(item.id) ? sel.delete(item.id) : sel.add(item.id);
   render();
@@ -756,10 +819,22 @@ const deviceLabel = () => {
 };
 
 async function loadDevices() {
-  try { DEV = await api("/api/devices"); } catch (_) { return; }
-  $("#device-btn").classList.toggle("static", !DEV.switching);
+  try { DEV = await api("/api/devices"); }
+  catch (_) { DEV = {...DEV, discovery: "unavailable", devices: DEV.devices.map(d => ({...d, connected: null}))}; }
+  const button = $("#device-btn"), available = DEV.switching || DEV.discovery === "unavailable";
+  button.classList.toggle("static", !available);
+  button.disabled = !available;
+  if (available) {
+    button.removeAttribute("tabindex");
+    button.setAttribute("aria-haspopup", "true");
+    button.setAttribute("data-i18n-title", "editor.chooseDevice");
+    button.title = t("editor.chooseDevice");
+  } else {
+    button.setAttribute("tabindex", "-1");
+    for (const attribute of ["aria-haspopup", "data-i18n-title", "title"]) button.removeAttribute(attribute);
+  }
   // nothing chosen yet: take the first connected device
-  if (DEV.switching && !DEV.devices.some((d) => d.udid === DEV.current)) {
+  if (DEV.switching && DEV.discovery === "complete" && !DEV.devices.some((d) => d.udid === DEV.current)) {
     const first = DEV.devices.find((d) => d.connected);
     if (first) return selectDevice(first.udid, true);
   }
@@ -770,22 +845,27 @@ async function loadDevices() {
 function renderDeviceMenu() {
   const m = $("#device-menu");
   m.replaceChildren();
-  if (!DEV.devices.length) {
+  if (DEV.discovery === "unavailable") {
+    const note = localizedEl("div", "menu-note", () => t("editor.discoveryUnavailable"));
+    note.setAttribute("role", "status");
+    m.appendChild(note);
+  } else if (!DEV.devices.length) {
     m.appendChild(localizedEl("div", "menu-note", () => t("editor.noDevices")));
   }
   for (const d of DEV.devices) {
     const b = el("button", "device-row" + (d.udid === DEV.current ? " current" : ""));
-    const dot = el("i", d.connected ? "on" : "off");
+    const dot = el("i", d.connected === true ? "on" : d.connected === false ? "off" : "unknown");
     const text = el("span", "t");
     text.append(el("b", null, d.name || d.udid),
       el("small", null, [d.version && ((d.model || "").startsWith("iPad") ? "iPadOS " : "iOS ") + d.version,
-        d.connected ? d.connection : t("editor.notConnected"), d.draft && t("editor.draftSaved")].filter(Boolean).join(" · ")));
+        d.connected === true ? d.connection : t(d.connected === false ? "editor.notConnected" : "editor.connectionUnknown"),
+        d.draft && t("editor.draftSaved")].filter(Boolean).join(" · ")));
     b.append(dot, text);
     b.onclick = () => { m.hidden = true; if (d.udid !== DEV.current) selectDevice(d.udid); };
     m.appendChild(b);
   }
   const r = localizedEl("button", "menu-foot", () => t("editor.refreshDevices"));
-  r.onclick = (e) => { e.stopPropagation(); loadDevices(); };
+  r.onclick = (e) => { e.stopPropagation(); return loadDevices(); };
   m.appendChild(r);
 }
 
@@ -888,7 +968,7 @@ async function review() {
 
 function showWriteOutcome({view, result}, success) {
   setView(view);
-  if (result.ok) toast(success, "ok", result.error, result.backup);
+  if (result.ok) toast(success, "ok", result.error, result.backup, result);
   else showResult(result);
 }
 
@@ -896,7 +976,8 @@ function showResult(r) {
   if (r.hidden_webclips?.length) return showHiddenClips(r);
   const body = el("div");
   const compared = r.mismatches && Object.keys(r.mismatches).length;
-  const outcome = () => compared ? t("editor.resultMismatch", {device: D()}) : t("editor.resultUnknown");
+  const outcome = () => t(r.readback === "matched" && r.local_adoption === "failed" ? "editor.resultLocalSave"
+    : compared ? "editor.resultMismatch" : "editor.resultUnknown", {device: D()});
   localized($("#operation-status"), outcome);
   body.appendChild(localizedEl("p", null, outcome));
   resultDetails(body, r);
@@ -904,6 +985,10 @@ function showResult(r) {
 }
 
 function resultDetails(body, result) {
+  body.appendChild(localizedEl("p", null, () => t("editor.verificationScope")));
+  if (result.write_error) body.appendChild(localizedEl("p", null, () => t("editor.writeStage", {error: result.write_error})));
+  if (result.readback_error) body.appendChild(localizedEl("p", null, () => t("editor.readbackStage", {error: result.readback_error})));
+  if (result.recovery === "read") body.appendChild(localizedEl("p", null, () => t("editor.recoveryRead")));
   if (result.error) body.appendChild(diagnostic(result.error));
   if (result.mismatches && Object.keys(result.mismatches).length)
     body.appendChild(el("pre", "diagnostic", JSON.stringify(result.mismatches, null, 1)));
@@ -988,7 +1073,7 @@ wireZone($("#library"), { target: "library" });
 wireZone($("#bank"), { target: "bank" });
 $("#read").onclick = readDevice;
 $("#device-btn").onclick = (e) => {
-  if (!DEV.switching) return;
+  if (!DEV.switching && DEV.discovery !== "unavailable") return;
   e.stopPropagation();
   const m = $("#device-menu");
   m.hidden = !m.hidden;
@@ -1038,7 +1123,12 @@ $("#sel-folder").onclick = newFolderFromSelection;
 $("#sel-library").onclick = selectionToLibrary;
 $("#sel-unpin").onclick = () => op("unpin", { ids: [...sel] }, () => sel.clear());
 $("#sel-clear").onclick = () => { sel.clear(); render(); };
-$("#drawer-close").onclick = () => { openFolder = null; render(); };
+function closeFolder() {
+  openFolder = null;
+  render();
+  focusItem(folderOpener);
+}
+$("#drawer-close").onclick = closeFolder;
 $("#folder-name").onchange = (e) => {
   const name = e.target.value.trim();
   if (openFolder && name) op("rename_folder", { id: openFolder, name });
@@ -1065,7 +1155,7 @@ document.addEventListener("keydown", (e) => {
   if (e.defaultPrevented || !ScreenOrganizerOnboarding.accepted || ScreenOrganizerOnboarding.dialog || e.target.matches("input,select,textarea")) return;
   const mod = e.metaKey || e.ctrlKey;
   if (mod && e.key.toLowerCase() === "z") { e.preventDefault(); op(e.shiftKey ? "redo" : "undo"); }
-  else if (e.key === "Escape") { sel.clear(); openFolder = null; render(); }
+  else if (e.key === "Escape") { sel.clear(); closeFolder(); }
   else if ((e.key === "Backspace" || e.key === "Delete") && sel.size) { e.preventDefault(); selectionToLibrary(); }
   else if (mod && e.key.toLowerCase() === "f") { e.preventDefault(); $("#search").focus(); }
 });

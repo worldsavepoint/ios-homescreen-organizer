@@ -598,6 +598,151 @@ assert.equal($('#selection-bar').hidden,true);assert.equal($('#folder-pages').ch
 ''', native=True)
 
 
+def test_verified_result_keeps_backup_scope_and_pending_clean_result():
+    browser('''
+const show=body=>vm.runInContext(body,context);
+show("showWriteOutcome({view:V,result:{ok:true,status:'verified',backup:'opaque-{backup}.plist'}},()=>t('editor.restored'))");
+assert.ok($('#toast').textContent.includes('opaque-{backup}.plist'));
+assert.ok($('#toast').textContent.includes(i18n.t('editor.verificationScope')));
+show("showError(new Error('earlier diagnostic'))");
+$('#toast').querySelector('details').open=true;
+show("showWriteOutcome({view:V,result:{ok:true,status:'verified',backup:'later.plist'}},()=>t('editor.restored'))");
+assert.ok($('#toast').textContent.includes('earlier diagnostic'));
+assert.ok($('#operation-status').textContent.includes('later.plist'),'latest outcome includes recovery access');
+$('#toast').querySelector('button').click();
+assert.ok($('#toast').textContent.includes('later.plist'));
+assert.ok($('#toast').textContent.includes(i18n.t('editor.restored')));
+assert.ok(document.body.contains(document.activeElement));
+''', native=True)
+
+
+def test_result_distinguishes_matched_readback_from_failed_local_save():
+    browser('''
+vm.runInContext("showResult({ok:false,status:'unknown',readback:'matched',local_adoption:'failed',recovery:'read',backup:'save.plist',write_error:'TimeoutError',error:'Write returned TimeoutError. Readback matched. Saving failed.'})",context);
+const body=$('#modal-body').textContent;
+assert.ok(body.includes(i18n.t('editor.resultLocalSave')));
+assert.ok(body.includes(i18n.t('editor.recoveryRead')));
+assert.ok(body.includes(i18n.t('editor.verificationScope')));
+assert.ok(body.includes('save.plist') && body.includes('TimeoutError'));
+assert.ok(!body.includes(i18n.t('editor.resultMismatch',{device:'iPhone'})));
+''', native=True)
+
+
+def test_discovery_failure_retains_devices_and_offers_retry_without_switching():
+    browser('''
+let mode='complete', switches=0;
+context.fetch=async(path,options={})=>{
+ assert.equal(path,'/api/devices');assert.equal(options.method,undefined);
+ if(mode==='http')throw Error('synthetic refresh failure');
+ return {ok:true,json:async()=>({switching:true,current:'known',discovery:mode,devices:[{udid:'known',name:'Known {name}',connected:mode==='complete'?true:null,draft:false}]})};
+};
+await vm.runInContext('loadDevices()',context);
+mode='unavailable';await vm.runInContext('loadDevices()',context);
+assert.ok($('#device-menu').textContent.includes(i18n.t('editor.discoveryUnavailable')));
+assert.ok($('#device-menu').textContent.includes(i18n.t('editor.connectionUnknown')));
+assert.ok(!$('#device-menu').textContent.includes(i18n.t('editor.notConnected')));
+mode='http';await vm.runInContext('loadDevices()',context);
+assert.ok($('#device-menu').textContent.includes('Known {name}'));
+assert.equal(vm.runInContext('DEV.current',context),'known');
+assert.equal(switches,0);
+mode='complete';await $('#device-menu').querySelector('.menu-foot').onclick({stopPropagation(){}});
+await tick();assert.ok(!$('#device-menu').textContent.includes(i18n.t('editor.discoveryUnavailable')));
+''', native=True)
+
+
+def test_fixed_source_button_has_no_popup_or_tab_action():
+    browser('''
+assert.equal($('#device-btn').disabled,true);
+assert.equal($('#device-btn').getAttribute('aria-haspopup'),null);
+assert.equal($('#device-btn').getAttribute('tabindex'),'-1');
+''', native=True)
+
+
+def test_keyboard_item_controls_preserve_selection_modifiers_and_focus():
+    browser('''
+const key=(node,key,extra={})=>node.dispatchEvent({type:'keydown',key,...extra});
+let folder=$('#pages').querySelector('[data-id="synthetic.folder"]');
+assert.equal(folder.getAttribute('role'),'button');assert.equal(folder.getAttribute('aria-expanded'),'false');
+folder.focus();key(folder,'Enter');
+assert.equal($('#drawer').hidden,false);
+let item=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
+assert.equal(item.getAttribute('aria-label'),'Synthetic Notes');
+item.focus();key(item,' ');
+item=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
+assert.equal(item.getAttribute('aria-pressed'),'true');assert.equal(document.activeElement,item);
+key(item,'Enter',{ctrlKey:true});
+item=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
+assert.equal(item.getAttribute('aria-pressed'),'false');assert.equal(document.activeElement,item);
+await i18n.setLocale('fr');
+assert.equal(document.activeElement,$('#folder-pages').querySelector('[data-id="synthetic.app"]'));
+$('#drawer-close').click();
+assert.equal(document.activeElement,$('#pages').querySelector('[data-id="synthetic.folder"]'));
+assert.equal($('#pages').querySelector('.add-page').tagName,'button');
+''', native=True)
+
+
+def test_folder_prompt_has_separate_name_and_description():
+    browser('''
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+$('#folder-pages').querySelector('[data-id="synthetic.app"]').click();
+$('#sel-folder').click();await tick();
+const input=$('#modal-body').querySelector('input');
+assert.equal(input.getAttribute('aria-label'),i18n.t('editor.folderName'));
+assert.ok(input.getAttribute('aria-describedby'));
+const description=$('#'+input.getAttribute('aria-describedby'));
+assert.ok(description.textContent.includes('1'));
+input.value='Raw 新 {name}';await i18n.setLocale('es');
+assert.equal(input.value,'Raw 新 {name}');assert.equal(input.getAttribute('aria-label'),'Nombre de carpeta');
+''', native=True)
+
+
+def test_ios16_remedies_are_distinct_and_keep_original_details():
+    browser('''
+await i18n.setLocale('es');
+vm.runInContext("showError(new Error('iOS 16 does not preserve fixed icon positions; use ordinary page order'))",context);
+assert.ok($('#toast').textContent.includes(i18n.t('error.ios16')));
+$('#toast').querySelector('button').click();
+vm.runInContext("showError(new Error('iOS 16 keeps these widgets ahead of folders; place the folder after the widgets'))",context);
+assert.ok($('#toast').textContent.includes(i18n.t('error.ios16FolderWidgets')));
+assert.ok($('#toast').textContent.includes('place the folder after the widgets'));
+assert.notEqual(i18n.t('error.ios16FolderWidgets'),'error.ios16FolderWidgets');
+''', native=True)
+
+
+def test_library_reuses_collator_and_refreshes_on_effective_locale_change():
+    browser('''
+const order=()=>$('#library').children.map(n=>n.dataset.id);
+assert.deepEqual(order(),['a','b','c']);assert.equal(context.collators,1);
+vm.runInContext('render();render()',context);assert.equal(context.collators,1);
+await i18n.setLocale('fr');assert.equal(context.collators,2);
+await i18n.setLocale('fr');vm.runInContext('render()',context);assert.equal(context.collators,2);
+''', native=True, setup='''
+fixture.library=[{id:'c',kind:'app',name:'Zèbre'},{id:'b',kind:'app',name:'École'},{id:'a',kind:'app',name:'Able'}];
+context.collators=0;context.Intl=Object.create(Intl);
+context.Intl.Collator=class extends Intl.Collator{constructor(...args){super(...args);context.collators++;}};
+''')
+
+
+def test_help_and_count_labels_follow_current_editor_options():
+    browser('''
+for(const code of i18n.languages.map(l=>l.code)){
+ await i18n.setLocale(code);$('#help').click();
+ assert.ok($('#modal-body').textContent.includes('200'),code+' undo capacity');
+ $('#modal-actions').firstChild.click();
+}
+for(const [code,selected,folder] of [['en','Selection: 1','Create a folder. Selection: 1.'],
+ ['es','Selección: 1','Crear una carpeta. Selección: 1.'],['pt','Seleção: 1','Criar uma pasta. Seleção: 1.']]){
+ await i18n.setLocale(code);
+ $('#pages').querySelector('[data-id="synthetic.folder"]').click();
+ $('#folder-pages').querySelector('[data-id="synthetic.app"]').click();
+ assert.equal($('#sel-count').textContent,selected);
+ $('#sel-folder').click();await tick();
+ assert.ok($('#modal-body').textContent.includes(folder));$('#modal-actions').firstChild.click();
+ assert.ok(i18n.t('editor.selected',{count:2}).includes('2'));
+}
+''', native=True)
+
+
 def view_for(monkeypatch, layout, usage=None):
     from types import SimpleNamespace
     import homescreen.ui as ui
@@ -863,7 +1008,8 @@ const name='recovery.plist';context.fetch=async(path,opts)=>{
 if(OP==='restore'){$('#backups-btn').click();await tick();$('#modal-body button').click();await tick();}
 else $('#review').click();
 $('#modal-actions').lastChild.click();await tick();await tick();
-assert.equal($('#operation-status').textContent,OP==='apply'?i18n.t('editor.applied',{device:'iPhone'}):i18n.t('editor.restored'));
+assert.ok($('#operation-status').textContent.startsWith(OP==='apply'?i18n.t('editor.applied',{device:'iPhone'}):i18n.t('editor.restored')));
+assert.ok($('#operation-status').textContent.includes(name));
 assert.ok($('#toast details').textContent.includes(raw));assert.ok($('#toast').textContent.includes(name));
 '''.replace('OP',json.dumps(operation)),native=True)
 

@@ -52,6 +52,7 @@ input:focus { border-color: var(--accent); }
 .device-row i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .device-row i.on { background: var(--ok); }
 .device-row i.off { background: var(--line); }
+.device-row i.unknown { border: 1px solid var(--muted); }
 .device-row .t { display: flex; flex-direction: column; }
 .device-row small { color: var(--muted); font-size: 11px; }
 .device-row.current { background: var(--drop); }
@@ -204,17 +205,20 @@ main { flex: 1; display: flex; min-height: 0; }
   box-shadow: var(--shadow); border-radius: 14px; padding: 8px 10px; display: flex; gap: 8px; align-items: center; z-index: 25; }
 .floating span { padding: 0 6px; font-weight: 600; }
 
-.modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: grid; place-items: center; z-index: 50; padding: 16px; }
-.modal-card { background: var(--panel); border-radius: 16px; box-shadow: var(--shadow); width: min(560px, 100%); max-height: 82vh;
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; z-index: 50; padding: 16px; }
+.modal-card { background: var(--panel); border-radius: 16px; box-shadow: var(--shadow); width: min(560px, 100%); min-width: 0; max-height: min(82vh, calc(100vh - 32px));
   display: flex; flex-direction: column; padding: 20px; }
 .modal-card h2 { margin: 0 0 12px; font-size: 17px; }
-#modal-body { overflow: auto; color: var(--fg); }
+#modal-body { overflow: auto; min-height: 0; color: var(--fg); overflow-wrap: anywhere; }
 #modal-body p { margin: 0 0 10px; color: var(--muted); }
 #modal-body input { width: 100%; font-size: 14px; }
-.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal-actions { display: flex; flex-wrap: wrap; flex-shrink: 0; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.modal-actions button { white-space: normal; overflow-wrap: anywhere; }
 .moves { list-style: none; margin: 0; padding: 0; max-height: 46vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }
 .moves li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 10px; border-bottom: 1px solid var(--line); }
 .moves li:last-child { border-bottom: 0; }
+.moves li > *, .backup-row > * { min-width: 0; overflow-wrap: anywhere; }
+.backup-row button { flex-shrink: 0; }
 .moves .to { color: var(--muted); text-align: right; }
 .stats { display: flex; gap: 18px; margin-bottom: 12px; }
 .stats div b { display: block; font-size: 20px; }
@@ -225,6 +229,8 @@ main { flex: 1; display: flex; min-height: 0; }
 .toast { position: fixed; left: 50%; top: 70px; transform: translateX(-50%); background: var(--fg); color: var(--bg);
   padding: 10px 16px; border-radius: 12px; z-index: 60; box-shadow: var(--shadow); max-width: 80vw; }
 .toast:has(details) { max-height: calc(100vh - 82px); overflow: auto; overflow-wrap: anywhere; }
+.toast[inert] { visibility: hidden; }
+.toast .pending-result { margin-top: 10px; border-top: 1px solid currentColor; padding-top: 10px; }
 .toast.error { background: var(--danger); color: #fff; }
 .toast.ok { background: var(--ok); color: #003d14; }
 .busy { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 70; display: grid; place-items: center; align-content: center; gap: 14px; color: #fff; font-weight: 600; }
@@ -234,7 +240,6 @@ main { flex: 1; display: flex; min-height: 0; }
 @media (max-width: 760px) {
   .bar.top { flex-wrap: wrap; }
   #search { width: 100%; order: 10; }
-  #library-panel { display: none !important; }
   .page { width: 100%; }
   .grid { grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr)); }
 }
@@ -272,4 +277,12 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template
 #board { grid-column: 1; grid-row: 2; min-width: 0; }
 #library-panel { grid-column: 2; grid-row: 2; min-width: 0; }
 #empty { grid-column: 1 / -1; grid-row: 2; }
-@media (max-width: 760px) { main { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 760px) {
+  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto; overflow: auto; align-content: start; }
+  #board { overflow: visible; }
+  #library-panel { grid-column: 1; grid-row: 3; width: 100%; overflow: visible; border-left: 0; border-top: 1px solid var(--line); }
+  #library { overflow: visible; }
+  #empty { min-height: 260px; }
+  .drawer { width: min(400px, 100%); }
+}
+.add-page { background: none; white-space: normal; padding: 0; }
