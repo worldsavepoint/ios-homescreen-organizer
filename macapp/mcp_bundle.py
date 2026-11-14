@@ -42,12 +42,14 @@ def verify_assets(folder, version):
 
 def engine_entries(archive, arch, version):
     """Validate the complete ZIP, then map engine and notice members without extraction."""
+    from check_package_paths import check_zip_metadata
+    check_zip_metadata(archive)
     entries = {}
     for info in archive.infolist():
         name = info.filename.rstrip("/")
         parts = name.split("/")
         if (not name or any(part in ("", ".", "..") for part in parts)
-                or "\\" in name or "\x00" in name or parts[0] not in (APP, "__MACOSX")):
+                or "\\" in name or "\x00" in name or parts[0] != APP):
             raise ValueError(f"Unexpected ZIP path: {info.filename}")
         if name in entries:
             raise ValueError(f"Duplicate ZIP path: {name}")

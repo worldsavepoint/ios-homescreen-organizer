@@ -89,6 +89,43 @@ def private_transaction(parent):
         raise
 
 
+def check_tree_metadata(root):
+    if any(path.name == "__MACOSX" or path.name.startswith("._") for path in (root, *root.rglob("*"))):
+        raise ValueError("Native payload contains provenance metadata members")
+    result = subprocess.run(["/usr/bin/xattr", "-rs", root], check=True, capture_output=True)
+    if result.stdout:
+        raise ValueError("Native payload contains extended metadata")
+
+
+def clean_copy(app, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ditto", "--norsrc", "--noextattr", "--noqtn", "--noacl", "--nopersistRootless",
+                    app, destination], check=True, capture_output=True)
+    check_tree_metadata(destination)
+
+
+def native_zip(app, destination):
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in (app, *sorted(app.rglob("*"))):
+            mode = path.lstat().st_mode
+            name = path.relative_to(app.parent).as_posix()
+            if stat.S_ISDIR(mode):
+                name += "/"
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = mode << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            if stat.S_ISLNK(mode):
+                archive.writestr(info, os.fsencode(os.readlink(path)))
+            elif stat.S_ISDIR(mode):
+                archive.writestr(info, b"")
+            elif stat.S_ISREG(mode):
+                with path.open("rb") as source, archive.open(info, "w", force_zip64=path.stat().st_size >= zipfile.ZIP64_LIMIT) as output:
+                    shutil.copyfileobj(source, output)
+            else:
+                raise ValueError("Check the app file types in the native release")
+
+
 def package(build_dir, output_dir, version, arch):
     app = build_dir / "Screen Organizer.app"
     bundle = plistlib.loads((app / "Contents/Info.plist").read_bytes())
@@ -116,8 +153,9 @@ def package(build_dir, output_dir, version, arch):
         disk_image = staged / (basename + ".dmg")
         archive = staged / (basename + ".zip")
         shutil.copyfile(dmg, disk_image)
-        subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent",
-                        str(app), str(archive)], check=True, capture_output=True)
+        clean = folder / "clean" / app.name
+        clean_copy(app, clean)
+        native_zip(clean, archive)
         check_archive(archive, [*roots, staged])
         verify_image(disk_image, archive, Path(folder))
         lines = []
@@ -169,6 +207,7 @@ def verify_image(image, archive, folder):
         if not (mount / "Applications").is_symlink() or os.readlink(mount / "Applications") != "/Applications":
             raise ValueError("Check the Applications link in the release image")
         for location in (unpacked, mount):
+            check_tree_metadata(location)
             if (location / app).is_symlink() or not (location / app).is_dir():
                 raise ValueError("Check the app directory in the native release")
             subprocess.run(["codesign", "--verify", "--deep", "--strict", location / app],
@@ -351,10 +390,15 @@ def main():
         localization_command = commands.add_parser(action, help="Assemble or check native language resources")
         localization_command.add_argument("--app", type=Path, required=True)
         localization_command.add_argument("--locales", type=Path, default=ROOT / "homescreen/web/locales")
+    copy_command = commands.add_parser("clean-copy", help="Stage an app without filesystem provenance metadata")
+    copy_command.add_argument("--app", type=Path, required=True)
+    copy_command.add_argument("--destination", type=Path, required=True)
     args = parser.parse_args()
     try:
         version = project_version(getattr(args, "tag", None))
-        if args.command in ("localize", "check-localization"):
+        if args.command == "clean-copy":
+            clean_copy(args.app, args.destination)
+        elif args.command in ("localize", "check-localization"):
             localize(args.app, args.locales, check=args.command == "check-localization")
         elif args.command == "package":
             build_dir = args.build_dir or ROOT / "build" / args.arch

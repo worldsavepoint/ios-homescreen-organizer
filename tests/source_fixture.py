@@ -22,7 +22,7 @@ def fixture_checkout(root, version):
     scripts = root / "macapp"
     scripts.mkdir(parents=True)
     for name in ("publish_release.sh", "release.py", "source_archive.py", "source_inputs.py", "native_sources.py",
-                 "frozen_sources.py", "mcp_bundle.py", "wheelhouse.py", "source_checkout.py", "source_tar.py"):
+                 "frozen_sources.py", "mcp_bundle.py", "wheelhouse.py", "source_checkout.py", "source_tar.py", "check_package_paths.py"):
         shutil.copyfile(ROOT / "macapp" / name, scripts / name)
     (root / "LICENSE").write_text("Fixture original grant\n")
     (scripts / "mcp_launcher.sh").write_text("#!/bin/sh\nexit 0\n")

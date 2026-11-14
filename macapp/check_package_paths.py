@@ -24,6 +24,42 @@ class BuildPathError(ValueError):
     pass
 
 
+class PackageMetadataError(ValueError):
+    pass
+
+
+def check_zip_metadata(archive):
+    """Inspect central and local metadata independently of compressed payload bytes."""
+    def extra_fields(extra):
+        offset = 0
+        while offset < len(extra):
+            if len(extra) - offset < 4:
+                raise ValueError("Could not verify native ZIP metadata")
+            kind, size = struct.unpack_from("<HH", extra, offset)
+            offset += 4
+            if offset + size > len(extra):
+                raise ValueError("Could not verify native ZIP metadata")
+            if (kind in (0x7875, 0x756E, 0x000D, 0x4453)
+                    or kind == 0x7855 and size > 0 or kind == 0x5855 and size > 8):
+                raise PackageMetadataError("Native ZIP contains numeric ownership metadata")
+            offset += size
+
+    for info in archive.infolist():
+        if any(part == "__MACOSX" or part.startswith("._") for part in info.filename.split("/")):
+            raise PackageMetadataError("Native ZIP contains provenance metadata members")
+        extra_fields(info.extra)
+        archive.fp.seek(info.header_offset)
+        header = archive.fp.read(30)
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            raise ValueError("Could not verify native ZIP metadata")
+        name_length, extra_length = struct.unpack_from("<HH", header, 26)
+        archive.fp.read(name_length)
+        extra = archive.fp.read(extra_length)
+        if len(extra) != extra_length:
+            raise ValueError("Could not verify native ZIP metadata")
+        extra_fields(extra)
+
+
 def wide_text(data):
     for bom, encoding in ((codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
                           (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16")):
@@ -162,11 +198,12 @@ def check_archive(path, blocked):
     try:
         check(path.read_bytes())
         with zipfile.ZipFile(path) as archive, tempfile.TemporaryDirectory() as folder:
+            check_zip_metadata(archive)
             check_zip(archive)
             engine = Path(folder) / "engine"
             engine.write_bytes(archive.read(ENGINE))
             check_engine(engine)
-    except BuildPathError:
+    except (BuildPathError, PackageMetadataError):
         raise
     except (Exception, SystemExit):
         # Archive readers include their input filename in parsing errors.

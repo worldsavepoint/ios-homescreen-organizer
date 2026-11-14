@@ -153,7 +153,8 @@ echo "• dmg"
 DMG=$BUILD/home-screen-organizer-$VERSION.dmg
 STAGE=$BUILD/dmg
 rm -rf "$STAGE" "$DMG" && mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/" && ln -s /Applications "$STAGE/Applications"
+"$VENV/bin/python" "$ROOT/macapp/release.py" clean-copy --app "$APP" --destination "$STAGE/Screen Organizer.app"
+ln -s /Applications "$STAGE/Applications"
 hdiutil create -quiet -volname "Screen Organizer" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
 rm -rf "$STAGE"
 echo "built $APP ($(du -sh "$APP" | cut -f1)) and $DMG ($(du -sh "$DMG" | cut -f1))"

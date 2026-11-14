@@ -691,3 +691,84 @@ def test_native_retirement_envelope_clears_inherited_acl(tmp_path):
         assert not list(folder.iterdir())
     finally:
         subprocess.run(["chmod", "-N", parent], check=True)
+
+
+def test_native_zip_preserves_modes_links_and_omits_owner_extras(tmp_path):
+    import stat
+    import struct
+    from macapp.release import app_contents, native_zip
+    app = tmp_path / "Screen Organizer.app"
+    app.mkdir(mode=0o750)
+    (app / "folder").mkdir(mode=0o710)
+    (app / "folder/executable").write_bytes(b"\x00\xff signed payload")
+    (app / "folder/executable").chmod(0o751)
+    (app / "shortcut").symlink_to("folder/executable")
+    path = tmp_path / "native.zip"
+    native_zip(app, path)
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            assert info.create_system == 3 and info.extra == b""
+            archive.fp.seek(info.header_offset + 26)
+            name_length, extra_length = struct.unpack("<HH", archive.fp.read(4))
+            assert extra_length == 0
+        assert stat.S_ISLNK(archive.getinfo(app.name + "/shortcut").external_attr >> 16)
+        assert archive.read(app.name + "/shortcut") == b"folder/executable"
+    unpacked = tmp_path / "unpacked"
+    subprocess.run(["ditto", "-x", "-k", path, unpacked], check=True)
+    assert app_contents(unpacked / app.name) == app_contents(app)
+
+
+def test_clean_native_staging_preserves_input_xattrs_and_signed_bytes(tmp_path):
+    from macapp.release import app_contents, clean_copy, check_tree_metadata
+    build = make_build(tmp_path)
+    app = build / "Screen Organizer.app"
+    directory = app / "Contents/Resources"
+    payload = directory / "LICENSE-fixture"
+    payload.write_bytes(b"ordinary signed resource")
+    link = directory / "resource-link"
+    link.symlink_to(payload.name)
+    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", app], check=True, capture_output=True)
+    value = plistlib.dumps(["https://unrelated.example/private-origin"])
+    attribute = "com.apple.metadata:kMDItemWhereFroms"
+    for path in (app, directory, payload):
+        subprocess.run(["xattr", "-wx", attribute, value.hex(), path], check=True)
+    before = app_contents(app)
+    clean = tmp_path / "staging" / app.name
+    clean_copy(app, clean)
+    check_tree_metadata(clean)
+    assert app_contents(clean) == before
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", clean], check=True, capture_output=True)
+    assert all(bytes.fromhex(subprocess.check_output(["xattr", "-px", attribute, path], text=True)) == value
+               for path in (app, directory, payload))
+    with pytest.raises(ValueError, match="metadata"):
+        check_tree_metadata(app)
+    (clean.parent / "Applications").symlink_to("/Applications")
+    subprocess.run(["hdiutil", "create", "-quiet", "-ov", "-format", "UDZO", "-srcfolder", clean.parent,
+                    build / f"home-screen-organizer-{VERSION}.dmg"], check=True, capture_output=True)
+    output = tmp_path / "release"
+    result = release("package", "--build-dir", build, "--output-dir", output, "--arch", "arm64")
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(next(output.glob("*.zip"))) as archive:
+        assert all(not name.startswith("__MACOSX/") and "/._" not in name for name in archive.namelist())
+    assert app_contents(app) == before
+    assert all(bytes.fromhex(subprocess.check_output(["xattr", "-px", attribute, path], text=True)) == value
+               for path in (app, directory, payload))
+
+
+def test_tagged_zip_and_dmg_are_rejected_without_path_marker(tmp_path):
+    from macapp.release import verify_image
+    build = make_build(tmp_path)
+    app = build / "Screen Organizer.app"
+    archive = tmp_path / "app.zip"
+    subprocess.run(["ditto", "-c", "-k", "--keepParent", app, archive], check=True)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    verify_image(build / f"home-screen-organizer-{VERSION}.dmg", archive, plain)
+    subprocess.run(["xattr", "-wx", "com.apple.metadata:kMDItemWhereFroms",
+                    plistlib.dumps(["https://unrelated.example/private-origin"]).hex(), app / "Contents/Resources"], check=True)
+    image = build / "tagged.dmg"
+    make_image(app, image, tmp_path / "tagged-files")
+    tagged = tmp_path / "tagged"
+    tagged.mkdir()
+    with pytest.raises(ValueError, match="metadata"):
+        verify_image(image, archive, tagged)

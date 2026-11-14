@@ -281,3 +281,37 @@ def test_wide_plist_at_unlabeled_path_and_embedded_entity(tmp_path):
     result = subprocess.run(["/usr/bin/plutil", "-convert", "binary1", "-o", "-", "--", "-"],
                             input=declaration.encode(), capture_output=True, timeout=5)
     assert result.returncode or plistlib.loads(result.stdout)["v"] != canary.read_text()
+
+
+@pytest.mark.parametrize("field,data", [
+    (0x5855, b"\0" * 12), (0x7855, b"\0" * 4), (0x7875, b"\x01\x04\x01\0\0\0\x04\x02\0\0\0"),
+    (0x000D, b"\0" * 12), (0x756E, b"\0" * 14),
+])
+@pytest.mark.parametrize("location", ["both", "local-only"])
+def test_native_zip_rejects_numeric_ownership_in_both_header_sets(tmp_path, field, data, location):
+    import struct
+    from macapp.check_package_paths import check_archive
+
+    path = native_zip(tmp_path)
+    info = zipfile.ZipInfo("entry")
+    extra = struct.pack("<HH", field, len(data)) + data
+    info.extra = extra
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr(info, b"ordinary bytes")
+    if location == "local-only":
+        raw = path.read_bytes()
+        before, after = raw.rsplit(extra, 1)
+        # Unknown padding leaves the central header free of owner-bearing records.
+        path.write_bytes(before + struct.pack("<HH", 0x9999, len(data)) + b"\0" * len(data) + after)
+    with pytest.raises(ValueError, match="ownership"):
+        check_archive(path, [tmp_path / "unrelated"])
+
+
+@pytest.mark.parametrize("name", ["__MACOSX/._Screen Organizer.app", "Screen Organizer.app/Contents/._payload"])
+def test_native_zip_rejects_appledouble_metadata(tmp_path, name):
+    from macapp.check_package_paths import check_archive
+    path = native_zip(tmp_path)
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr(name, b"unrelated provenance origin")
+    with pytest.raises(ValueError, match="metadata"):
+        check_archive(path, [tmp_path / "unrelated"])
