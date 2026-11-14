@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .device import FileSource, PhoneSource, SimSource, Source
 from .session import Session
+from .private_store import ensure_private_directory
 
 DATA = Path(os.environ.get("HOMESCREEN_DATA") or Path.home() / "Library/Application Support/homescreen-mcp")
 
@@ -46,6 +47,7 @@ def enable_device_switching() -> None:
     global _switching, _current
     if os.environ.get("HOMESCREEN_FIXTURE") or os.environ.get("HOMESCREEN_SIM") or os.environ.get("HOMESCREEN_UDID"):
         return  # a pinned source: nothing to switch between
+    ensure_private_directory(DATA)
     _switching = True
     _adopt_shared_draft()
     if LAST_DEVICE.exists():
@@ -78,8 +80,8 @@ def current_device() -> str | None:
 
 def select_device(udid: str) -> Session:
     global _current
+    ensure_private_directory(DATA)
     _current = udid
-    DATA.mkdir(parents=True, exist_ok=True)
     LAST_DEVICE.write_text(udid)
     return session()
 
@@ -87,6 +89,7 @@ def select_device(udid: str) -> Session:
 def known_devices() -> dict[str, dict]:
     """Devices with a saved draft: {udid: {"name", "version", "model"}}."""
     import plistlib
+    ensure_private_directory(DATA)
     out = {}
     for f in sorted((DATA / "drafts").glob("*.plist")) if (DATA / "drafts").exists() else []:
         try:

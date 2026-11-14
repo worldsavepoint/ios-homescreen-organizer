@@ -27,6 +27,7 @@ from typing import Any, Callable
 from . import colors
 from .device import DISK_MARK, NAME_MARK, ObservedPins, Source, disk_pins, disk_to_model, page_fields, require_writable
 from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, widget_configuration
+from .private_store import ensure_private_directory
 
 KEEP_READS = 10
 MAX_UNDO = 200
@@ -507,14 +508,7 @@ class Session:
         None keeps the single shared draft the CLI and MCP server use."""
         self.source = source
         self.dir = Path(data_dir)
-        if self.dir.is_symlink():
-            raise LayoutError("the Session data directory must not be a symlink")
-        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fchmod(fd, 0o700)
-        finally:
-            os.close(fd)
+        ensure_private_directory(self.dir)
         self._draft_key = device
         self.layout: Layout | None = None
         self._draft_error: str | None = None
