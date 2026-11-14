@@ -1136,6 +1136,60 @@ def mutations(sandbox):
     return path.read_text().splitlines() if path.exists() else []
 
 
+def set_acl(path, *, deny=False, inherit=False):
+    permission = "deny writeextattr" if deny else "allow read,readattr,readextattr,readsecurity"
+    if inherit:
+        permission += ",file_inherit,directory_inherit"
+    subprocess.run(["/bin/chmod", "+a", "everyone " + permission, str(path)], check=True,
+                   capture_output=True, text=True)
+
+
+def acl_text(path):
+    return subprocess.run(["/bin/ls", "-lde", str(path)], check=True, capture_output=True,
+                          text=True).stdout.splitlines()[1:]
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_journal_creation_excludes_parent_acl(native_mcp_binary, sandbox, tmp_path, inherited):
+    cli = fake_client(tmp_path)
+    store, prior = seed_user(sandbox, options={"privateField":"fixture-private-value"})
+    journal = journal_file(sandbox)
+    journal.parent.parent.mkdir(parents=True)
+    if inherited:
+        set_acl(journal.parent.parent, inherit=True)
+    parent_acl = acl_text(journal.parent.parent)
+    interrupted(native_mcp_binary, {**sandbox,"TEST_JOURNAL_EXIT":"prepared"}, cli, "/new")
+    assert not any("allow" in line for line in acl_text(journal.parent))
+    assert not any("allow" in line for line in acl_text(journal.parent / "codex.lock"))
+    assert not any("allow" in line for line in acl_text(journal))
+    assert acl_text(journal.parent.parent) == parent_acl
+    assert "fixture-private-value" in journal.read_text()
+    assert execute(native_mcp_binary, sandbox, "recover", "codex", cli)["code"] == "success"
+    assert json.loads(store.read_text()) == prior and mutations(sandbox) == []
+
+
+@pytest.mark.parametrize("target", ["directory", "lock", "record"])
+@pytest.mark.parametrize("deny", [False, True])
+def test_existing_journal_acl_is_validated_without_changing_objects(native_mcp_binary, sandbox, tmp_path, target, deny):
+    cli = fake_client(tmp_path)
+    store, prior = seed_user(sandbox, options={"privateField":"fixture-private-value"})
+    journal = journal_file(sandbox)
+    interrupted(native_mcp_binary, {**sandbox,"TEST_JOURNAL_EXIT":"prepared"}, cli, "/new")
+    path = {"directory":journal.parent, "lock":journal.parent / "codex.lock", "record":journal}[target]
+    set_acl(path, deny=deny)
+    before = journal.read_bytes()
+    acl = acl_text(path)
+    result = execute(native_mcp_binary, sandbox, "recover", "codex", cli)
+    assert result["code"] == ("success" if deny else {"directory":"snapshotReadFailed", "lock":"operationBusy", "record":"recoveryFailed"}[target])
+    if target != "record" or not deny:
+        assert acl_text(path) == acl
+    else:
+        assert not journal.exists()
+    if not deny:
+        assert journal.read_bytes() == before
+    assert json.loads(store.read_text()) == prior and mutations(sandbox) == []
+
+
 def interrupted(binary, env, cli, *args, action="register", status=85):
     proc = subprocess.run([binary, action, "codex", cli, *args], env=env, capture_output=True, timeout=10)
     assert proc.returncode == status, proc.stdout
