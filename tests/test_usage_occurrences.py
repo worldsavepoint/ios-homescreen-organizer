@@ -129,3 +129,36 @@ def test_device_usage_rechecks_source_identity_before_adopting_reports(tmp_path,
     with pytest.raises(LayoutError, match="identity"):
         asyncio.run(session.load_device_usage())
     assert session.usage is None and session.draft_path.read_bytes() == draft
+
+
+@pytest.mark.parametrize("intervening", ["none", "identity", "edit"])
+def test_optimize_keeps_one_review_through_a_delayed_device_error_and_mac_fallback(tmp_path, monkeypatch, intervening):
+    source = MemorySource()
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    providers, after = [], {}
+    async def reports(path):
+        providers.append("device")
+        if intervening == "identity":
+            source.udid = "next-device"
+            await session.read()
+        elif intervening == "edit":
+            session.edit(lambda lay: lay.move("a", "dock"))
+        after.update(draft=session.draft_path.read_bytes(), history=session.history())
+        raise ConnectionError("synthetic delayed report failure")
+    def mac(known, days):
+        providers.append("mac")
+        return {"ok": True, "days": days, "opens": {"b": 20}}
+    source.memory_reports = reports
+    monkeypatch.setattr(usage, "load", mac)
+    monkeypatch.setattr(server, "session", lambda: session)
+    result = asyncio.run(server.optimize_by_usage())
+    if intervening == "none":
+        assert result["ok"] and providers == ["device", "mac"]
+        assert [node.id for node in session.require().pages[0]] == ["b", "a"]
+        assert session.history()["undo"] == 1
+    else:
+        assert result.get("ok") is False and "changed" in result["error"]
+        assert providers == ["device"] and session.usage is None
+        assert session.draft_path.read_bytes() == after["draft"] and session.history() == after["history"]
+    assert not source.writes

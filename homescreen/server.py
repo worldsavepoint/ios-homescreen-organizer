@@ -335,19 +335,24 @@ async def optimize_by_usage(
     Sorts/refills every folder's contents, including page-1, Dock and holding-tray folders.
     Return ok and validation problems or an error."""
     s = session()
-    if s.usage is None:
-        try:
-            await s.load_device_usage()
-        except LayoutError as e:
-            return {"ok": False, "error": str(e)}
-        except Exception:
-            pass
-        if not (s.usage or {}).get("ok"):
-            s.load_usage()
-    if not s.usage.get("ok"):
-        return {"ok": False, "error": s.usage.get("error")}
-    opens = s.usage["opens"]
-    return _edit(lambda lay: usage.optimize(lay, opens, keep_first_page))
+    binding = s.binding
+    try:
+        if s.usage is None:
+            try:
+                await s.load_device_usage(expected=binding)
+            except LayoutError:
+                raise
+            except Exception:
+                pass
+            if not (s.usage or {}).get("ok"):
+                s.load_usage(expected=binding)
+        if not s.usage.get("ok"):
+            return {"ok": False, "error": s.usage.get("error")}
+        opens = s.usage["opens"]
+        result = s.edit(lambda lay: usage.optimize(lay, opens, keep_first_page), expected=binding)
+    except LayoutError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "problems": s.require().validate(), **result}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
