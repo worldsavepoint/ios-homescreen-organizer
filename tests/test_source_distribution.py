@@ -632,11 +632,195 @@ def test_documented_install_selects_edited_wheel_and_original_direct_pure_wheel(
     assert "file:" not in portable.read_text() and str(tmp_path) not in portable.read_text()
 
 
+class _PrivateLauncherBytes(bytes):
+    def __repr__(self):
+        return "<private unsigned native launcher>"
+
+    __str__ = __repr__
+
+
+def _unsigned_launcher_bytes(executable, copy):
+    import shutil
+    import subprocess
+    shutil.copyfile(executable, copy)
+    subprocess.run(["codesign", "--remove-signature", copy], check=True, capture_output=True)
+    return _PrivateLauncherBytes(copy.read_bytes())
+
+
+def _launcher_signing_note(before, after):
+    import struct
+    from frozen_sources import canonical_launcher_payload
+    unavailable = "Native launcher signing diagnostics unavailable"
+
+    def summary(data):
+        canonical = canonical_launcher_payload(data)
+        header = struct.unpack_from("<IiiIIIII", data)
+        offset = 32
+        for _ in range(header[4]):
+            command, size = struct.unpack_from("<II", data, offset)
+            if command == 0x19 and data[offset + 8:offset + 24].rstrip(b"\0") == b"__LINKEDIT":
+                linkedit = [offset, *struct.unpack_from("<QQQQ", data, offset + 24)]
+            offset += size
+        return {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                "canonicalSha256": hashlib.sha256(canonical).hexdigest(), "header": list(header),
+                "linkedit": linkedit, "commandsSha256": hashlib.sha256(data[32:offset]).hexdigest()}
+
+    try:
+        details = {"before": summary(before), "after": summary(after)}
+    except (ValueError, struct.error):
+        return unavailable
+    ranges, count, previous = [], 0, -2
+    for offset in range(max(len(before), len(after))):
+        if before[offset:offset + 1] == after[offset:offset + 1]:
+            continue
+        if previous != offset - 1:
+            count += 1
+            if count <= 8:
+                ranges.append([offset, offset + 1])
+        elif count <= 8:
+            ranges[-1][1] = offset + 1
+        previous = offset
+    details.update(differenceRanges=ranges, differenceRangeCount=count)
+    note = "Native launcher signing diagnostics: " + json.dumps(details, separators=(",", ":"))
+    return note if len(note) <= 2048 else unavailable
+
+
+def _verify_launcher_with_signing_diagnostics(app, before, copy):
+    from frozen_sources import verify_local_record
+    try:
+        verify_local_record(app)
+    except ValueError as error:
+        try:
+            note = _launcher_signing_note(before, _unsigned_launcher_bytes(app / "Contents/MacOS/HomeScreenOrganizer", copy))
+        except Exception:
+            note = "Native launcher signing diagnostics unavailable"
+        error.add_note(note)
+        raise
+
+
+@pytest.mark.parametrize("changes", [1, 24])
+def test_launcher_signing_diagnostics_expose_only_bounded_structure_and_digests(changes):
+    import struct
+    page = 4096
+    before = bytearray(page + 512)
+    struct.pack_into("<IiiIIIII", before, 0, 0xFEEDFACF, 0x01000007, 3, 2, 1, 72, 0, 0)
+    struct.pack_into("<II16sQQQQiiII", before, 32, 0x19, 72, b"__LINKEDIT", page * 4, page, page, 512, 1, 1, 0, 0)
+    marker = b"/private/untrusted-builder/\x1b[31msecret.swift"
+    before[200:200 + len(marker)] = marker
+    after = bytearray(before)
+    struct.pack_into("<Q", after, 64, page * 2)
+    for index in range(changes):
+        after[page + 2 * index] ^= 1
+    note = _launcher_signing_note(before, after)
+    assert len(note) <= 2048 and all(character.isprintable() for character in note)
+    assert not any(value in note for value in ("/private/", "untrusted-builder", "secret.swift"))
+    details = json.loads(note.removeprefix("Native launcher signing diagnostics: "))
+    assert details["before"]["linkedit"] == [32, page * 4, page, page, 512]
+    assert details["after"]["linkedit"] == [32, page * 4, page * 2, page, 512]
+    assert details["before"]["sha256"] == hashlib.sha256(before).hexdigest()
+    assert details["before"]["canonicalSha256"] != details["after"]["canonicalSha256"]
+    assert details["differenceRangeCount"] == changes + 1
+    assert len(details["differenceRanges"]) == min(8, changes + 1)
+    assert details["differenceRanges"][0] == [65, 66]
+
+
+def test_launcher_signing_diagnostics_reject_malformed_bytes_without_echoing_them():
+    assert _launcher_signing_note(b"/private/secret-header\x1b[31m", b"bad") == "Native launcher signing diagnostics unavailable"
+
+
+@pytest.mark.parametrize("diagnostic_failure", [False, True])
+def test_launcher_signing_failure_traceback_keeps_payload_bytes_private(tmp_path, diagnostic_failure):
+    import struct
+    import subprocess
+    marker = b"/private/byte-marker-for-pytest/payload-secret.swift"
+    payload = bytearray(4096 + 512)
+    struct.pack_into("<IiiIIIII", payload, 0, 0xFEEDFACF, 0x01000007, 3, 2, 1, 72, 0, 0)
+    struct.pack_into("<II16sQQQQiiII", payload, 32, 0x19, 72, b"__LINKEDIT", 16384, 4096, 4096, 512, 1, 1, 0, 0)
+    payload[-len(marker):] = marker
+    app = tmp_path / "fixture.app"
+    launcher = app / "Contents/MacOS/HomeScreenOrganizer"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_bytes(payload)
+    resources = app / "Contents/Resources"
+    resources.mkdir()
+    (resources / "LOCAL-BUILD.json").write_text(json.dumps({"launcher": {"algorithm": "unchanged", "sha256": "0" * 64}}))
+    probe = tmp_path / "test_failure_probe.py"
+    probe.write_text(f'''import importlib.util
+from pathlib import Path
+import subprocess
+spec = importlib.util.spec_from_file_location("launcher_diagnostic_probe", {str(Path(__file__).resolve())!r})
+helpers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helpers)
+import frozen_sources
+
+def test_binding_failure(tmp_path, monkeypatch):
+    app = Path("fixture.app")
+    monkeypatch.setattr(frozen_sources, "launcher_digest", lambda executable: "a" * 64)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: None)
+    before = helpers._unsigned_launcher_bytes(app / "Contents/MacOS/HomeScreenOrganizer", tmp_path / "before")
+    if {diagnostic_failure!r}:
+        def invalid_note(before, after):
+            raise ValueError(before[-100:].decode("ascii", "replace"))
+        monkeypatch.setattr(helpers, "_launcher_signing_note", invalid_note)
+    helpers._verify_launcher_with_signing_diagnostics(app, before, tmp_path / "after")
+''')
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "--showlocals", "--tb=long", probe.name],
+                            cwd=tmp_path, capture_output=True, text=True)
+    rendered = result.stdout + result.stderr
+    assert result.returncode == 1 and "1 failed" in rendered
+    assert "The signed native launcher differs from the local build record" in rendered
+    assert "Native launcher signing diagnostics" in rendered
+    assert "payload-secret.swift" not in rendered and "byte-marker-for-pytest" not in rendered
+
+
+@pytest.mark.parametrize("provider_status,build_status", [(0, 0), (9, 0), (0, 7)])
+def test_intel_package_diagnostic_preserves_test_failure_and_build_gates(tmp_path, provider_status, build_status):
+    import os
+    import subprocess
+    import textwrap
+    workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+    test_job = workflow.split("\n  test:\n", 1)[1].split("\n  assemble:\n", 1)[0]
+    full_tests = test_job.split("      - name: Validate layouts, draft edits, backups and editor routes\n", 1)[1].split("\n      - ", 1)[0]
+    assert "        id: full_tests\n" in full_tests
+    step = test_job.split("      - name: Diagnose Intel package after failed tests\n", 1)[1].split("\n      - ", 1)[0]
+    assert test_job.index("        id: full_tests\n") < test_job.index("      - name: Diagnose Intel package after failed tests\n")
+    assert "        if: ${{ failure() && matrix.arch == 'x86_64' && steps.full_tests.outcome == 'failure' }}\n" in step
+    assert "HOMESCREEN_BUILD_PYTHON: ${{ runner.temp }}/release-python/bin/python3.12" in step
+    assert "HOMESCREEN_BUILD_ARCH: ${{ matrix.arch }}" in step
+    assert "continue-on-error" not in test_job
+    for title in ("Upload matching native source inputs", "Upload installable archives"):
+        upload = test_job.split("      - name: " + title + "\n", 1)[1].split("\n      - ", 1)[0]
+        assert "        if:" not in upload
+    assert "    needs: test\n" in workflow.split("\n  assemble:\n", 1)[1]
+    body = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    macapp = tmp_path / "macapp"
+    macapp.mkdir()
+    (macapp / "native_sources.py").write_text('''import os, pathlib, sys
+assert sys.argv[1:] == ["--arch", "x86_64", "--destination", os.environ["RUNNER_TEMP"] + "/release-python"]
+pathlib.Path("provider-ran").touch()
+sys.exit(int(os.environ["PROVIDER_STATUS"]))
+''')
+    build = macapp / "build.sh"
+    build.write_text('#!/bin/bash\nset -eu\ntest "$HOMESCREEN_BUILD_ARCH" = x86_64\ntest "$HOMESCREEN_BUILD_PYTHON" = "$RUNNER_TEMP/release-python/bin/python3.12"\ntouch build-ran\nexit "$BUILD_STATUS"\n')
+    build.chmod(0o755)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "python").symlink_to(sys.executable)
+    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=tmp_path, capture_output=True,
+                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                                 "BUILD_ARCH": "x86_64", "HOMESCREEN_BUILD_ARCH": "x86_64", "RUNNER_TEMP": str(tmp_path),
+                                 "HOMESCREEN_BUILD_PYTHON": str(tmp_path / "release-python/bin/python3.12"),
+                                 "PROVIDER_STATUS": str(provider_status), "BUILD_STATUS": str(build_status)})
+    assert result.returncode == (provider_status or build_status)
+    assert (tmp_path / "provider-ran").is_file()
+    assert (tmp_path / "build-ran").is_file() == (provider_status == 0)
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Uses the native Swift compiler and Mach-O signer")
 def test_swift_only_changes_and_canonical_launcher_are_sealed_into_local_record(tmp_path):
     import plistlib
     import subprocess
-    from frozen_sources import finalize_local_record, launcher_digest, verify_local_record
+    from frozen_sources import finalize_local_record, launcher_digest
 
     root = tmp_path / "editable project"
     target = root / "macapp/Shell/Sources/Homescreen"
@@ -683,10 +867,11 @@ def test_swift_only_changes_and_canonical_launcher_are_sealed_into_local_record(
     assert data["engine"] == "e" * 64 and data["editableOverlayHashes"] == {"cpython/config.py": "d" * 64}
     assert str(tmp_path).encode() not in record.read_bytes()
     before_signing = record.read_bytes()
+    unsigned_before = _unsigned_launcher_bytes(launcher, tmp_path / "launcher-before-signing")
     subprocess.run(["codesign", "--force", "--sign", "-", app], check=True, capture_output=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", app], check=True, capture_output=True)
     assert record.read_bytes() == before_signing
-    verify_local_record(app)
+    _verify_launcher_with_signing_diagnostics(app, unsigned_before, tmp_path / "launcher-after-signing")
     assert launcher_digest(launcher) == data["launcher"]["sha256"]
     subprocess.run(["swiftc", "-O", "-module-cache-path", tmp_path / "module-cache", target / "main.swift", added,
                     "-o", original], check=True, capture_output=True)
@@ -694,8 +879,12 @@ def test_swift_only_changes_and_canonical_launcher_are_sealed_into_local_record(
     main.write_text('print("another launcher")\n')
     subprocess.run(["swiftc", "-O", "-module-cache-path", tmp_path / "module-cache", main, "-o", launcher],
                    check=True, capture_output=True)
-    with pytest.raises(ValueError, match="launcher"):
-        verify_local_record(app)
+    with pytest.raises(ValueError, match="launcher") as tampered:
+        _verify_launcher_with_signing_diagnostics(app, unsigned_before, tmp_path / "launcher-after-tampering")
+    assert len(tampered.value.__notes__) == 1
+    assert tampered.value.__notes__[0].startswith("Native launcher signing diagnostics: ")
+    assert len(tampered.value.__notes__[0]) <= 2048
+    assert str(tmp_path) not in tampered.value.__notes__[0]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Builds and loads a native Darwin C extension")
