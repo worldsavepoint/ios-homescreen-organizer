@@ -582,17 +582,22 @@ class Session:
         if self.draft_path.exists():
             data = self.draft_path.read_bytes()
             self._draft_digest = hashlib.sha256(data).digest()
-            blob = plistlib.loads(data)
-            self._page_identity = blob.get("source_page_identity", _MISSING)
-            self._placement_revision = blob.get("placement_revision", "")
-            self.device_id = blob["device"]
-            self.info = blob.get("info", {})
-            self.grid = Grid(**blob["grid"]) if "grid" in blob else Grid()
-            if "source_placement" in blob:
-                self._observed_placement = disk_pins(blob["source_placement"])
-            elif "source_pins_reported" in blob:
-                self._observed_placement = blob["source_pin_map"] if blob["source_pins_reported"] else None
             try:
+                blob = plistlib.loads(data)
+                if not isinstance(blob, dict):
+                    raise ValueError("invalid draft")
+                device = blob["device"]
+                info = blob.get("info", {})
+                if not isinstance(device, str) or not device or not isinstance(info, dict):
+                    raise ValueError("invalid draft identity")
+                if self._draft_key is not None and self._draft_key != device:
+                    raise ValueError("draft belongs to another device")
+                self.device_id = device  # Recovery can still list this device's backups.
+                placement = _MISSING
+                if "source_placement" in blob:
+                    placement = disk_pins(blob["source_placement"])
+                elif "source_pins_reported" in blob:
+                    placement = blob["source_pin_map"] if blob["source_pins_reported"] else None
                 lay = Layout.from_snapshot(blob)
                 original = lay.original()  # validate source identity independently
                 for view in (lay, original):
@@ -616,10 +621,16 @@ class Session:
                             stable &= owners[pin_key(node)] == 1
                             if not stable:
                                 raise LayoutError("saved draft pin identity is ambiguous; call read again")
-                lay.approval_device = self.device_id
+                self.info, self.grid = info, lay.grid
+                self._observed_placement = placement
+                self._page_identity = blob.get("source_page_identity", _MISSING)
+                self._placement_revision = blob.get("placement_revision", "")
+                lay.approval_device = device
                 self.layout = lay
             except LayoutError as e:
                 self._draft_error = str(e)
+            except (ValueError, TypeError, KeyError, OverflowError, plistlib.InvalidFileException):
+                self._draft_error = "saved draft data is invalid; read the device again"
 
     def require(self) -> Layout:
         if self.layout is None:
@@ -841,13 +852,13 @@ class Session:
 
     def _remember_webclips(self, state: list[Any], library: list[Any] | None) -> None:
         known = self._known_webclips()
-        before = len(known)
+        updated = dict(known)
         for n in Layout(state, library=library).nodes.values():
             if n.kind == "webclip":
-                known[n.id] = {k: n.raw[k] for k in ("displayIdentifier", "displayName", "webClipURL")
-                               if isinstance(n.raw.get(k), str)}
-        if len(known) != before:
-            self._webclips_path.write_text(json.dumps(known, indent=1, sort_keys=True))
+                updated[n.id] = {k: n.raw[k] for k in ("displayIdentifier", "displayName", "webClipURL")
+                                 if isinstance(n.raw.get(k), str)}
+        if updated != known:
+            _private_replace(self._webclips_path, json.dumps(updated, indent=1, sort_keys=True).encode())
 
     def _with_webclips(self, state: list[Any], library: list[Any] | None) -> list[Any] | None:
         """library plus every remembered web clip that isn't on the Home Screen."""

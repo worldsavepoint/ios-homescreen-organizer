@@ -101,6 +101,12 @@ def is_folder(raw: dict[str, Any]) -> bool:
     return "iconLists" in raw and not is_widget(raw) and raw.get("iconType") != "app"
 
 
+def item_list(value: Any) -> list:
+    if not isinstance(value, list):
+        raise LayoutError("layout item containers must be lists; read the device again")
+    return value
+
+
 def _kind(raw: dict[str, Any]) -> str:
     if is_widget(raw):
         return "widget"
@@ -156,9 +162,9 @@ class Layout:
         self.source_library = copy.deepcopy(library if source is None else source_library)
         self._counter: dict[str, int] = {}
         self.nodes: dict[str, Node] = {}
-        self.dock = [self._wrap(r, "dock") for r in raw_state[0]]
-        self.pages = [[self._wrap(r, f"p{i}") for r in page] for i, page in enumerate(raw_state[1:], 1)]
-        self.library = None if library is None else [self._wrap(r, "library") for r in library]
+        self.dock = [self._wrap(r, "dock") for r in item_list(raw_state[0])]
+        self.pages = [[self._wrap(r, f"p{i}") for r in item_list(page)] for i, page in enumerate(raw_state[1:], 1)]
+        self.library = None if library is None else [self._wrap(r, "library") for r in item_list(library)]
         # App Bank: a draft-only tray for items set aside while rearranging. Never written.
         self.bank = [self._wrap(r, "bank") for r in bank or []]
         if identity is not None:
@@ -348,7 +354,7 @@ class Layout:
                     slots=_slots(raw, kind))
         self.nodes[nid] = node
         if kind == "folder":
-            node.children = [[self._wrap(r, nid) for r in page] for page in raw.get("iconLists", [])]
+            node.children = [[self._wrap(r, nid) for r in item_list(page)] for page in item_list(raw.get("iconLists"))]
             if where == "dock" and not node.children:
                 node.children = [[]]
         return node

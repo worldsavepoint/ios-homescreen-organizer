@@ -239,11 +239,14 @@ def _problem_details(lay: Layout, problems: list[str]) -> list[dict[str, Any]]:
             for message in problems]
 
 
-def view() -> dict[str, Any]:
-    s = session()
+def view(s=None) -> dict[str, Any]:
+    s = session() if s is None else s
     if s.layout is None:
-        return {"loaded": False, "source": s.source.name, "device_id": config.current_device(),
-                "read_only": _read_only()}
+        result = {"loaded": False, "source": s.source.name, "device_id": config.current_device(),
+                  "read_only": _read_only()}
+        if s._draft_error:
+            result["draft_error"] = s._draft_error
+        return result
     lay = s.layout
     d = lay.diff()
     baseline = None
@@ -408,8 +411,8 @@ async def get_health(request: Request) -> Response:
     return JSONResponse({"app": "homescreen", "ready": True})
 
 
-def _err(e: Exception, status: int = 400) -> JSONResponse:
-    return JSONResponse({"error": str(e), "view": view()}, status_code=status)
+def _err(e: Exception, status: int = 400, s=None) -> JSONResponse:
+    return JSONResponse({"error": str(e), "view": view(s)}, status_code=status)
 
 
 async def index(request: Request) -> Response:
@@ -484,11 +487,12 @@ async def post_read(request: Request) -> Response:
     if (bad := _guard(request)):
         return bad
     async with _device_lock:
+        s = session()
         try:
-            await session().read()
+            await s.read()
         except Exception as e:
-            return _err(RuntimeError(f"couldn't read the device: {e}"), 502)
-    return JSONResponse(view())
+            return _err(RuntimeError(f"couldn't read the device: {e}"), 502, s)
+    return JSONResponse(view(s))
 
 
 async def post_apply(request: Request) -> Response:

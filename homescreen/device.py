@@ -31,7 +31,7 @@ from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Protocol
 
-from .model import Grid, LayoutError, is_folder, is_widget, widget_wire_fields
+from .model import Grid, LayoutError, is_folder, is_widget, item_list, widget_wire_fields
 
 Layout = tuple[list[Any], list[Any] | None]
 
@@ -74,7 +74,7 @@ def _item_in(x: Any, names: dict[str, str]) -> Any:
         if "displayName" not in x:  # iOS leaves it out while the folder keeps its default name
             out["displayName"] = x.get("defaultDisplayName") or "Folder"
             out[NAME_MARK] = True
-        out["iconLists"] = [[_item_in(i, names) for i in page] for page in x["iconLists"]]
+        out["iconLists"] = [[_item_in(i, names) for i in item_list(page)] for page in item_list(x.get("iconLists"))]
         return out
     return x
 
@@ -261,9 +261,9 @@ def _archive_metrics(path: Path) -> dict[str, int]:
 
 def disk_to_model(raw: dict[str, Any], names: dict[str, str] | None = None) -> Layout:
     names = names or {}
-    state = [[_item_in(x, names) for x in raw.get("buttonBar", [])]]
-    state += [[_item_in(x, names) for x in page] for page in raw.get("iconLists", [])]
-    library = [_item_in(x, names) for x in raw.get("ignored", [])]
+    state = [[_item_in(x, names) for x in item_list(raw.get("buttonBar", []))]]
+    state += [[_item_in(x, names) for x in item_list(page)] for page in item_list(raw.get("iconLists"))]
+    library = [_item_in(x, names) for x in item_list(raw.get("ignored", []))]
     return state, library
 
 
