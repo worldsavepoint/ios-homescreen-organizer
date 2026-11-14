@@ -12,6 +12,44 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("sdk_version", ["15.4", "26.5"])
+def test_subprocess_builds_with_supported_sdks_and_uses_child_directory(tmp_path, sdk_version):
+    sdk = Path(f"/Library/Developer/CommandLineTools/SDKs/MacOSX{sdk_version}.sdk")
+    if not sdk.is_dir() or shutil.which("swiftc") is None:
+        pytest.skip("Requested macOS SDK unavailable")
+    source = ROOT / "macapp/Shell/Sources/Homescreen"
+    harness = tmp_path / "Harness.swift"
+    harness.write_text('''import Foundation
+@main struct Harness {
+    static func main() async {
+        let args = CommandLine.arguments
+        let result = await MCPProcessRunner.run(executablePath: args[1], arguments: [args[2]],
+            environment: [:], timeout: 3, cwd: args[3])
+        let data = try! JSONSerialization.data(withJSONObject: ["status": result.exitStatus,
+            "stdout": result.stdout, "stderr": result.stderr])
+        print(String(decoding: data, as: UTF8.self))
+    }
+}
+''')
+    binary = tmp_path / "runner"
+    modules = [source / name for name in ("MCPClientManager.swift", "MCPServiceCheck.swift",
+               "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift")]
+    build = subprocess.run(["xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
+                            "-target", "arm64-apple-macosx14.0", "-sdk", str(sdk),
+                            "-module-cache-path", str(tmp_path / "modules"),
+                            *map(str, modules), str(harness), "-o", str(binary)],
+                           capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    child = tmp_path / "child.py"
+    child.write_text("import os, sys\nprint(os.getcwd())\nprint('fixture-error', file=sys.stderr)\nsys.exit(7)\n")
+    cwd = tmp_path / "child directory"
+    cwd.mkdir()
+    result = subprocess.run([str(binary), sys.executable, str(child), str(cwd)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": 7, "stdout": str(cwd) + "\n", "stderr": "fixture-error\n"}
+
+
 @pytest.fixture(scope="module")
 def native_mcp_binary(tmp_path_factory):
     if shutil.which("swiftc") is None:

@@ -27,8 +27,7 @@ final class MCPChildCancellation: @unchecked Sendable {
         // The child becomes its group leader atomically, before an npm launcher can fork.
         try checked(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)))
         try checked(posix_spawnattr_setpgroup(&attributes, 0))
-        if #available(macOS 26, *) { try checked(posix_spawn_file_actions_addchdir(&actions, cwd)) }
-        else { try checked(posix_spawn_file_actions_addchdir_np(&actions, cwd)) }
+        try checked(posix_spawn_file_actions_addchdir_np(&actions, cwd))
         for (index, handle) in [stdin, stdout, stderr].enumerated() {
             if handle.fileDescriptor >= 0 {
                 try checked(posix_spawn_file_actions_adddup2(&actions, handle.fileDescriptor, Int32(index)))
