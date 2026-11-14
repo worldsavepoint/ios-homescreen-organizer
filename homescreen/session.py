@@ -25,8 +25,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import colors
-from .device import DISK_MARK, ObservedPins, Source, disk_pins, require_writable
-from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, structure, widget_configuration
+from .device import DISK_MARK, NAME_MARK, ObservedPins, Source, disk_pins, disk_to_model, page_fields, require_writable
+from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, widget_configuration
 
 KEEP_READS = 10
 MAX_UNDO = 200
@@ -354,7 +354,7 @@ def _retains_pins(requested: Layout, observed: Layout, memory: dict[str, Any] | 
 
 def placed_structure(state: list[Any], library: list[Any] | None,
                      keyed_pins: dict[str, Any] | list[dict[str, int]] | None,
-                     grid: Grid | None = None, by_memory: bool = False) -> str:
+                     grid: Grid | None = None, by_memory: bool = False, *, leaf_dicts: bool = False) -> str:
     """Like model.structure, but each page lists its items in grid order (row by row) after
     gaps are applied. iOS reorders a page's list by position when it has gaps, so list order
     alone would report a correct write as a mismatch."""
@@ -366,10 +366,33 @@ def placed_structure(state: list[Any], library: list[Any] | None,
     for page in lay.pages:
         pos, _ = lay.place(page)
         order = sorted(page, key=lambda n: (pos[n.id][0], pos[n.id][1]) if n.id in pos else (99, 0))
-        pages.append([[node_structure(n), pos[n.id][:2] if n.id in pos else None] for n in order])
-    return json.dumps({"dock": [node_structure(n) for n in lay.dock], "pages": pages,
-                       "library": lay.library_structure()},
+        pages.append([[_carried_node(n, leaf_dicts), pos[n.id][:2] if n.id in pos else None] for n in order])
+    return json.dumps({"dock": [_carried_node(n, leaf_dicts) for n in lay.dock], "pages": pages,
+                       "library": _carried_library(lay, leaf_dicts)},
                       default=list)
+
+
+def _carried_node(node: Node, leaf_dicts: bool) -> Any:
+    """Compare fields actually sent by the selected writer, separately from persistent pin identities."""
+    if node.kind == "folder":
+        fields = {k: v for k, v in node.raw.items()
+                  if k not in (NAME_MARK, "iconLists", "displayName", "uniqueIdentifier", "listUniqueIdentifiers")}
+        return [node.name, plistlib.dumps(fields, fmt=plistlib.FMT_BINARY).hex(),
+                [[_carried_node(c, leaf_dicts) for c in page] for page in node.children if page]]
+    if leaf_dicts and node.bundle_id and not node.raw.get(DISK_MARK):
+        return {"fields": plistlib.dumps(node.raw, fmt=plistlib.FMT_BINARY).hex()}
+    return node_structure(node)
+
+
+def _carried_library(lay: Layout, leaf_dicts: bool) -> list | None:
+    if lay.library is None:
+        return None
+    return sorted((_carried_node(n, leaf_dicts) for n in lay.library), key=json.dumps)
+
+
+def _carried_layout(lay: Layout, leaf_dicts: bool) -> tuple[list, list | None]:
+    return ([[_carried_node(n, leaf_dicts) for n in page] for page in [lay.dock, *lay.pages]],
+            _carried_library(lay, leaf_dicts))
 
 
 def _widgets(state: list[Any]) -> list[dict[str, Any]]:
@@ -449,9 +472,12 @@ class _SourceObservation:
     pins: Any
     page_identity: Any
     layout: Layout
+    archive: dict | None
+    leaf_dicts: bool
 
     def same_layout(self, other: "_SourceObservation") -> bool:
-        return structure(self.state, self.library) == structure(other.state, other.library)
+        return (self.leaf_dicts == other.leaf_dicts and
+                _carried_layout(self.layout, self.leaf_dicts) == _carried_layout(other.layout, other.leaf_dicts))
 
     def same_placement(self, other: "_SourceObservation") -> bool:
         return (same_reported_pins(self.pins, other.pins)
@@ -1018,14 +1044,18 @@ class Session:
         if pins is not None:
             node_pins(layout, pins, strict=True)
         return _SourceObservation(state, library, pins, copy.deepcopy(getattr(self.source, "page_identity", {})),
-                                  layout)
+                                  layout, copy.deepcopy(getattr(self.source, "source_archive", None)),
+                                  getattr(self.source, "writes_leaf_dictionaries", True))
 
     def _backup(self, state: list[Any], library: list[Any] | None, label: str,
-                pins: list[dict[str, int]] | None = None, *, observed: Layout | None = None) -> Path:
+                pins: list[dict[str, int]] | None = None, *, observed: Layout | None = None,
+                archive: dict[str, Any] | None = None) -> Path:
         if not self.device_id:
             raise LayoutError("device identity is required for a backup")
         p = self._dev_dir("backups") / f"{_stamp()}-{label}-{uuid.uuid4().hex}.plist"
         blob = plistlib.loads(_pack(state, library, pins))
+        if archive is not None:
+            blob["source_archive"] = archive
         provenance = {"version": 1, "device_id": self.device_id, "grid": self.grid.to_dict()}
         if observed is not None:
             provenance["pin_keys"] = "wire-v1"
@@ -1052,7 +1082,7 @@ class Session:
                               label: str, pins: list[dict[str, int]] | None = None,
                               expected: tuple[list[Any], list[Any] | None] | None = None,
                               expected_pins: Any = _MISSING, prepared: Layout | None = None,
-                              backup_instances: Set[str] = frozenset()) -> dict[str, Any]:
+                              backup_instances: Set[str] = frozenset(), page_archive: dict | None = None) -> dict[str, Any]:
         # Invalid requested pins must fail before a backup, pending marker or source write.
         want_pins = pins or []
         if self._placement_revision != self._saved_placement_revision():
@@ -1066,7 +1096,7 @@ class Session:
         original = self.require().original() if expected is not None else current.layout
         bound_ids = _instance_ids(original, previous_memory)
         if expected is not None:
-            if structure(current.state, current.library) != structure(*expected):
+            if _carried_layout(current.layout, current.leaf_dicts) != _carried_layout(original, current.leaf_dicts):
                 raise LayoutError("the phone's layout changed since it was read; read again and redo the edits")
             if expected_pins is not _MISSING and not same_reported_pins(current.pins, expected_pins):
                 raise LayoutError("the phone's exported gaps changed since it was read; read again and redo the edits")
@@ -1090,11 +1120,17 @@ class Session:
             raise LayoutError("the phone's layout changed during the final prewrite read; read again")
         if not current.same_placement(final):
             raise LayoutError("the phone's exported gaps changed during the final prewrite read; read again")
+        archive_args = {}
+        retained_fields = page_fields(page_archive if page_archive is not None else final.archive or {}, len(target) - 1)
+        if page_archive is not None and final.archive is not None:
+            archive_args["page_archive"] = page_archive
+        elif retained_fields and final.archive is None:
+            raise LayoutError("this source cannot restore the backup's exported page metadata")
         prepared_write = None
         prepare_write = getattr(self.source, "prepare_write", None)
         if prepare_write is not None:
             target_lib, prepared_write = await asyncio.wait_for(
-                prepare_write(target, target_lib, want_pins, self.grid), OPERATION_TIMEOUT)
+                prepare_write(target, target_lib, want_pins, self.grid, **archive_args), OPERATION_TIMEOUT)
         info = await self._assert_identity()
         self._check_placement(requested, saved, info)
         check_write = getattr(self.source, "check_write", None)
@@ -1110,14 +1146,14 @@ class Session:
             requested_memory = memory_pins(prepared, previous_memory, bound_ids)
         else:
             requested_memory = memory_pins(requested, previous_memory, backup_instances)
-        backup = self._backup(saved.to_state(), saved.to_library(), label, saved_pins, observed=saved)
+        backup = self._backup(saved.to_state(), saved.to_library(), label, saved_pins, observed=saved, archive=final.archive)
         lib_known = target_lib is not None
         _publish_exclusive(self._pending_path, json.dumps({"device_id": self.device_id,
                            "backup": backup.name, "status": "pending"}).encode())
         write_error = None
         try:
             operation = (prepared_write() if prepared_write is not None
-                         else self.source.write(target, target_lib, want_pins, self.grid))
+                         else self.source.write(target, target_lib, want_pins, self.grid, **archive_args))
             await asyncio.wait_for(operation, OPERATION_TIMEOUT)
         except Exception as e:
             write_error = str(e) or type(e).__name__
@@ -1145,8 +1181,14 @@ class Session:
             if not _retains_pins(requested, observed, requested_memory):
                 raise LayoutError("readback did not retain every requested fixed position")
             ok = (placed_structure(after, after_lib if lib_known else None, got_pins, self.grid,
-                                   by_memory=unreported)
-                  == placed_structure(target, target_lib, want_pins, self.grid))
+                                   by_memory=unreported, leaf_dicts=final.leaf_dicts)
+                  == placed_structure(target, target_lib, want_pins, self.grid, leaf_dicts=final.leaf_dicts))
+            if retained_fields:
+                reported = page_fields(getattr(self.source, "source_archive", None) or {}, len(after) - 1)
+                for pid, wanted in retained_fields.items():
+                    present = {k: v for k, v in reported.get(pid, {}).items() if k in wanted}
+                    if plistlib.dumps(wanted, fmt=plistlib.FMT_BINARY) != plistlib.dumps(present, fmt=plistlib.FMT_BINARY):
+                        raise LayoutError("readback changed an exported page field")
         except Exception as e:
             return {"ok": False, "status": "unknown", "backup": backup.name,
                     "warnings": [verification_note],
@@ -1252,6 +1294,18 @@ class Session:
             if not isinstance(state, list) or (library is not None and not isinstance(library, list)):
                 raise ValueError("invalid layout payload")
             restored = Layout(state, library=library, grid=self.grid)
+            page_archive = None
+            archive = blob.get("source_archive") if isinstance(blob, dict) else None
+            if archive is not None:
+                if not isinstance(archive, dict):
+                    raise ValueError("invalid saved source archive")
+                original_state, original_lib = disk_to_model(archive)
+                original = Layout(original_state, library=original_lib, grid=restored.grid)
+                if len(original.pages) != len(restored.pages):
+                    raise ValueError("archive page count differs from saved layout")
+                metadata = disk_pins(archive)
+                if metadata.archive:
+                    page_archive = metadata.archive
             pins = _unpack_pins(data)
             if pins is not None and (not isinstance(pins, list) or any(not isinstance(page, dict) for page in pins)):
                 raise LayoutError("backup pins must identify items on each page")
@@ -1298,6 +1352,8 @@ class Session:
                     mapped.append(mapped_page)
                 pins = mapped
                 node_pins(restored, pins, strict=True)
+            if page_archive is not None:
+                metadata.validate([{pin_key(n) for n in page} for page in original.pages], old_grid or self.grid)
             bound = set()
             if "folder_instances" in provenance:
                 pages = provenance["folder_instances"]
@@ -1328,4 +1384,5 @@ class Session:
             raise
         except (ValueError, TypeError, KeyError, plistlib.InvalidFileException) as e:
             raise LayoutError("backup identity or layout data is invalid") from e
-        return await self._write_verified(state, library, "before-restore", pins, backup_instances=bound)
+        return await self._write_verified(state, library, "before-restore", pins, backup_instances=bound,
+                                          page_archive=page_archive)

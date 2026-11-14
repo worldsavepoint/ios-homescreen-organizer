@@ -233,6 +233,18 @@ def disk_pins(raw: dict[str, Any]) -> ObservedPins:
     return ObservedPins(raw)
 
 
+def page_fields(archive: dict, count: int) -> dict:
+    """Extra fields owned by each retained dictionary-archive page."""
+    meta = archive.get("listMetadata", {})
+    fields = {}
+    for pid in archive.get("listUniqueIdentifiers", [])[:count]:
+        extra = {k: v for k, v in meta.get(pid, {}).items()
+                 if k not in ("fixedLocations", "fixedLocationsGridColumns", "fixedLocationsGridRows")}
+        if extra:
+            fields[pid] = extra
+    return fields
+
+
 def is_dict_format(raw: Any) -> bool:
     return isinstance(raw, dict) and "iconLists" in raw
 
@@ -269,7 +281,7 @@ def disk_to_model(raw: dict[str, Any], names: dict[str, str] | None = None) -> L
 
 def model_to_disk(state: list[Any], library: list[Any] | None, base: dict[str, Any],
                   pins: list[dict[str, int]] | None = None, grid: Grid | None = None, *,
-                  keep_archive_frame: bool = False) -> dict[str, Any]:
+                  keep_archive_frame: bool = False, page_archive: dict[str, Any] | None = None) -> dict[str, Any]:
     """Rebuild the dict format; keys we don't touch (today view, ids) come from base. pins
     (per page) replace the gaps when given. grid supplies their page dimensions, with
     iPhone defaults when omitted."""
@@ -278,6 +290,11 @@ def model_to_disk(state: list[Any], library: list[Any] | None, base: dict[str, A
     if "listUniqueIdentifiers" in base:
         _validate_page_ids(base, len(base["iconLists"]))
     out = dict(base)
+    if page_archive is not None:
+        for key in ("listUniqueIdentifiers", "listMetadata"):
+            out.pop(key, None)
+            if key in page_archive:
+                out[key] = page_archive[key]
     out["buttonBar"] = [_item_out(x) for x in state[0]]
     out["iconLists"] = [[_item_out(x) for x in page] for page in state[1:]]
     _fix_list_ids(out, len(out["iconLists"]))
@@ -287,9 +304,12 @@ def model_to_disk(state: list[Any], library: list[Any] | None, base: dict[str, A
         if "listUniqueIdentifiers" not in out:
             out["listUniqueIdentifiers"] = [str(uuid.uuid4()).upper() for _ in out["iconLists"]]
         ids = out["listUniqueIdentifiers"]
+        extra_fields = page_fields(out, len(ids))
         meta = _list_metadata(ids, pins, grid)
         if keep_archive_frame and ids and not meta and grid and (grid.cols, grid.rows) != (Grid().cols, Grid().rows):
             meta[ids[0]] = {"fixedLocationsGridColumns": grid.cols, "fixedLocationsGridRows": grid.rows}
+        for pid, extras in extra_fields.items():
+            meta[pid] = {**extras, **meta.get(pid, {})}
         if meta:
             out["listMetadata"] = meta
         else:
@@ -414,6 +434,14 @@ class PhoneSource:
         raw = self._last_dict or {}
         return {k: raw[k] for k in ("listUniqueIdentifiers",) if k in raw}
 
+    @property
+    def source_archive(self) -> dict[str, Any] | None:
+        return self._last_dict
+
+    @property
+    def writes_leaf_dictionaries(self) -> bool:
+        return self._last_dict is not None or self.write_mode == "list"
+
     def check_write(self, pins: list[dict[str, int]] | None, library: list[Any] | None = None) -> None:
         if self._last_dict is not None:
             if "listUniqueIdentifiers" in self._last_dict:
@@ -425,13 +453,14 @@ class PhoneSource:
 
     @_bounded
     async def prepare_write(
-        self, state: list[Any], library: list[Any] | None, pins: list[dict[str, int]] | None, grid: Grid | None
+        self, state: list[Any], library: list[Any] | None, pins: list[dict[str, int]] | None, grid: Grid | None,
+        *, page_archive: dict[str, Any] | None = None
     ) -> tuple[list[Any] | None, Callable[[], Awaitable[None]]]:
         """Build the target once, including the installed apps retained by the root writer."""
         require_writable()
         self.check_write(pins, library)
         if self._last_dict is not None:
-            payload: Any = model_to_disk(state, library, self._last_dict, pins, grid)
+            payload: Any = model_to_disk(state, library, self._last_dict, pins, grid, page_archive=page_archive)
         elif self.write_mode == "list":
             payload = state
         else:
@@ -553,6 +582,7 @@ class SimSource:
     async def read(self) -> Layout:
         raw = plistlib.loads(self.path.read_bytes())
         names = {b: a.get("CFBundleDisplayName") or a.get("CFBundleName") or b for b, a in self.apps().items()}
+        self.source_archive = raw
         self.pins = disk_pins(raw)
         return disk_to_model(raw, names)
 
@@ -567,10 +597,12 @@ class SimSource:
 
     @_bounded
     async def write(self, state: list[Any], library: list[Any] | None,
-                    pins: list[dict[str, int]] | None = None, grid: Grid | None = None) -> None:
+                    pins: list[dict[str, int]] | None = None, grid: Grid | None = None, *,
+                    page_archive: dict[str, Any] | None = None) -> None:
         require_writable()
         base = plistlib.loads(self.path.read_bytes())
-        out = model_to_disk(state, library, base, pins if pins is not None else [], grid, keep_archive_frame=True)
+        out = model_to_disk(state, library, base, pins if pins is not None else [], grid,
+                            keep_archive_frame=True, page_archive=page_archive)
         before = self._springboard_pid()
         self.path.write_bytes(plistlib.dumps(out, fmt=plistlib.FMT_BINARY))
         # SIGKILL so SpringBoard can't save its old in-memory layout over ours on the way out
@@ -658,6 +690,7 @@ class FileSource:
 
     async def read(self) -> Layout:
         raw = plistlib.loads(self.path.read_bytes())
+        self.source_archive = raw if is_dict_format(raw) else None
         self.pins = disk_pins(raw) if is_dict_format(raw) else None
         return disk_to_model(raw) if is_dict_format(raw) else (raw, None)
 
@@ -668,11 +701,13 @@ class FileSource:
             _check_list_write(pins, library)
 
     async def write(self, state: list[Any], library: list[Any] | None,
-                    pins: list[dict[str, int]] | None = None, grid: Grid | None = None) -> None:
+                    pins: list[dict[str, int]] | None = None, grid: Grid | None = None, *,
+                    page_archive: dict[str, Any] | None = None) -> None:
         require_writable()
         raw = plistlib.loads(self.path.read_bytes())
         if is_dict_format(raw):
-            out = model_to_disk(state, library, raw, pins if pins is not None else [], grid, keep_archive_frame=True)
+            out = model_to_disk(state, library, raw, pins if pins is not None else [], grid,
+                                keep_archive_frame=True, page_archive=page_archive)
         else:
             _check_list_write(pins, library)
             out = state
