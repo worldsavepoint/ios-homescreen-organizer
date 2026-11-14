@@ -531,3 +531,52 @@ def test_restore_refuses_unrelated_raw_page_attached_to_the_model(tmp_path):
     with pytest.raises(LayoutError, match="backup"):
         asyncio.run(session.restore(backup.name))
     assert path.read_bytes() == before and not session._pending_path.exists()
+
+
+@pytest.mark.parametrize("damage", ["duplicate-ids", "typed-ids", "record-owner", "frame-type", "pin-value", "valid"])
+def test_historical_raw_backup_validates_page_evidence_before_restore(tmp_path, damage):
+    path = tmp_path / "archive.plist"
+    raw = {"iconLists": [["a"], ["b"]], "ignored": [], "listUniqueIdentifiers": ["A", "B"],
+           "listMetadata": {"A": {"fixedLocations": {"a": 3}, "fixedLocationsGridColumns": 4,
+                                   "fixedLocationsGridRows": 6}, "B": {"opaque": b"B"}}}
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    backup = session._backup(session.require().to_state(), [], "older", [{"a": 3}, {}],
+                             observed=session.require(), archive=raw)
+    body = plistlib.loads(backup.read_bytes())
+    body["provenance"].pop("archive_pins_reported")
+    archive = body["source_archive"]
+    if damage == "duplicate-ids":
+        archive["listUniqueIdentifiers"] = ["A", "A"]
+    elif damage == "typed-ids":
+        archive["listUniqueIdentifiers"] = [False, True]
+    elif damage == "record-owner":
+        archive["listMetadata"]["unrelated"] = {"opaque": b"data"}
+    elif damage == "frame-type":
+        archive["listMetadata"]["A"]["fixedLocationsGridColumns"] = True
+    elif damage == "pin-value":
+        archive["listMetadata"]["A"]["fixedLocations"]["a"] = 2
+    backup.write_bytes(plistlib.dumps(body))
+    before = path.read_bytes(), session.backups()
+    if damage == "valid":
+        assert asyncio.run(session.restore(backup.name))["ok"]
+    else:
+        with pytest.raises(LayoutError):
+            asyncio.run(session.restore(backup.name))
+        assert (path.read_bytes(), session.backups()) == before
+        assert not session._pending_path.exists()
+
+
+def test_historical_raw_backup_without_reported_pins_can_keep_remembered_positions(tmp_path):
+    path = tmp_path / "archive.plist"
+    raw = {"iconLists": [["a", "b"]], "ignored": [], "listUniqueIdentifiers": ["A"]}
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    backup = session._backup(session.require().to_state(), [], "older", [{"a": 4}], archive=raw)
+    body = plistlib.loads(backup.read_bytes())
+    body["provenance"].pop("archive_pins_reported")
+    backup.write_bytes(plistlib.dumps(body))
+    assert asyncio.run(session.restore(backup.name))["ok"]
+    assert plistlib.loads(path.read_bytes())["listMetadata"]["A"]["fixedLocations"] == {"a": 4}

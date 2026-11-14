@@ -1485,9 +1485,12 @@ class Session:
                     mapped.append(mapped_page)
                 pins = mapped
                 node_pins(restored, pins, strict=True)
-            if page_archive is not None and provenance.get("archive_pins_reported"):
+            if page_archive is not None:
                 metadata.validate([{pin_key(n) for n in page} for page in original.pages], old_grid or self.grid)
-                if metadata.pages(len(original.pages)) != (saved_wire_pins or [{} for page in original.pages]):
+                reported = provenance.get("archive_pins_reported", "listMetadata" in archive)
+                if type(reported) is not bool:
+                    raise LayoutError("backup archive placement evidence is invalid")
+                if reported and metadata.pages(len(original.pages)) != (saved_wire_pins or [{} for page in original.pages]):
                     raise LayoutError("backup archive positions differ from the saved layout")
             bound = set()
             if "folder_instances" in provenance:
