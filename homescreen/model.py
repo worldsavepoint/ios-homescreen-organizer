@@ -255,7 +255,8 @@ class Layout:
             if type(snap.get("page_origins_known", True)) is not bool:
                 raise LayoutError("saved draft page identities are invalid; read the device again")
             lay.page_origins_known = snap.get("page_origins_known", True)
-        elif lay.to_state() != lay.source:
+        elif (lay.to_state() != lay.source or
+              lay.identity(include_bank=False)["ids"] != lay.source_identity["ids"]):
             # Older drafts did not track page moves independently of their contents.
             lay.page_origins_known = False
             lay.page_origins = [i if i < len(lay.source) - 1 else -1 for i in range(len(lay.pages))]
@@ -934,7 +935,8 @@ class Layout:
         pins = [[(node.id, self.pins[node.id]) for node in page if node.id in self.pins] for page in self.pages]
         blob = plistlib.dumps({"device": self.approval_device or "",
                                "state": self.to_state(), "library": self.to_library() or [],
-                               "pins": pins, "grid": self.grid.to_dict()},
+                               "pins": pins, "grid": self.grid.to_dict(),
+                               "page_origins": self.page_origins, "page_origins_known": self.page_origins_known},
                               fmt=plistlib.FMT_BINARY, sort_keys=True)
         return "apply-" + hashlib.sha256(blob).hexdigest()[:10]
 

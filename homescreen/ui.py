@@ -108,7 +108,7 @@ def _same_fields(a: Any, b: Any) -> bool:
 
 
 def _has_changes(lay: Layout, original: Layout) -> bool:
-    if (lay.bank or lay.pins != lay.source_pins or
+    if (lay.bank or lay.pins != lay.source_pins or lay.page_origins != list(range(len(lay.source) - 1)) or
             lay.identity()["ids"] != lay.source_identity["ids"] or
             not _same_fields(lay.to_library(), lay.source_library)):
         return True

@@ -4,10 +4,65 @@ import plistlib
 import pytest
 
 from fake_phone import app, folder
+from homescreen import ui
 from homescreen.device import FileSource, disk_to_model
 from homescreen.model import Layout, LayoutError
 from homescreen.session import Session
 from test_integrity import MemorySource
+
+
+@pytest.mark.parametrize("operation", ["replace", "reorder-identical"])
+def test_review_approval_covers_archive_page_ownership(tmp_path, operation):
+    path = tmp_path / "archive.plist"
+    pages = [["x"]] if operation == "replace" else [["x"], ["x"]]
+    ids = ["A"] if operation == "replace" else ["A", "B"]
+    path.write_bytes(plistlib.dumps({"iconLists": pages, "ignored": [], "listUniqueIdentifiers": ids,
+                                    "listMetadata": {pid: {"opaque": pid} for pid in ids}}))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    token = session.require().token()
+    if operation == "replace":
+        session.edit(lambda lay: (lay.insert_page(2), lay.move("x", "page:2"), lay.delete_page(1)))
+    else:
+        session.edit(lambda lay: lay.move_page(1, 2))
+    assert ui.view(session)["diff"]["has_changes"]
+    with pytest.raises(LayoutError, match="token"):
+        asyncio.run(session.apply(token))
+    assert not session.backups() and not session._pending_path.exists()
+    assert session.undo()
+    assert session.require().token() == token and not ui.view(session)["diff"]["has_changes"]
+    assert session.redo()
+    assert asyncio.run(session.apply(session.require().token()))["ok"]
+    written = plistlib.loads(path.read_bytes())
+    if operation == "replace":
+        assert written["listUniqueIdentifiers"][0] != "A" and "listMetadata" not in written
+    else:
+        assert written["listUniqueIdentifiers"] == ["B", "A"]
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+def test_legacy_duplicate_wire_pages_require_known_occurrence_ownership(tmp_path, reorder):
+    path = tmp_path / "archive.plist"
+    raw = {"iconLists": [["x"], ["x"]], "ignored": [], "listUniqueIdentifiers": ["A", "B"],
+           "listMetadata": {"A": {"opaque": b"A"}, "B": {"opaque": b"B"}}}
+    path.write_bytes(plistlib.dumps(raw))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    if reorder:
+        session.edit(lambda lay: lay.move_page(1, 2))
+    blob = plistlib.loads(session.draft_path.read_bytes())
+    blob.pop("page_origins")
+    blob.pop("page_origins_known")
+    session.draft_path.write_bytes(plistlib.dumps(blob))
+    session = Session(source, session.dir)
+    if reorder:
+        with pytest.raises(LayoutError, match="page ownership.*read"):
+            asyncio.run(session.apply(session.require().token()))
+        assert not session.backups() and not session._pending_path.exists()
+        assert plistlib.loads(path.read_bytes()) == raw
+    else:
+        assert asyncio.run(session.apply(session.require().token()))["ok"]
 
 
 @pytest.mark.parametrize(("state", "library"), [
