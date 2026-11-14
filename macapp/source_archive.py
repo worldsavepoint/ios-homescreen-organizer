@@ -27,10 +27,21 @@ ARCHES = ("arm64", "x86_64")
 RESOURCES = "Screen Organizer.app/Contents/Resources/"
 ENGINE = RESOURCES + "engine/"
 LIMIT = 2 * 1024**3
+INTEL_OPENSSL_NOTICE = "native/openssl/4.0.3/openssl-4.0.3/LICENSE.txt"
 
 
 def asset_name(version):
     return f"home-screen-organizer-{version}-corresponding-source.tar.gz"
+
+
+def intel_notice(inputs, output):
+    _, native = read_locks()
+    pin = next(item for item in native["assets"] if item["id"] == "openssl/4.0.3")
+    member = "openssl-4.0.3/LICENSE.txt"
+    path = inputs / "ThirdPartyLicenses" / INTEL_OPENSSL_NOTICE
+    if path.is_symlink() or not path.is_file() or sha256(path) != pin["notices"][member]:
+        raise ValueError("Missing authenticated Intel OpenSSL notice")
+    output.write_bytes(path.read_bytes())
 
 
 def validate_inventory(data, arch, version, packages, native):
@@ -118,6 +129,8 @@ def check_zip(source, inventory):
         for name, value in expected.items():
             if hashlib.sha256(archive.read(prefix + name)).hexdigest() != value:
                 raise ValueError(f"Different signed notice: {name}")
+        if arch == "x86_64" and hashlib.sha256(archive.read(RESOURCES + "OPENSSL-LICENSE.txt")).hexdigest() != expected.get(INTEL_OPENSSL_NOTICE):
+            raise ValueError("Different additional Intel OpenSSL notice")
         return archive.read(RESOURCES + "THIRD-PARTY-NOTICES.txt")
 
 
@@ -382,6 +395,9 @@ def main():
     stage = sub.add_parser("native")
     for arg in ("inputs", "archive", "output"):
         stage.add_argument("--" + arg, type=Path, required=True)
+    notice = sub.add_parser("intel-notice")
+    for arg in ("inputs", "output"):
+        notice.add_argument("--" + arg, type=Path, required=True)
     build = sub.add_parser("assemble")
     for arg in ("inputs", "release"):
         build.add_argument("--" + arg, type=Path, required=True)
@@ -391,6 +407,8 @@ def main():
     try:
         if args.action == "native":
             native_inputs(args.inputs, args.archive, args.output)
+        elif args.action == "intel-notice":
+            intel_notice(args.inputs, args.output)
         else:
             assemble(args.inputs, args.release, args.version, args.commit, args.repository)
     except (KeyError, OSError, ValueError, subprocess.CalledProcessError, tarfile.TarError, zipfile.BadZipFile) as error:

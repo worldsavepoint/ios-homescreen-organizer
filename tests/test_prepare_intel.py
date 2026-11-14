@@ -51,6 +51,57 @@ def test_generated_intel_lock_parses_with_the_selected_backend_wheel(tmp_path):
         assert selected == expected
 
 
+@pytest.mark.parametrize("cached", ["missing", "changed", "symlink"])
+def test_intel_app_notice_comes_from_authenticated_capture(tmp_path, cached):
+    import sys
+    from source_fixture import fixture_checkout
+
+    checkout = tmp_path / "project"
+    fixture_checkout(checkout, "1.3.0")
+    cache = checkout / "build/dependencies/x86_64"
+    cache.mkdir(parents=True)
+    untrusted = cache / "OPENSSL-LICENSE.txt"
+    if cached == "changed":
+        untrusted.write_bytes(b"unrelated cache notice")
+    elif cached == "symlink":
+        untrusted.symlink_to(tmp_path / "unrelated")
+        (tmp_path / "unrelated").write_bytes(b"unrelated cache notice")
+    stage = tmp_path / "capture"
+    notice = stage / "ThirdPartyLicenses/native/openssl/4.0.3/openssl-4.0.3/LICENSE.txt"
+    notice.parent.mkdir(parents=True)
+    notice.write_bytes(b"authenticated OpenSSL grant")
+    output = tmp_path / "app-notice"
+    args = [sys.executable, checkout / "macapp/source_archive.py", "intel-notice", "--inputs", stage, "--output", output]
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == b"authenticated OpenSSL grant"
+    notice.unlink()
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode != 0
+    notice.symlink_to(tmp_path / "unrelated")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode != 0
+
+
+def test_changed_additional_intel_notice_is_rejected(tmp_path):
+    import json
+    import zipfile
+    from source_fixture import release_source
+    from source_archive import check_zip
+
+    release_source(tmp_path, "1.3.0", tmp_path / "checkout")
+    archive = tmp_path / "home-screen-organizer-1.3.0-macos-x86_64.zip"
+    with zipfile.ZipFile(archive) as source:
+        files = [(info, source.read(info)) for info in source.infolist()]
+        inventory = json.loads(source.read("Screen Organizer.app/Contents/Resources/SourceInventory.json"))
+    check_zip(archive, inventory)
+    with zipfile.ZipFile(archive, "w") as target:
+        for info, data in files:
+            target.writestr(info, b"changed extra notice" if info.filename.endswith("/OPENSSL-LICENSE.txt") else data)
+    with pytest.raises(ValueError, match="OpenSSL"):
+        check_zip(archive, inventory)
+
+
 @pytest.mark.parametrize("system,architecture,translated", [
     ("Darwin", "arm64", "0"),
     ("Linux", "x86_64", "0"),

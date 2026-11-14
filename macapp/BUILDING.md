@@ -88,7 +88,7 @@ The other dependency versions match the arm64 pins.
 - `OUTPUT_DIR/requirements-build.lock`: a complete, hashed Intel wheel lock,
   including the locally built cryptography wheel's hash.
 - `OUTPUT_DIR/wheels/`: the compiled cryptography wheel used by `--find-links`.
-- `OUTPUT_DIR/OPENSSL-LICENSE.txt`: the verified OpenSSL license included in the Intel app.
+- `OUTPUT_DIR/OPENSSL-LICENSE.txt`: the standalone OpenSSL build notice. The Intel app embeds the matching grant from the authenticated `ThirdPartyLicenses/native/openssl/4.0.3/openssl-4.0.3/LICENSE.txt` captured during its freeze.
 
 The committed `requirements-build-x86_64.lock` contains the Intel wheel and
 build-tool pins; `requirements-cryptography-x86_64.lock` pins the cryptography

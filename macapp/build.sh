@@ -99,7 +99,7 @@ cp -R "$BUILD/dist/engine" "$APP/Contents/Resources/engine"
   > "$APP/Contents/Resources/dependencies.txt"
 if [[ "$ARCH" == x86_64 ]]; then
   cp "$ROOT/requirements-cryptography-x86_64.lock" "$APP/Contents/Resources/requirements-cryptography-x86_64.lock"
-  cp "$DEPENDENCIES/OPENSSL-LICENSE.txt" "$APP/Contents/Resources/OPENSSL-LICENSE.txt"
+  "$VENV/bin/python" "$ROOT/macapp/source_archive.py" intel-notice --inputs "$SOURCE_STAGE" --output "$APP/Contents/Resources/OPENSSL-LICENSE.txt"
 fi
 cp "$ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
 cp "$SOURCE_STAGE/THIRD-PARTY-NOTICES.txt" "$APP/Contents/Resources/"
