@@ -404,6 +404,11 @@ def _carried_layout(lay: Layout, leaf_dicts: bool) -> tuple[list, list | None]:
             _carried_library(lay, leaf_dicts))
 
 
+def _clip_inventory(lay: Layout) -> list[str]:
+    return sorted(plistlib.dumps(n.raw, fmt=plistlib.FMT_BINARY).hex()
+                  for n in lay.nodes.values() if n.kind == "webclip")
+
+
 def _widgets(state: list[Any]) -> list[dict[str, Any]]:
     """Every top-level widget dict in a list-format state (widgets can't be in folders)."""
     return [x for page in state for x in page
@@ -483,9 +488,10 @@ class _SourceObservation:
     layout: Layout
     archive: dict | None
     leaf_dicts: bool
+    reported_clips: list[str] | None
 
     def same_layout(self, other: "_SourceObservation") -> bool:
-        return (self.leaf_dicts == other.leaf_dicts and
+        return (self.leaf_dicts == other.leaf_dicts and self.reported_clips == other.reported_clips and
                 _carried_layout(self.layout, self.leaf_dicts) == _carried_layout(other.layout, other.leaf_dicts))
 
     def same_placement(self, other: "_SourceObservation") -> bool:
@@ -525,6 +531,7 @@ class Session:
         self.grid = Grid()
         self._observed_placement = _MISSING
         self._page_identity = _MISSING
+        self._reported_clips = _MISSING
         self._placement_revision = ""
         self._draft_digest: bytes | None = None
         self.usage: dict[str, Any] | None = None  # Screen Time opens, loaded on request
@@ -604,6 +611,8 @@ class Session:
         blob["placement_revision"] = self._placement_revision
         if self._page_identity is not _MISSING:
             blob["source_page_identity"] = self._page_identity
+        if self._reported_clips is not _MISSING:
+            blob["source_reported_clips"] = self._reported_clips
         if isinstance(self._observed_placement, ObservedPins):
             blob["source_placement"] = self._observed_placement.archive
         elif self._observed_placement is not _MISSING:
@@ -639,6 +648,10 @@ class Session:
                     placement = blob["source_pin_map"] if blob["source_pins_reported"] else None
                 lay = Layout.from_snapshot(blob)
                 original = lay.original()  # validate source identity independently
+                reported_clips = blob.get("source_reported_clips", _MISSING)
+                if reported_clips is not _MISSING and (not isinstance(reported_clips, list) or
+                        any(not isinstance(value, str) for value in reported_clips)):
+                    raise ValueError("invalid reported clip inventory")
                 for view in (lay, original):
                     if set(view.pins) - view.nodes.keys():
                         raise LayoutError("saved draft pin identity is unavailable; call read again")
@@ -665,6 +678,7 @@ class Session:
                 self.info, self.grid = info, lay.grid
                 self._observed_placement = placement
                 self._page_identity = blob.get("source_page_identity", _MISSING)
+                self._reported_clips = reported_clips
                 self._placement_revision = blob.get("placement_revision", "")
                 lay.approval_device = device
                 self.layout = lay
@@ -921,16 +935,17 @@ class Session:
         here = {n.id for n in Layout(state, library=library).nodes.values()}
         return library + [dict(w) for i, w in sorted(self._known_webclips().items()) if i not in here]
 
-    async def _read_source(self, reference=None, *, verifying: bool = False) -> tuple[list[Any], list[Any] | None]:
+    async def _read_source(self, reference=None, *, verifying: bool = False) -> tuple[list[Any], list[Any] | None, list[str] | None]:
         state, library = await asyncio.wait_for(self.source.read(), OPERATION_TIMEOUT)
-        Layout(state, library=library, grid=self.grid)
+        raw = Layout(state, library=library, grid=self.grid)
+        reported_clips = _clip_inventory(raw) if getattr(self.source, "source_archive", None) is not None else None
         if reference is not None:
             _restore_archive_app_ids(state, library, reference)
         self._remember_widget_ids(state)
         self._remember_webclips(state, library)
         if verifying and getattr(self.source, "source_archive", None) is not None:
-            return state, library
-        return state, self._with_webclips(state, library)
+            return state, library, reported_clips
+        return state, self._with_webclips(state, library), reported_clips
 
     # ---- gap memory ----------------------------------------------------------------------
     # The phone never reports gaps over USB, and a write without them closes every gap. So the
@@ -1002,7 +1017,8 @@ class Session:
             raise LayoutError("device identity changed during read; no layout was loaded")
         if Grid.from_metrics(verified.get("icon_metrics")) != grid:
             raise LayoutError("device grid changed during read; no layout was loaded")
-        Layout(state, library=library, grid=grid)  # validate the shape before committing identity
+        raw = Layout(state, library=library, grid=grid)  # validate the shape before committing identity
+        reported_clips = _clip_inventory(raw) if getattr(self.source, "source_archive", None) is not None else None
         clear_pending = False
         legacy_pending = None
         if self._pending_path.exists():
@@ -1017,7 +1033,8 @@ class Session:
                     ):
                 legacy_pending = pending_bytes
         previous = (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
-                    self._observed_placement, self._page_identity, self._draft_digest, self._placement_revision)
+                    self._observed_placement, self._page_identity, self._reported_clips,
+                    self._draft_digest, self._placement_revision)
         if self.layout is not None and device_id == self.device_id:
             _restore_archive_app_ids(state, library, (self.layout.source, self.layout.source_library))
         try:
@@ -1041,6 +1058,7 @@ class Session:
                 self._placement_revision = self._saved_placement_revision()
                 self._observed_placement = copy.deepcopy(getattr(self.source, "pins", None))
                 self._page_identity = copy.deepcopy(getattr(self.source, "page_identity", {}))
+                self._reported_clips = reported_clips
                 self._save_draft()
                 if legacy_pending is not None:
                     unresolved = self.dir / "unresolved-writes"
@@ -1061,7 +1079,8 @@ class Session:
                 self.usage = None
         except BaseException:
             (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
-             self._observed_placement, self._page_identity, self._draft_digest, self._placement_revision) = previous
+             self._observed_placement, self._page_identity, self._reported_clips,
+             self._draft_digest, self._placement_revision) = previous
             raise
         self._draft_error = None
         return {"device": {k: v for k, v in info.items() if k != "UniqueDeviceID"},
@@ -1097,14 +1116,14 @@ class Session:
     # ---- write ------------------------------------------------------------------
 
     async def _observe(self, reference) -> _SourceObservation:
-        state, library = await self._read_source(reference)
+        state, library, reported_clips = await self._read_source(reference)
         pins = copy.deepcopy(getattr(self.source, "pins", None))
         layout = Layout(state, library=library, grid=self.grid)
         if pins is not None:
             node_pins(layout, pins, strict=True)
         return _SourceObservation(state, library, pins, copy.deepcopy(getattr(self.source, "page_identity", {})),
                                   layout, copy.deepcopy(getattr(self.source, "source_archive", None)),
-                                  getattr(self.source, "writes_leaf_dictionaries", True))
+                                  getattr(self.source, "writes_leaf_dictionaries", True), reported_clips)
 
     def _backup(self, state: list[Any], library: list[Any] | None, label: str,
                 pins: list[dict[str, int]] | None = None, *, observed: Layout | None = None,
@@ -1157,6 +1176,10 @@ class Session:
         original = self.require().original() if expected is not None else current.layout
         bound_ids = _instance_ids(original, previous_memory)
         if expected is not None:
+            if current.reported_clips is not None:
+                reported = _clip_inventory(original) if self._reported_clips is _MISSING else self._reported_clips
+                if reported != current.reported_clips:
+                    raise LayoutError("the phone's reported web clips changed since it was read; read again")
             if _carried_layout(current.layout, current.leaf_dicts) != _carried_layout(original, current.leaf_dicts):
                 raise LayoutError("the phone's layout changed since it was read; read again and redo the edits")
             if expected_pins is not _MISSING and not same_reported_pins(current.pins, expected_pins):
@@ -1233,7 +1256,7 @@ class Session:
             write_error = type(e).__name__
         verification_note = "Readback compares the layout fields returned by the selected source."
         try:
-            after, after_lib = await self._read_source((target, target_lib), verifying=True)
+            after, after_lib, after_clips = await self._read_source((target, target_lib), verifying=True)
             await self._assert_identity()
             got_pins = getattr(self.source, "pins", None)
             unreported = got_pins is None
@@ -1312,7 +1335,7 @@ class Session:
         adopted = Layout(after, library=after_lib, pins=written.pins, grid=self.grid)
         adopted.approval_device = self.device_id
         previous = (self.layout, self._observed_placement, self._page_identity,
-                    self._draft_digest, self._placement_revision)
+                    self._reported_clips, self._draft_digest, self._placement_revision)
         try:
             with (_previous_file(self._gaps_path), _previous_file(self.draft_path),
                   _previous_file(self._placement_revision_path)):
@@ -1322,10 +1345,11 @@ class Session:
                 self.layout = adopted
                 self._observed_placement = copy.deepcopy(getattr(self.source, "pins", None))
                 self._page_identity = copy.deepcopy(getattr(self.source, "page_identity", {}))
+                self._reported_clips = after_clips
                 self._save_draft()
                 self._clear_pending()
         except BaseException as e:
-            (self.layout, self._observed_placement, self._page_identity, self._draft_digest,
+            (self.layout, self._observed_placement, self._page_identity, self._reported_clips, self._draft_digest,
              self._placement_revision) = previous
             if isinstance(e, Exception):
                 detail = f"Readback matched. Saving the local draft failed ({type(e).__name__}). Run Read to recover."

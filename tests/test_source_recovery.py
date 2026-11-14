@@ -414,6 +414,62 @@ def test_explicit_archive_library_readback_cannot_claim_clip_from_memory(tmp_pat
     assert not result["ok"] and session._pending_path.exists()
 
 
+@pytest.mark.parametrize("at", [0, 1, 2])
+@pytest.mark.parametrize("draft", ["live", "reopened", "legacy"])
+def test_prewrite_compares_reported_library_clips_before_memory_enrichment(tmp_path, at, draft):
+    path = tmp_path / "archive.plist"
+    clip = {"displayIdentifier": "clip", "webClipURL": "/clip", "displayName": "Clip", "opaque": b"data"}
+    path.write_bytes(plistlib.dumps({"iconLists": [["moving", "keep"]], "ignored": [clip]}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.move("moving", "dock"))
+    if draft == "legacy":
+        blob = plistlib.loads(session.draft_path.read_bytes())
+        blob.pop("source_reported_clips", None)
+        session.draft_path.write_bytes(plistlib.dumps(blob))
+    if draft != "live":
+        session = Session(source, session.dir)
+    before = session.draft_path.read_bytes(), session.history()
+    read = source.read
+    calls = 0
+    async def changed():
+        nonlocal calls
+        calls += 1
+        if calls == at:
+            raw = plistlib.loads(path.read_bytes())
+            raw["ignored"] = []
+            path.write_bytes(plistlib.dumps(raw))
+        return await read()
+    source.read = changed
+    if at:
+        with pytest.raises(LayoutError, match="changed"):
+            asyncio.run(session.apply(session.require().token()))
+        assert not session.backups() and not session._pending_path.exists()
+        assert (session.draft_path.read_bytes(), session.history()) == before
+        assert plistlib.loads(path.read_bytes())["ignored"] == []
+    else:
+        assert asyncio.run(session.apply(session.require().token()))["ok"]
+        assert plistlib.loads(path.read_bytes())["ignored"] == [clip]
+
+
+def test_explicit_read_can_adopt_a_remembered_only_archive_clip(tmp_path):
+    path = tmp_path / "archive.plist"
+    clip = {"displayIdentifier": "clip", "webClipURL": "/clip", "displayName": "Clip", "opaque": b"data"}
+    raw = {"iconLists": [["moving", "keep"]], "ignored": [clip]}
+    path.write_bytes(plistlib.dumps(raw))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    raw["ignored"] = []
+    path.write_bytes(plistlib.dumps(raw))
+    asyncio.run(session.read())
+    session = Session(source, session.dir)
+    session.edit(lambda lay: lay.move("moving", "dock"))
+    assert asyncio.run(session.apply(session.require().token()))["ok"]
+    assert plistlib.loads(path.read_bytes())["ignored"] == [clip]
+
+
 def test_failed_explicit_read_rolls_back_learned_cache_and_read_snapshot(tmp_path, monkeypatch):
     path = tmp_path / "fixture.plist"
     source = FileSource(path)
