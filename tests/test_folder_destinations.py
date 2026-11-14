@@ -1,4 +1,5 @@
 import asyncio
+import plistlib
 
 import pytest
 
@@ -172,3 +173,88 @@ def test_appending_child_of_full_folder_retains_original_subpage_and_localizes_c
     assert [len(p) for p in session.require().dock[0].children] == [9]
     session.edit(lambda lay: lay.move("x", "folder:1:1"))
     assert ui.view(session)["diff"]["problem_details"][0]["key"] == "validation.folderCapacity"
+
+
+def test_older_retired_wire_id_stays_reserved_after_upgrade(tmp_path):
+    source = MemorySource()
+    source.state = [[], [{**folder("Old", apps(1)), "uniqueIdentifier": "1"}, app("x", "X")]]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.dissolve_folder("folder:1"))
+    saved = plistlib.loads(session.draft_path.read_bytes())
+    for field in ("identity", "source_identity"):
+        saved[field]["counters"].pop("folder:", None)
+    session.draft_path.write_bytes(plistlib.dumps(saved))
+    reopened = Session(source, tmp_path)
+    assert reopened.edit(lambda lay: lay.create_folder("New", ["x"], "page:1")) != "folder:1"
+    with pytest.raises(LayoutError):
+        reopened.edit(lambda lay: lay.move("app0", "folder:1"))
+
+
+def test_numeric_string_wire_identifier_is_opaque_to_plist_counters(tmp_path):
+    source = MemorySource()
+    uid = "18446744073709551616"
+    source.state = [[], [{**folder("Old", apps(1)), "uniqueIdentifier": uid}, app("x", "X")]]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    assert Session(source, tmp_path).require().pages[0][0].id == "folder:" + uid
+    assert session.edit(lambda lay: lay.create_folder("New", ["x"], "page:1")) != "folder:" + uid
+
+
+def test_empty_intermediate_folder_page_compacts_during_the_edit(tmp_path):
+    source = MemorySource()
+    source.state = [[], [folder("Work", apps(1)), app("b", "B"), app("keep", "Keep")]]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.move("b", "folder:1:2"))
+    session.edit(lambda lay: lay.move("app0", "page:1"))
+    def children(lay):
+        return [[n.id for n in page] for page in lay.get("folder:1").children]
+    assert children(session.require()) == children(Session(source, tmp_path).require()) == [["b"]]
+    session.edit(lambda lay: lay.move_many(["keep"], "folder:1"))
+    assert children(session.require()) == [["b", "keep"]]
+
+
+@pytest.mark.parametrize("selection", [["x", "app7"], ["app7", "x"]])
+def test_mixed_selection_uses_the_room_vacated_by_every_selected_child(selection):
+    lay = Layout([[folder("Full", apps(9))], [app("x", "X"), app("keep", "Keep")]])
+    lay.move_many(selection, "folder:1")
+    pages = lay.get("folder:1").children
+    assert [len(page) for page in pages] == [9, 1]
+    assert [n.id for page in pages for n in page][-2:] == selection
+
+
+def test_mixed_selection_compacts_the_vacated_final_page_before_appending():
+    raw = {**folder("Full", apps(9)), "listUniqueIdentifiers": ["first", "last"]}
+    raw["iconLists"].append([app("last", "Last")])
+    lay = Layout([[raw], [app("x", "X")]])
+    lay.move_many(["last", "app7", "x"], "folder:1")
+    assert [len(page) for page in lay.dock[0].children] == [9, 2]
+    assert [n.id for page in lay.dock[0].children for n in page][-3:] == ["last", "app7", "x"]
+    assert lay.dock[0].raw["listUniqueIdentifiers"] == ["first", "last"]
+
+
+def test_reappending_a_whole_subpage_retains_its_reviewed_identity():
+    raw = {**folder("Full", apps(9)), "listUniqueIdentifiers": ["first"]}
+    lay = Layout([[raw], [app("keep", "Keep")]])
+    lay.move_many([f"app{i}" for i in range(9)], "folder:1")
+    assert lay.to_state()[0][0]["listUniqueIdentifiers"] == ["first"]
+    assert not lay.diff()["items_moved"]
+
+
+def test_exported_folder_subpage_identifiers_follow_compaction_and_extension(tmp_path):
+    from homescreen.device import FileSource
+    raw = {"iconLists": [[{"listType": "folder", "displayName": "Work",
+                           "iconLists": [["a"], ["b"]], "listUniqueIdentifiers": ["first", "second"]}, "x"]],
+           "ignored": []}
+    path = tmp_path / "fixture.plist"
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.move("a", "dock"))
+    session.edit(lambda lay: lay.move("x", "folder:1:2"))
+    assert asyncio.run(session.apply(session.require().token()))["ok"]
+    field = plistlib.loads(path.read_bytes())["iconLists"][0][0]
+    assert field["iconLists"] == [["b"], ["x"]]
+    assert field["listUniqueIdentifiers"][0] == "second"
+    assert field["listUniqueIdentifiers"][1] not in ("first", "second")

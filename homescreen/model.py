@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import plistlib
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -164,6 +165,7 @@ class Layout:
         self.source = copy.deepcopy(raw_state if source is None else source)
         self.source_library = copy.deepcopy(library if source is None else source_library)
         self._counter: dict[str, int] = {}
+        self._reserved_ids: set[str] = set()
         self.nodes: dict[str, Node] = {}
         self.dock = [self._wrap(r, "dock") for r in item_list(raw_state[0])]
         self.pages = [[self._wrap(r, f"p{i}") for r in item_list(page)] for i, page in enumerate(raw_state[1:], 1)]
@@ -177,6 +179,8 @@ class Layout:
         self.source_identity = copy.deepcopy(source_identity) if source_identity is not None else (
             self.identity(include_bank=False) if source is None else
             Layout(self.source, library=self.source_library, grid=self.grid).identity())
+        if source is not None:
+            self._reserve_identity(self.source_identity["ids"])
         # Gaps: items pinned to a grid cell (row * 4 + column) on their page. Unpinned items flow
         # into the free cells in order, like iOS does. iOS doesn't report pins over USB.
         self.pins: dict[str, int] = dict(pins or {})
@@ -216,8 +220,7 @@ class Layout:
             node.id = nid
         self.nodes = {node.id: node for node in nodes}
         self._counter = dict(counters)
-        for node in nodes:
-            self._reserve_wire_id(node.id)
+        self._reserve_identity(ids)
 
     def current_fields(self) -> dict[str, Any]:
         return {"state": self.to_state(), "library": self.to_library(), "bank": self.to_bank(),
@@ -262,7 +265,27 @@ class Layout:
         """Lay a folder's items (or the given ones) out in full folder pages."""
         items = [c for p in folder.children for c in p] if items is None else items
         k = self.grid.folder
-        folder.children = [items[i:i + k] for i in range(0, len(items), k)] or [[]]
+        pages = [items[i:i + k] for i in range(0, len(items), k)] or [[]]
+        self._set_folder_pages(folder, pages, list(range(len(pages))))
+
+    @staticmethod
+    def _set_folder_pages(folder: Node, pages: list[list[Node]], origins: list[int]) -> None:
+        if "listUniqueIdentifiers" in folder.raw:
+            old = folder.raw["listUniqueIdentifiers"]
+            ids = [old[i] if 0 <= i < len(old) else str(uuid.uuid4()).upper() for i in origins]
+            folder.raw = {**folder.raw, "listUniqueIdentifiers": ids}
+            removed = set(old) - set(ids)
+            metadata = folder.raw.get("listMetadata")
+            if removed and isinstance(metadata, dict):
+                folder.raw["listMetadata"] = {k: v for k, v in metadata.items() if k not in removed}
+        folder.children = pages
+
+    def _compact_folder(self, folder: Node) -> None:
+        keep = [i for i, page in enumerate(folder.children) if page]
+        if len(keep) != len(folder.children):
+            self._set_folder_pages(folder, [folder.children[i] for i in keep], keep)
+        if not folder.children and any(n is folder for n in self.dock):
+            folder.children = [[]]
 
     # ---- grid / gaps ----------------------------------------------------------------
 
@@ -352,16 +375,13 @@ class Layout:
 
     def _new_id(self, prefix: str) -> str:
         n = self._counter.get(prefix, 0) + 1
-        while f"{prefix}{n}" in self.nodes:
+        while f"{prefix}{n}" in self.nodes or f"{prefix}{n}" in self._reserved_ids:
             n += 1
         self._counter[prefix] = n
         return f"{prefix}{n}"
 
-    def _reserve_wire_id(self, nid: str) -> None:
-        prefix, sep, suffix = nid.partition(":")
-        if sep and prefix in ("folder", "widget") and suffix.isascii() and suffix.isdecimal():
-            key = prefix + ":"
-            self._counter[key] = max(self._counter.get(key, 0), int(suffix))
+    def _reserve_identity(self, ids: list[str]) -> None:
+        self._reserved_ids.update(nid for nid in ids if isinstance(nid, str) and nid.startswith(("folder:", "widget:")))
 
     def _wrap(self, raw: Any, where: str) -> Node:
         if not isinstance(raw, dict):
@@ -378,7 +398,7 @@ class Layout:
             nid = str(bundle)
         elif kind in ("widget", "folder") and uid and f"{kind}:{uid}" not in self.nodes and ":" not in str(uid):
             nid = f"{kind}:{uid}"  # iOS's own id: stays the same across undo, reloads and moves
-            self._reserve_wire_id(nid)
+            self._reserved_ids.add(nid)
         else:
             nid = self._new_id(f"{kind}:")
             while nid in self.nodes:
@@ -388,6 +408,11 @@ class Layout:
         self.nodes[nid] = node
         if kind == "folder":
             node.children = [[self._wrap(r, nid) for r in item_list(page)] for page in item_list(raw.get("iconLists"))]
+            if "listUniqueIdentifiers" in raw:
+                ids = raw["listUniqueIdentifiers"]
+                if (not isinstance(ids, list) or len(ids) != len(node.children)
+                        or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids)):
+                    raise LayoutError("folder page identifiers must name each exported subpage")
             if where == "dock" and not node.children:
                 node.children = [[]]
         return node
@@ -401,6 +426,8 @@ class Layout:
         out = dict(node.raw)
         out["displayName"] = node.name
         out["iconLists"] = [[Layout._unwrap(c) for c in page] for page in node.children if page]
+        if "listUniqueIdentifiers" in out:
+            out["listUniqueIdentifiers"] = [pid for pid, page in zip(out["listUniqueIdentifiers"], node.children) if page]
         return out
 
     def to_state(self) -> list[Any]:
@@ -505,7 +532,9 @@ class Layout:
             if page > len(folder.children) + 1 or any(not children for children in folder.children[:page - 1]):
                 raise LayoutError("a folder page needs an item on each preceding page")
             if len(folder.children) < page:
-                folder.children.append([])
+                self._set_folder_pages(folder, [*folder.children, []], list(range(page)))
+            elif "listUniqueIdentifiers" in folder.raw and len(folder.raw["listUniqueIdentifiers"]) < page:
+                self._set_folder_pages(folder, folder.children, list(range(len(folder.children))))
             return folder.children[page - 1]
         raise LayoutError(f"bad target {target!r}; use dock, library, bank, page:N or folder:<id>[:N]")
 
@@ -545,17 +574,42 @@ class Layout:
                 raise LayoutError(f"{before!r} is not in {target}")
             index = ids.index(before)
         dest.insert(len(dest) if index is None else max(0, min(index, len(dest))), node)
+        if not src:
+            self._compact_source_folder(src)
+
+    def _compact_source_folder(self, source: list[Node], except_folder: Node | None = None) -> None:
+        for folder in self.nodes.values():
+            if folder.kind == "folder" and folder is not except_folder and any(source is p for p in folder.children):
+                self._compact_folder(folder)
+                break
 
     def move_many(self, ids: list[str], target: str, before: str | None = None) -> None:
         """Append a selection dropped on a folder across available subpages."""
         if target.startswith("folder:") and target.count(":") == 1 and before is None:
             folder = self.get(target)
-            for item in ids:
-                page = len(folder.children) or 1
-                if (folder.children and len(folder.children[-1]) >= self.grid.folder and
-                        self.get(item) not in folder.children[-1]):
-                    page += 1
-                self.move(item, f"{target}:{page}")
+            if folder.kind != "folder":
+                raise LayoutError(f"{target} is not a folder")
+            selected = [self.get(item) for item in dict.fromkeys(ids)]
+            for node in selected:
+                if problem := self._destination_problem(node.kind, target):
+                    raise LayoutError(problem)
+            for node in selected:
+                source, index = self.locate(node.id)
+                source.pop(index)
+                self.pins.pop(node.id, None)
+                if not source:
+                    self._compact_source_folder(source, except_folder=folder)
+            if selected:
+                origins = [i for i, page in enumerate(folder.children) if page]
+                pages = [folder.children[i] for i in origins]
+                vacant = iter(range(origins[-1] + 1 if origins else 0, len(folder.children)))
+                for node in selected:
+                    if not pages or len(pages[-1]) >= self.grid.folder:
+                        origin = next(vacant, -1)
+                        pages.append(folder.children[origin] if origin >= 0 else [])
+                        origins.append(origin)
+                    pages[-1].append(node)
+                self._set_folder_pages(folder, pages, origins)
         else:
             for item in ids:
                 self.move(item, target, before=before)
@@ -691,7 +745,7 @@ class Layout:
     def drop_empty(self) -> None:
         for n in [*self.dock, *(x for p in self.pages for x in p)]:
             if n.kind == "folder":
-                n.children = [p for p in n.children if p]
+                self._compact_folder(n)
         empties = [n for p in self.pages for n in p if n.kind == "folder" and not n.children]
         for f in empties:
             c, i = self.locate(f.id)

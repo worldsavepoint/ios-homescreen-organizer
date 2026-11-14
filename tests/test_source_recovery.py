@@ -304,6 +304,42 @@ def test_carried_folder_subpage_id_is_checked_at_each_observation(tmp_path, at):
         assert not session.backups()
 
 
+@pytest.mark.parametrize("operation", ["grow", "shrink-last", "shrink-first"])
+def test_folder_page_owners_survive_intentional_pagination(tmp_path, operation):
+    path = tmp_path / "archive.plist"
+    field = {"listType": "folder", "displayName": "Work", "uniqueIdentifier": "owner",
+             "iconLists": [["inside"], ["last"]], "listUniqueIdentifiers": ["first", "last"],
+             "listMetadata": {"first": {"opaque": b"first"}, "last": {"opaque": b"last"}}}
+    if operation == "grow":
+        field["iconLists"].pop()
+        field["listUniqueIdentifiers"].pop()
+        field["listMetadata"].pop("last")
+    path.write_bytes(plistlib.dumps({"iconLists": [[field, "moving", "keep"]], "ignored": []}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    if operation == "grow":
+        session.edit(lambda lay: lay.move("moving", "folder:owner:2"))
+    else:
+        session.edit(lambda lay: lay.move("last" if operation == "shrink-last" else "inside", "dock"))
+    reviewed = session.require().to_state()[1][0]
+    ids = reviewed["listUniqueIdentifiers"]
+    if operation == "grow":
+        assert len(ids) == 2 and ids[0] == "first" and ids[1] != "first"
+    else:
+        assert ids == (["first"] if operation == "shrink-last" else ["last"])
+        assert reviewed["listMetadata"] == {ids[0]: {"opaque": ids[0].encode()}}
+    reopened = Session(source, session.dir)
+    assert reopened.require().to_state()[1][0] == reviewed
+    result = asyncio.run(reopened.apply(reopened.require().token()))
+    assert result["ok"] and not reopened._pending_path.exists()
+    written = plistlib.loads(path.read_bytes())["iconLists"][0][0]
+    assert written["listUniqueIdentifiers"] == ids
+    assert written["listMetadata"] == reviewed["listMetadata"]
+    assert written["iconLists"] == {"grow": [["inside"], ["moving"]], "shrink-last": [["inside"]],
+                                     "shrink-first": [["last"]]}[operation]
+
+
 def test_explicit_archive_library_readback_cannot_claim_clip_from_memory(tmp_path):
     path = tmp_path / "archive.plist"
     clip = {"displayIdentifier": "clip", "webClipURL": "/clip", "displayName": "Clip"}

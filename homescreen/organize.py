@@ -97,11 +97,7 @@ def into_folders(lay: Layout, groups: dict[str, list[str]], keep_first_page: boo
             folder = lay.get(fid)
             existing[name.lower()] = folder
         else:
-            for i in ids:
-                page = folder.children[-1] if folder.children else None
-                if page is None or len(page) >= lay.grid.folder:
-                    folder.children.append([])
-                lay.move(i, f"{folder.id}:{len(folder.children)}")
+            lay.move_many(ids, folder.id)
         filed[folder.name] = [lay.nodes[i].name for i in ids]
     lay.remove_empty_pages()
     if not lay.pages:
