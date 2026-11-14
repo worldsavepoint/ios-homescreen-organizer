@@ -215,10 +215,12 @@ struct MCPChildIO {
     }
 
     mutating func receive(_ id: Int, mcp: Bool, codexBatchWrite: Bool = false, preserveNumbers: Bool = false) throws -> [String: Any] {
+        var scanIndex = pending.startIndex
         while true {
-            if let newline = pending.firstIndex(of: 10) {
+            if let newline = pending[scanIndex...].firstIndex(of: 10) {
                 let line = pending.prefix(upTo: newline)
                 pending.removeSubrange(...newline)
+                scanIndex = pending.startIndex
                 guard let message = try JSONSerialization.jsonObject(with: line) as? [String: Any],
                       !mcp || message["jsonrpc"] as? String == "2.0" else { throw MCPClientOperationCode.invalidResponse }
                 if message["id"] == nil, message["method"] is String { continue }
@@ -262,6 +264,7 @@ struct MCPChildIO {
                 }
                 return result
             }
+            scanIndex = pending.endIndex
             try wait(output.fileDescriptor, events: Int16(POLLIN))
             var bytes = [UInt8](repeating: 0, count: 65536)
             let count = read(output.fileDescriptor, &bytes, bytes.count)

@@ -107,6 +107,18 @@ final class InterruptibleJournal: MCPRegistrationJournal {
         } else if args[1] == "scope" {
             let query = await manager.query(client:client,executablePath:path)
             output = ["scope":query.scope.rawValue,"effective":query.mode?.rawValue ?? "", "user":query.userMode?.rawValue ?? "", "connection":query.connection.rawValue]
+        } else if args[1] == "frames" {
+            do {
+                let sizes = try await MCPSubprocess.session(args[3], Array(args.dropFirst(4)), environment, timeout) { io in
+                    var sizes: [Int] = []
+                    for id in 1...Int(environment["TEST_FRAME_COUNT"] ?? "1")! {
+                        let result = try io.receive(id, mcp: false)
+                        sizes.append((result["text"] as! String).utf8.count)
+                    }
+                    return sizes
+                }
+                output = ["sizes":sizes]
+            } catch { output = ["code":(error as? MCPClientOperationCode ?? .invalidResponse).rawValue] }
         } else {
             let result = await MCPServiceCheck(timeout: timeout, environment: environment).run(executablePath: args[3])
             output = ["code": result.code.rawValue, "tools": result.tools.sorted()]
@@ -1103,6 +1115,31 @@ def test_registration_postcheck_compares_command_bytes(native_mcp_binary,sandbox
                      "register",client,cli,engine)
     assert (result["code"],result["recovery"]) == ("invalidResponse","restored")
     assert json.loads(store.read_text()) == prior
+
+
+@pytest.mark.parametrize("sizes,fragmented", [([16 * 1024],False), ([4 * 1024 * 1024],True),
+    ([7 * 1024 * 1024],True), ([3,5,7],False), ([3,5,7],True), ([4 * 1024 * 1024] * 2,True)])
+def test_jsonl_frames_handle_notifications_chunks_and_cumulative_limit(native_mcp_binary,sandbox,tmp_path,sizes,fragmented):
+    child = tmp_path / "frames.py"
+    child.write_text('''import json, os, sys
+sizes = json.loads(sys.argv[1])
+frames = b"".join((json.dumps({"method":"fixture.progress","params":{}}) + "\\n" +
+    json.dumps({"id":i,"result":{"text":"x" * size}}) + "\\n").encode() for i,size in enumerate(sizes,1))
+if sys.argv[2] == "whole":
+    sys.stdout.buffer.write(frames)
+else:
+    offset = 0
+    for length in [1, 7, 29, 65535]:
+        sys.stdout.buffer.write(frames[offset:offset+length]); sys.stdout.buffer.flush()
+        offset += length
+    while offset < len(frames):
+        end = min(offset+32767,len(frames))
+        sys.stdout.buffer.write(frames[offset:end]); sys.stdout.buffer.flush()
+        offset = end
+''')
+    result = execute(native_mcp_binary,{**sandbox,"TEST_FRAME_COUNT":str(len(sizes)),"TEST_TIMEOUT":"10"},
+                     "frames","codex",sys.executable,child,json.dumps(sizes),"chunks" if fragmented else "whole")
+    assert result == ({"code":"invalidResponse"} if sum(sizes) >= 8 * 1024 * 1024 else {"sizes":sizes})
 
 
 def test_owned_process_group_prevents_late_apply(native_mcp_binary,sandbox,tmp_path):
