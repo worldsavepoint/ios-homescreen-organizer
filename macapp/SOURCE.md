@@ -34,7 +34,7 @@ fi
 "$PYTHON" -c 'import lzss; assert lzss.decompress(lzss.compress(b"Hello")) == b"Hello"'
 ```
 
-The generated `local-requirements.lock` records the hash of your edited wheel. Install it into a fresh virtual environment with `pip install --require-hashes --only-binary=:all: --find-links local-wheels -r local-requirements.lock`. On Intel also pass the directory containing the prepared cryptography wheel. Use this environment to run the editable project, its command line tools and the PyInstaller and Swift build steps described in `project/macapp/BUILDING.md`.
+The generated `local-requirements.lock` selects your edited wheel by its local file URI and hash, and retains the original requirements for unchanged components, including the pure-Python chardet wheel. Keep the wheel directory in place and install the lock into a fresh virtual environment with `pip install --require-hashes --only-binary=:all: --find-links local-wheels -r local-requirements.lock`. On Intel also pass the directory containing the prepared cryptography wheel. Use this environment to run the editable project, its command line tools and the PyInstaller and Swift build steps described in `project/macapp/BUILDING.md`. Refreeze can also use authenticated wheels from `local-wheels` or `PIP_FIND_LINKS`. The lock embedded in a signed local app retains filenames and hashes with download locations removed.
 
 ## Refreeze a modified Python package
 

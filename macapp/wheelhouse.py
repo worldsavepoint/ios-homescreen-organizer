@@ -12,19 +12,28 @@ def entries(lock):
 
 
 def entries_text(text):
-    requirement = None
+    for filename, requirement, checksum in records_text(text):
+        yield filename, checksum
+
+
+def records(lock):
+    return records_text(lock.read_text())
+
+
+def records_text(text):
+    filename = None
     count = 0
     for line in text.splitlines():
         if line.startswith("# ") and line.endswith(".whl"):
-            requirement = relative_name(line[2:])
+            filename = relative_name(line[2:])
         elif line.strip() and not line.startswith("#"):
-            match = re.search(r" --hash=sha256:([0-9a-f]{64})$", line)
-            if not requirement or not match or "/" in requirement:
+            match = re.fullmatch(r"(.+) --hash=sha256:([0-9a-f]{64})", line)
+            if not filename or not match or "/" in filename:
                 raise ValueError("Invalid release wheel lock")
-            yield requirement, match[1]
+            yield filename, match[1], match[2]
             count += 1
-            requirement = None
-    if not count or requirement:
+            filename = None
+    if not count or filename:
         raise ValueError("Incomplete release wheel lock")
 
 

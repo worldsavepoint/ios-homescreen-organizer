@@ -5,6 +5,7 @@ import os
 import platform
 from pathlib import Path, PurePosixPath
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -128,7 +129,7 @@ def cargo_vendor(root, destination):
 
 
 def local_wheel(root, source, arch, wheelhouse, output):
-    from wheelhouse import entries
+    from wheelhouse import records
     python = sys.executable
     wheelhouse.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as folder:
@@ -146,21 +147,42 @@ def local_wheel(root, source, arch, wheelhouse, output):
         lock = root / "project/requirements-build.lock"
         if arch == "x86_64":
             lock = root / "project/build/dependencies/x86_64/requirements-build.lock"
-        lines = []
+        selected = []
         replaced = False
-        for filename, checksum in entries(lock):
+        for filename, requirement, checksum in records(lock):
             name, expected = filename.split("-")[:2]
             if canonical(name) == owner:
                 if version != expected:
                     raise ValueError("Rebuild the matching release component version")
                 filename, checksum = wheel.name, sha256(wheel)
                 replaced = True
-            lines.extend(["# " + filename, f"{name}=={expected} --hash=sha256:{checksum}"])
+            selected.append((filename, requirement, checksum))
         if not replaced:
             raise ValueError("Wheel is absent from the release build lock")
         shutil.copyfile(wheel, wheelhouse / wheel.name)
-        output.write_text("\n".join(lines) + "\n")
+        output.write_text(selected_lock(selected, wheelhouse.resolve(), {owner}))
         print(wheelhouse / wheel.name)
+
+
+def selected_lock(records, wheelhouse, changed, *, cached=False):
+    lines = []
+    locations = [wheelhouse]
+    if cached:
+        locations.extend(Path(path) for path in shlex.split(os.environ.get("PIP_FIND_LINKS", "")))
+    for filename, requirement, value in records:
+        owner = canonical(filename.split("-")[0])
+        if owner in changed:
+            path = wheelhouse / filename
+            if not path.is_file() or sha256(path) != value:
+                raise ValueError("Edited wheel does not match its local lock")
+            requirement = f"{filename.split('-')[0]} @ {path.resolve().as_uri()}"
+        elif cached:
+            path = next((folder / filename for folder in locations
+                         if (folder / filename).is_file() and sha256(folder / filename) == value), None)
+            if path is not None:
+                requirement = f"{filename.split('-')[0]} @ {path.resolve().as_uri()}"
+        lines.extend(["# " + filename, f"{requirement} --hash=sha256:{value}"])
+    return "\n".join(lines) + "\n"
 
 
 def local_selections(original, edited, shipped):
@@ -186,7 +208,7 @@ def local_selections(original, edited, shipped):
 def refreeze(root, arch, wheelhouse, lock, output):
     if platform.machine() != arch or output.exists():
         raise ValueError("Use a new output directory on the matching native Mac")
-    from wheelhouse import entries
+    from wheelhouse import entries, records
     manifest = json.loads((root / "MANIFEST.json").read_bytes())
     volume = json.loads((root / relative_name(manifest["architectures"][arch]["inventory"])).read_bytes())
     project = root / "project"
@@ -208,26 +230,7 @@ def refreeze(root, arch, wheelhouse, lock, output):
         # A package index or find-links directory may also have the original wheel under
         # the same filename. Direct local references select the trusted replacement bytes.
         effective_lock = Path(temporary) / "local-download.lock"
-        from source_inputs import read_locks
-        packages, _ = read_locks()
-        lines = []
-        for filename, value in entries(lock):
-            name, version = filename.split("-")[:2]
-            owner = canonical(name)
-            if owner in changed:
-                requirement = f"{name} @ {(wheels / filename).as_uri()}"
-            elif (wheels / filename).is_file() and sha256(wheels / filename) == value:
-                requirement = f"{name} @ {(wheels / filename).as_uri()}"
-            elif owner == "chardet":
-                # An offline wheelhouse may contain both platform and pure-Python candidates.
-                locations = [Path(s) for s in os.environ.get("PIP_FIND_LINKS", "").split() if s]
-                cached = next((path / filename for path in locations if (path / filename).is_file()
-                               and sha256(path / filename) == value), None)
-                requirement = f"{name} @ {cached.resolve().as_uri() if cached else packages[owner]['download']}"
-            else:
-                requirement = f"{name}=={version}"
-            lines.extend(["# " + filename, f"{requirement} --hash=sha256:{value}"])
-        effective_lock.write_text("\n".join(lines) + "\n")
+        effective_lock.write_text(selected_lock(records(lock), wheels, changed, cached=True))
         settings = Path(temporary) / "rebuild.json"
         settings.write_text(json.dumps({"upstreamCommit": manifest["commit"], "components": changed}))
         env = {**os.environ, "HOMESCREEN_BUILD_ARCH": arch, "HOMESCREEN_BUILD_PYTHON": sys.executable,

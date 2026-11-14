@@ -529,3 +529,72 @@ sys.exit(7 if damage == "exit" else 0)
     monkeypatch.setattr(subprocess, "Popen", started)
     with pytest.raises(ValueError, match="Git blob"):
         list(source_checkout.tracked_blobs(tmp_path, commit))
+
+
+def test_wheel_records_retain_original_direct_requirements():
+    from wheelhouse import records
+    selected = [record for record in records(ROOT / "requirements-build.lock") if record[0].startswith("chardet-")]
+    assert selected == [("chardet-7.7.0-py3-none-any.whl",
+        "chardet @ https://files.pythonhosted.org/packages/cc/75/88a3eb36264375ff951bd2f9397c409727ab6aa6a18e1bd933851571d421/chardet-7.7.0-py3-none-any.whl",
+        "11cf9b719ea3675a2a7d8a3071bbe4d7ea24b26bfe39a51588d515ddd05cacad")]
+
+
+def test_documented_install_selects_edited_wheel_and_original_direct_pure_wheel(tmp_path):
+    import os
+    import platform
+    import subprocess
+    import zipfile
+    from rebuild_sources import local_wheel, selected_lock
+    from wheelhouse import records
+
+    candidates = tmp_path / "original candidates"
+    candidates.mkdir()
+    def original_wheel(owner, version, tag, value):
+        path = candidates / f"{owner}-{version}-{tag}.whl"
+        with zipfile.ZipFile(path, "w") as archive:
+            prefix = f"{owner}-{version}.dist-info/"
+            archive.writestr(owner + ".py", f"VALUE = {value!r}\n")
+            archive.writestr(prefix + "METADATA", f"Metadata-Version: 2.1\nName: {owner}\nVersion: {version}\n")
+            archive.writestr(prefix + "WHEEL", f"Wheel-Version: 1.0\nGenerator: fixture\nRoot-Is-Purelib: true\nTag: {tag}\n")
+            archive.writestr(prefix + "RECORD", "".join(name + ",,\n" for name in archive.namelist()) + prefix + "RECORD,,\n")
+        return path
+    h11 = original_wheel("h11", "0.16.0", "py3-none-any", "original")
+    chardet = original_wheel("chardet", "7.7.0", "py3-none-any", "pure selection")
+    original_wheel("chardet", "7.7.0", "py3-none-macosx_11_0_" + platform.machine(), "native decoy")
+    root = tmp_path / "unpacked"
+    project = root / "project"
+    project.mkdir(parents=True)
+    original_lock = project / "requirements-build.lock"
+    pure_requirement = "chardet @ " + chardet.as_uri()
+    original_lock.write_text(f"# {h11.name}\nh11==0.16.0 --hash=sha256:{hashlib.sha256(h11.read_bytes()).hexdigest()}\n"
+                             f"# {chardet.name}\n{pure_requirement} --hash=sha256:{hashlib.sha256(chardet.read_bytes()).hexdigest()}\n")
+    source = tmp_path / "editable source"
+    source.mkdir()
+    (source / "pyproject.toml").write_text('[build-system]\nrequires = ["setuptools", "wheel"]\n'
+        'build-backend = "setuptools.build_meta"\n[project]\nname = "h11"\nversion = "0.16.0"\n'
+        '[tool.setuptools]\npy-modules = ["h11"]\n')
+    (source / "h11.py").write_text('VALUE = "edited selection"\n')
+    wheels = tmp_path / "local wheels"
+    lock = tmp_path / "local-requirements.lock"
+    local_wheel(root, source, "arm64", wheels, lock)
+    parsed = list(records(lock))
+    assert parsed[1][1] == pure_requirement
+    assert parsed[0][1] == "h11 @ " + (wheels / h11.name).as_uri()
+    assert parsed[0][2] == hashlib.sha256((wheels / h11.name).read_bytes()).hexdigest()
+    assert selected_lock(records(lock), wheels, {"h11"}) == lock.read_text()
+    environment = tmp_path / "fresh environment"
+    subprocess.run([sys.executable, "-m", "venv", environment], check=True, capture_output=True)
+    python = environment / "bin/python"
+    subprocess.run([python, "-m", "pip", "install", "--require-hashes", "--only-binary=:all:", "--no-index",
+                    "--find-links", candidates, "--find-links", wheels, "-r", lock],
+                   check=True, capture_output=True, env={**os.environ, "PIP_CONFIG_FILE": "/dev/null"})
+    result = subprocess.check_output([python, "-c", "import h11,chardet; print(h11.VALUE); print(chardet.VALUE)"], text=True)
+    assert result.splitlines() == ["edited selection", "pure selection"]
+    locations = subprocess.check_output([python, "-c", 'import importlib.metadata as m,json; print(json.dumps({n:json.loads(m.distribution(n).read_text("direct_url.json")) for n in ("h11","chardet")}))'], text=True)
+    installed = json.loads(locations)
+    for owner, wheel in (("h11", wheels / h11.name), ("chardet", chardet)):
+        assert installed[owner]["url"] == wheel.as_uri()
+        assert installed[owner]["archive_info"]["hashes"]["sha256"] == hashlib.sha256(wheel.read_bytes()).hexdigest()
+    portable = tmp_path / "portable.lock"
+    subprocess.run([sys.executable, ROOT / "macapp/wheelhouse.py", lock, "--install-lock", portable], check=True)
+    assert "file:" not in portable.read_text() and str(tmp_path) not in portable.read_text()
