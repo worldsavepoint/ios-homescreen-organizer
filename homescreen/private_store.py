@@ -18,6 +18,7 @@ def _libsystem():
         "acl_add_flag_np": (integer, [pointer, integer]),
         "acl_get_fd_np": (pointer, [integer, integer]),
         "acl_get_entry": (integer, [pointer, integer, ctypes.POINTER(pointer)]),
+        "acl_get_tag_type": (integer, [pointer, ctypes.POINTER(integer)]),
         "filesec_init": (pointer, []), "filesec_free": (None, [pointer]),
         "filesec_set_property": (integer, [pointer, integer, pointer]),
         "mkdirx_np": (integer, [ctypes.c_char_p, pointer]),
@@ -63,8 +64,14 @@ def _check_darwin_acl(fd: int):
         raise _os_error()
     try:
         entry = ctypes.c_void_p()
-        if lib.acl_get_entry(acl, 0, ctypes.byref(entry)) == 0:  # ACL_FIRST_ENTRY
-            raise PermissionError("the Session data directory has an extended access list; select a private directory")
+        cursor = 0  # ACL_FIRST_ENTRY
+        while lib.acl_get_entry(acl, cursor, ctypes.byref(entry)) == 0:
+            tag = ctypes.c_int()
+            if lib.acl_get_tag_type(entry, ctypes.byref(tag)):
+                raise _os_error()
+            if tag.value != 2:  # ACL_EXTENDED_DENY
+                raise PermissionError("the Session data directory grants additional access; select a private directory")
+            cursor = -1  # ACL_NEXT_ENTRY
         if ctypes.get_errno() != errno.EINVAL:
             raise _os_error()
     finally:

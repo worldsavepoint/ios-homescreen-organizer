@@ -68,7 +68,7 @@ def test_hidden_clip_uses_latest_explicit_observation_after_reopen(tmp_path):
     source = FileSource(path)
     session = Session(source, tmp_path / "data")
     asyncio.run(session.read())
-    clip.update(displayName="Second", webClipURL="/two")
+    clip.update(displayName="Second", webClipURL="/two", opaque={"bytes": b"configuration"})
     path.write_bytes(plistlib.dumps(raw))
     asyncio.run(session.read())
     raw["iconLists"][0].remove(clip)
@@ -196,3 +196,191 @@ def test_legacy_fixture_pending_is_preserved_as_unresolved_evidence(tmp_path, mo
     asyncio.run(other.read())
     assert other.device_id != session.device_id and not other.backups()
     assert preserved[0].read_bytes() == old
+
+
+@pytest.mark.parametrize("damage", ["xml", "grid", "pin", "bank", "placement"])
+def test_invalid_draft_fields_allow_recovery_without_adopting_damaged_state(tmp_path, damage):
+    source = MemorySource()
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    blob = plistlib.loads(session.draft_path.read_bytes())
+    if damage == "grid":
+        blob["grid"]["rows"] = "six"
+    elif damage == "pin":
+        blob["pins"] = {"a": "bad"}
+    elif damage == "bank":
+        blob["bank"] = {}
+    elif damage == "placement":
+        blob["source_placement"] = "bad"
+    damaged = b'<?xml version="1.0"?><plist><dict><key>name' if damage == "xml" else plistlib.dumps(blob)
+    session.draft_path.write_bytes(damaged)
+    reopened = Session(source, tmp_path)
+    assert reopened.layout is None and reopened._draft_error
+    assert reopened.draft_path.read_bytes() == damaged
+    asyncio.run(reopened.read())
+    assert reopened.require().pages[0][0].id == "a"
+
+
+def test_selected_session_refuses_other_identity_before_draft_adoption(tmp_path):
+    source = MemorySource()
+    session = Session(source, tmp_path, device="selected")
+    with pytest.raises(LayoutError, match="identity"):
+        asyncio.run(session.read())
+    assert not session.draft_path.exists() and session.layout is None
+
+
+@pytest.mark.parametrize("operation", ["delete", "move", "insert"])
+def test_opaque_page_owners_follow_surviving_pages_after_draft_reload(tmp_path, operation):
+    path = tmp_path / "archive.plist"
+    raw = {"iconLists": [["a"], ["b"], ["c"]], "ignored": [],
+           "listUniqueIdentifiers": ["A", "B", "C"], "listMetadata": {k: {"opaque": k} for k in "ABC"}}
+    path.write_bytes(plistlib.dumps(raw))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    if operation == "delete":
+        session.edit(lambda lay: lay.delete_page(2))
+        owners = ["A", "C"]
+    elif operation == "move":
+        session.edit(lambda lay: lay.move_page(3, 1))
+        owners = ["C", "A", "B"]
+    else:
+        session.edit(lambda lay: (lay.insert_page(2), lay.move("b", "page:2"), lay.delete_page(3)))
+        owners = ["A", None, "C"]
+    session = Session(source, session.dir)
+    r = asyncio.run(session.apply(session.require().token()))
+    assert r["ok"]
+    written = plistlib.loads(path.read_bytes())
+    assert [written["listMetadata"].get(pid, {}).get("opaque") for pid in written["listUniqueIdentifiers"]] == owners
+    assert asyncio.run(session.restore(r["backup"]))["ok"]
+    assert plistlib.loads(path.read_bytes())["listUniqueIdentifiers"] == list("ABC")
+
+
+@pytest.mark.parametrize("regenerate", [False, True])
+def test_known_dictionary_page_ids_must_match_on_readback(tmp_path, regenerate):
+    path = tmp_path / "archive.plist"
+    raw = {"iconLists": [["a"], ["b"]], "listUniqueIdentifiers": ["one", "two"],
+           "listMetadata": {} if regenerate else {"one": {"color": "red"}, "two": {"color": "blue"}}}
+    path.write_bytes(plistlib.dumps(raw))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    send = source.write
+    async def write(*args, **kw):
+        await send(*args, **kw)
+        content = plistlib.loads(path.read_bytes())
+        content["listUniqueIdentifiers"] = ["x", "y"] if regenerate else ["two", "one"]
+        path.write_bytes(plistlib.dumps(content))
+    source.write = write
+    r = asyncio.run(session.apply(session.require().token()))
+    assert not r["ok"] and session._pending_path.exists()
+
+
+@pytest.mark.parametrize("at", [1, 2, 3])
+def test_carried_folder_subpage_id_is_checked_at_each_observation(tmp_path, at):
+    path = tmp_path / "archive.plist"
+    field = {**folder("Work", [app("inside", "Inside")]), "listUniqueIdentifiers": ["alpha"]}
+    path.write_bytes(plistlib.dumps({"iconLists": [[field, "spare", "moving"]], "ignored": []}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda l: l.move("moving", "dock"))
+    read = source.read
+    calls = 0
+    async def changed():
+        nonlocal calls
+        calls += 1
+        if calls == at:
+            raw = plistlib.loads(path.read_bytes())
+            raw["iconLists"][0][0]["listUniqueIdentifiers"] = ["beta"]
+            path.write_bytes(plistlib.dumps(raw))
+        return await read()
+    source.read = changed
+    if at == 3:
+        assert not asyncio.run(session.apply(session.require().token()))["ok"]
+    else:
+        with pytest.raises(LayoutError, match="changed"):
+            asyncio.run(session.apply(session.require().token()))
+        assert not session.backups()
+
+
+def test_explicit_archive_library_readback_cannot_claim_clip_from_memory(tmp_path):
+    path = tmp_path / "archive.plist"
+    clip = {"displayIdentifier": "clip", "webClipURL": "/clip", "displayName": "Clip"}
+    path.write_bytes(plistlib.dumps({"iconLists": [[clip, "keep"]], "ignored": []}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda l: l.move("clip", "library"))
+    send = source.write
+    async def discard(*args, **kw):
+        await send(*args, **kw)
+        raw = plistlib.loads(path.read_bytes())
+        raw["ignored"] = []
+        path.write_bytes(plistlib.dumps(raw))
+    source.write = discard
+    result = asyncio.run(session.apply(session.require().token()))
+    assert not result["ok"] and session._pending_path.exists()
+
+
+def test_failed_explicit_read_rolls_back_learned_cache_and_read_snapshot(tmp_path, monkeypatch):
+    path = tmp_path / "fixture.plist"
+    source = FileSource(path)
+    raw = {"iconLists": [["a"]], "ignored": []}
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    before = {p.relative_to(session.dir): p.read_bytes() for p in session.dir.rglob("*") if p.is_file()}
+    raw["iconLists"][0].append({"displayIdentifier": "clip", "webClipURL": "/changed"})
+    path.write_bytes(plistlib.dumps(raw))
+    def fail():
+        raise OSError("draft unavailable")
+    monkeypatch.setattr(session, "_save_draft", fail)
+    with pytest.raises(OSError):
+        asyncio.run(session.read())
+    assert {p.relative_to(session.dir): p.read_bytes() for p in session.dir.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("backup", ["other/saved.plist", "../saved.plist"])
+def test_invalid_legacy_marker_keeps_its_gate(tmp_path, backup):
+    import json
+    path = tmp_path / "fixture.plist"
+    path.write_bytes(plistlib.dumps([[], [app("a", "A")]]))
+    session = Session(FileSource(path), tmp_path / "data")
+    pending = json.dumps({"device_id": "fixture-fixture", "status": "pending", "backup": backup}).encode()
+    session._pending_path.write_bytes(pending)
+    asyncio.run(session.read())
+    assert session._pending_path.read_bytes() == pending
+    with pytest.raises(LayoutError, match="pending"):
+        asyncio.run(session.apply(session.require().token()))
+
+
+def test_failed_marker_retirement_unpublishes_new_legacy_evidence(tmp_path, monkeypatch):
+    path = tmp_path / "fixture.plist"
+    path.write_bytes(plistlib.dumps([[], [app("a", "A")]]))
+    session = Session(FileSource(path), tmp_path / "data")
+    old = b'{"device_id":"fixture-fixture","backup":"saved.plist","status":"pending"}'
+    session._pending_path.write_bytes(old)
+    def fail():
+        raise OSError("storage unavailable")
+    monkeypatch.setattr(session, "_clear_pending", fail)
+    with pytest.raises(OSError):
+        asyncio.run(session.read())
+    assert session._pending_path.read_bytes() == old and not list((session.dir / "unresolved-writes").glob("*.json"))
+
+
+def test_restore_refuses_unrelated_raw_page_attached_to_the_model(tmp_path):
+    path = tmp_path / "archive.plist"
+    raw = {"iconLists": [["a"]], "listUniqueIdentifiers": ["p"], "listMetadata": {"p": {"opaque": True}}}
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    approved = asyncio.run(session.apply(session.require().token()))
+    backup = session._dev_dir("backups") / approved["backup"]
+    content = plistlib.loads(backup.read_bytes())
+    content["source_archive"]["iconLists"] = [["other"]]
+    backup.write_bytes(plistlib.dumps(content))
+    before = path.read_bytes()
+    with pytest.raises(LayoutError, match="backup"):
+        asyncio.run(session.restore(backup.name))
+    assert path.read_bytes() == before and not session._pending_path.exists()

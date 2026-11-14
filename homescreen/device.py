@@ -86,6 +86,12 @@ def _validate_page_ids(archive: dict[str, Any], count: int) -> None:
         raise LayoutError("exported pin metadata has invalid page identifiers")
 
 
+def archive_page_order(archive: dict, origins: list[int]) -> list[str]:
+    _validate_page_ids(archive, len(archive["iconLists"]))
+    ids = archive["listUniqueIdentifiers"]
+    return [ids[i] if i >= 0 else str(uuid.uuid4()).upper() for i in origins]
+
+
 def _check_list_write(pins: list[dict[str, int]] | None, library: list[Any] | None) -> None:
     if pins and any(pins):
         raise LayoutError("list-format writes cannot send fixed positions; use ordinary page order")

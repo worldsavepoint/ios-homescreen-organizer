@@ -216,5 +216,5 @@ def optimize(lay: Layout, opens: dict[str, int], keep_first_page: bool = False) 
             used += movable[i].slots
             i += 1
         out.append(page)
-    lay.pages = lay.pages[:start] + [p for p in out if p]
+    lay.repack_pages(lay.pages[:start] + [p for p in out if p])
     return {"swipes_before": before, "swipes_after": swipes(lay, opens)}

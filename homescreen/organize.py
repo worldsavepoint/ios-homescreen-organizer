@@ -37,7 +37,7 @@ def pack(lay: Layout, items: list[Node], start_page: int = 0) -> None:
             used = 0
         pages[-1].append(n)
         used += n.slots
-    lay.pages = kept + [p for p in pages if p]
+    lay.repack_pages(kept + [p for p in pages if p])
 
 
 def _split(lay: Layout, keep_first_page: bool) -> tuple[int, list[Node], list[Node]]:
@@ -103,7 +103,9 @@ def into_folders(lay: Layout, groups: dict[str, list[str]], keep_first_page: boo
                     folder.children.append([])
                 lay.move(i, f"{folder.id}:{len(folder.children)}")
         filed[folder.name] = [lay.nodes[i].name for i in ids]
-    lay.pages = [p for p in lay.pages if p] or [[]]  # filing can empty a page
+    lay.remove_empty_pages()
+    if not lay.pages:
+        lay.insert_page(1)
     return {"filed": filed, "count": sum(len(v) for v in filed.values())}
 
 

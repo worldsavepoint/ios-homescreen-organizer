@@ -17,15 +17,16 @@ import json
 import os
 import uuid
 import plistlib
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from collections import Counter
 from collections.abc import Set
 from pathlib import Path
 from typing import Any, Callable
+from xml.parsers.expat import ExpatError
 
 from . import colors
-from .device import DISK_MARK, NAME_MARK, ObservedPins, Source, disk_pins, disk_to_model, page_fields, require_writable
+from .device import DISK_MARK, NAME_MARK, ObservedPins, Source, archive_page_order, disk_pins, disk_to_model, page_fields, require_writable
 from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, widget_configuration
 from .private_store import ensure_private_directory
 
@@ -384,7 +385,7 @@ def _carried_node(node: Node, leaf_dicts: bool) -> Any:
     """Compare fields actually sent by the selected writer, separately from persistent pin identities."""
     if node.kind == "folder":
         fields = {k: v for k, v in node.raw.items()
-                  if k not in (NAME_MARK, "iconLists", "displayName", "uniqueIdentifier", "listUniqueIdentifiers")}
+                  if k not in (NAME_MARK, "iconLists", "displayName", "uniqueIdentifier")}
         return [node.name, plistlib.dumps(fields, fmt=plistlib.FMT_BINARY).hex(),
                 [[_carried_node(c, leaf_dicts) for c in page] for page in node.children if page]]
     if leaf_dicts and node.bundle_id and not node.raw.get(DISK_MARK):
@@ -626,11 +627,13 @@ class Session:
                 info = blob.get("info", {})
                 if not isinstance(device, str) or not device or not isinstance(info, dict):
                     raise ValueError("invalid draft identity")
-                if self._draft_key is not None and self._draft_key != device:
+                if self._draft_key not in (None, "unselected", device):
                     raise ValueError("draft belongs to another device")
                 self.device_id = device  # Recovery can still list this device's backups.
                 placement = _MISSING
                 if "source_placement" in blob:
+                    if not isinstance(blob["source_placement"], dict):
+                        raise ValueError("invalid draft placement")
                     placement = disk_pins(blob["source_placement"])
                 elif "source_pins_reported" in blob:
                     placement = blob["source_pin_map"] if blob["source_pins_reported"] else None
@@ -639,6 +642,8 @@ class Session:
                 for view in (lay, original):
                     if set(view.pins) - view.nodes.keys():
                         raise LayoutError("saved draft pin identity is unavailable; call read again")
+                    if any(type(v) is not int or not 0 <= v < view.grid.slots for v in view.pins.values()):
+                        raise LayoutError("saved draft pin cell is invalid; read the device again")
                 if "identity" not in blob or "source_identity" not in blob:
                     # Legacy enumeration IDs cannot prove ownership after reordering.
                     for view in (lay, original):
@@ -665,7 +670,7 @@ class Session:
                 self.layout = lay
             except LayoutError as e:
                 self._draft_error = str(e)
-            except (ValueError, TypeError, KeyError, OverflowError, plistlib.InvalidFileException):
+            except (ValueError, TypeError, KeyError, OverflowError, ExpatError, plistlib.InvalidFileException):
                 self._draft_error = "saved draft data is invalid; read the device again"
 
     def require(self) -> Layout:
@@ -889,20 +894,25 @@ class Session:
 
     @property
     def _webclips_path(self) -> Path:
-        return self._dev_dir("webclips") / "seen.json"
+        return self._dev_dir("webclips") / "seen.plist"
 
-    def _known_webclips(self) -> dict[str, dict[str, str]]:
-        return json.loads(self._webclips_path.read_text()) if self._webclips_path.exists() else {}
+    def _known_webclips(self) -> dict[str, dict[str, Any]]:
+        path = self._webclips_path
+        if path.exists():
+            return plistlib.loads(path.read_bytes())
+        legacy = path.with_suffix(".json")
+        return json.loads(legacy.read_text()) if legacy.exists() else {}
 
     def _remember_webclips(self, state: list[Any], library: list[Any] | None) -> None:
         known = self._known_webclips()
         updated = dict(known)
         for n in Layout(state, library=library).nodes.values():
             if n.kind == "webclip":
-                updated[n.id] = {k: n.raw[k] for k in ("displayIdentifier", "displayName", "webClipURL")
-                                 if isinstance(n.raw.get(k), str)}
-        if updated != known:
-            _private_replace(self._webclips_path, json.dumps(updated, indent=1, sort_keys=True).encode())
+                updated[n.id] = n.raw
+        if updated:
+            result = plistlib.dumps(updated, fmt=plistlib.FMT_BINARY)
+            if result != plistlib.dumps(known, fmt=plistlib.FMT_BINARY):
+                _private_replace(self._webclips_path, result)
 
     def _with_webclips(self, state: list[Any], library: list[Any] | None) -> list[Any] | None:
         """library plus every remembered web clip that isn't on the Home Screen."""
@@ -911,12 +921,15 @@ class Session:
         here = {n.id for n in Layout(state, library=library).nodes.values()}
         return library + [dict(w) for i, w in sorted(self._known_webclips().items()) if i not in here]
 
-    async def _read_source(self, reference=None) -> tuple[list[Any], list[Any] | None]:
+    async def _read_source(self, reference=None, *, verifying: bool = False) -> tuple[list[Any], list[Any] | None]:
         state, library = await asyncio.wait_for(self.source.read(), OPERATION_TIMEOUT)
+        Layout(state, library=library, grid=self.grid)
         if reference is not None:
             _restore_archive_app_ids(state, library, reference)
         self._remember_widget_ids(state)
         self._remember_webclips(state, library)
+        if verifying and getattr(self.source, "source_archive", None) is not None:
+            return state, library
         return state, self._with_webclips(state, library)
 
     # ---- gap memory ----------------------------------------------------------------------
@@ -980,6 +993,8 @@ class Session:
         device_id = info.get("UniqueDeviceID")
         if not isinstance(device_id, str) or not device_id:
             raise LayoutError("device identity is unavailable; no layout was loaded")
+        if self._draft_key not in (None, "unselected", device_id):
+            raise LayoutError("device identity differs from the selected device; select the intended device")
         grid = Grid.from_metrics(info.get("icon_metrics"))
         state, library = await asyncio.wait_for(self.source.read(), OPERATION_TIMEOUT)
         verified = await asyncio.wait_for(self.source.info(), OPERATION_TIMEOUT)
@@ -994,9 +1009,12 @@ class Session:
             pending_bytes = self._pending_path.read_bytes()
             pending = json.loads(pending_bytes)
             clear_pending = pending.get("device_id") == device_id
-            if (getattr(self.source, "legacy_fixture_id", None) and
+            name = pending.get("backup")
+            if (set(pending) == {"device_id", "backup", "status"}
+                    and isinstance(name, str) and name.endswith(".plist") and Path(name).name == name
+                    and "\x00" not in name and getattr(self.source, "legacy_fixture_id", None) and
                     pending.get("device_id") == self.source.legacy_fixture_id and pending.get("status") == "pending"
-                    and isinstance(pending.get("backup"), str) and pending["backup"]):
+                    ):
                 legacy_pending = pending_bytes
         previous = (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
                     self._observed_placement, self._page_identity, self._draft_digest, self._placement_revision)
@@ -1006,14 +1024,18 @@ class Session:
             self.device_id = device_id
             self.info = {k: v for k, v in info.items() if k in ("DeviceName", "ProductType", "ProductVersion")}
             self.grid = grid
-            self._remember_widget_ids(state)
-            self._remember_webclips(state, library)
-            library = self._with_webclips(state, library)
             reads = self._dev_dir("reads")
-            _private_replace(reads / f"{_stamp()}.plist", _pack(state, library))
-            for old in sorted(reads.glob("*.plist"))[:-KEEP_READS]:
-                old.unlink()
-            with _previous_file(self._gaps_path), _previous_file(self.draft_path):
+            snapshot = reads / f"{_stamp()}.plist"
+            with ExitStack() as transaction:
+                for path in (self._widget_ids_path, self._webclips_path, snapshot, self._gaps_path, self.draft_path):
+                    transaction.enter_context(_previous_file(path))
+                self._remember_widget_ids(state)
+                self._remember_webclips(state, library)
+                library = self._with_webclips(state, library)
+                _private_replace(snapshot, _pack(state, library))
+                for old in sorted(reads.glob("*.plist"))[:-KEEP_READS]:
+                    transaction.enter_context(_previous_file(old))
+                    old.unlink()
                 self.layout = self._layout_from(state, library, recover_memory=True)
                 self.layout.approval_device = device_id
                 self._placement_revision = self._saved_placement_revision()
@@ -1024,6 +1046,7 @@ class Session:
                     unresolved = self.dir / "unresolved-writes"
                     unresolved.mkdir(mode=0o700, exist_ok=True)
                     path = unresolved / (hashlib.sha256(legacy_pending).hexdigest() + ".json")
+                    transaction.enter_context(_previous_file(path))
                     try:
                         _publish_exclusive(path, legacy_pending)
                     except FileExistsError:
@@ -1093,6 +1116,8 @@ class Session:
         if archive is not None:
             blob["source_archive"] = archive
         provenance = {"version": 1, "device_id": self.device_id, "grid": self.grid.to_dict()}
+        if archive is not None:
+            provenance["archive_pins_reported"] = getattr(self.source, "pins", None) is not None
         if observed is not None:
             provenance["pin_keys"] = "wire-v1"
             bound = _instance_ids(observed, self._gap_memory())
@@ -1142,7 +1167,6 @@ class Session:
                 raise LayoutError("the phone's exported gaps changed since it was read; read again and redo the edits")
             if self._page_identity is not _MISSING and self._page_identity != current.page_identity:
                 raise LayoutError("the phone's page identifiers changed since it was read; read again and redo the edits")
-        saved, saved_pins = self._prepared_layout(self._layout_from(current.state, current.library))
         target = copy.deepcopy(target)
         self._recover_widget_ids(_widgets(target))
         if target_lib is not None:
@@ -1156,6 +1180,20 @@ class Session:
             raise LayoutError("the phone's layout changed during the final prewrite read; read again")
         if not current.same_placement(final):
             raise LayoutError("the phone's exported gaps changed during the final prewrite read; read again")
+        saved, saved_pins = self._prepared_layout(self._layout_from(final.state, final.library))
+        expected_page_ids = None
+        if prepared is not None and final.archive is not None and "listUniqueIdentifiers" in final.archive:
+            old_ids = final.archive["listUniqueIdentifiers"]
+            if len(prepared.page_origins) != len(target) - 1:
+                raise LayoutError("page ownership changed; read the device again before writing")
+            expected_page_ids = archive_page_order(final.archive, prepared.page_origins)
+            if not prepared.page_origins_known and page_fields(final.archive, len(old_ids)):
+                raise LayoutError("the saved draft has no original page ownership; read the device again")
+            if expected_page_ids != old_ids:
+                page_archive = {"listUniqueIdentifiers": expected_page_ids,
+                                "listMetadata": final.archive.get("listMetadata", {})}
+        elif page_archive is not None and final.archive is not None:
+            expected_page_ids = page_archive.get("listUniqueIdentifiers")
         archive_args = {}
         retained_fields = page_fields(page_archive if page_archive is not None else final.archive or {}, len(target) - 1)
         if page_archive is not None and final.archive is not None:
@@ -1195,7 +1233,7 @@ class Session:
             write_error = type(e).__name__
         verification_note = "Readback compares the layout fields returned by the selected source."
         try:
-            after, after_lib = await self._read_source((target, target_lib))
+            after, after_lib = await self._read_source((target, target_lib), verifying=True)
             await self._assert_identity()
             got_pins = getattr(self.source, "pins", None)
             unreported = got_pins is None
@@ -1219,6 +1257,10 @@ class Session:
             ok = (placed_structure(after, after_lib if lib_known else None, got_pins, self.grid,
                                    by_memory=unreported, leaf_dicts=final.leaf_dicts)
                   == placed_structure(target, target_lib, want_pins, self.grid, leaf_dicts=final.leaf_dicts))
+            if expected_page_ids is not None:
+                raw = getattr(self.source, "source_archive", None) or {}
+                if raw.get("listUniqueIdentifiers") != expected_page_ids:
+                    raise LayoutError("readback changed the exported page identifiers")
             if retained_fields:
                 reported = page_fields(getattr(self.source, "source_archive", None) or {}, len(after) - 1)
                 for pid, wanted in retained_fields.items():
@@ -1367,13 +1409,13 @@ class Session:
                 if not isinstance(archive, dict):
                     raise ValueError("invalid saved source archive")
                 original_state, original_lib = disk_to_model(archive)
+                _restore_archive_app_ids(original_state, original_lib, (state, library))
                 original = Layout(original_state, library=original_lib, grid=restored.grid)
-                if len(original.pages) != len(restored.pages):
-                    raise ValueError("archive page count differs from saved layout")
                 metadata = disk_pins(archive)
                 if metadata.archive:
                     page_archive = metadata.archive
             pins = _unpack_pins(data)
+            saved_wire_pins = pins
             if pins is not None and (not isinstance(pins, list) or any(not isinstance(page, dict) for page in pins)):
                 raise LayoutError("backup pins must identify items on each page")
             key_format = provenance.get("pin_keys")
@@ -1419,8 +1461,10 @@ class Session:
                     mapped.append(mapped_page)
                 pins = mapped
                 node_pins(restored, pins, strict=True)
-            if page_archive is not None:
+            if page_archive is not None and provenance.get("archive_pins_reported"):
                 metadata.validate([{pin_key(n) for n in page} for page in original.pages], old_grid or self.grid)
+                if metadata.pages(len(original.pages)) != (saved_wire_pins or [{} for page in original.pages]):
+                    raise LayoutError("backup archive positions differ from the saved layout")
             bound = set()
             if "folder_instances" in provenance:
                 pages = provenance["folder_instances"]
@@ -1447,6 +1491,20 @@ class Session:
                     problems += [f"page {index + 1}: {problem}" for problem in restored.place(page)[1]]
             if problems:
                 raise LayoutError(f"backup layout has problems, not restoring: {problems}")
+            if archive is not None:
+                raw_pages, raw_lib = _carried_layout(original, True)
+                saved_pages, _ = _carried_layout(restored, True)
+                if raw_pages != saved_pages or not _compatible_folder_ids(original, restored):
+                    raise LayoutError("backup archive page owners differ from the saved layout")
+                inventory = Counter(json.dumps(value, sort_keys=True) for value in raw_lib or [])
+                for node in restored.library or []:
+                    key = json.dumps(_carried_node(node, True), sort_keys=True)
+                    if inventory[key]:
+                        inventory[key] -= 1
+                    elif node.kind != "webclip":
+                        raise LayoutError("backup archive library differs from the saved layout")
+                if any(inventory.values()):
+                    raise LayoutError("backup archive library differs from the saved layout")
         except LayoutError:
             raise
         except (ValueError, TypeError, KeyError, plistlib.InvalidFileException) as e:

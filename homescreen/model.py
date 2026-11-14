@@ -34,6 +34,10 @@ class Grid:
     dock: int = DEFAULT_DOCK_SLOTS
     folder: int = DEFAULT_FOLDER_PAGE_SLOTS
 
+    def __post_init__(self):
+        if any(type(v) is not int or v <= 0 for v in (self.cols, self.rows, self.dock, self.folder)):
+            raise LayoutError("grid dimensions must be positive integers")
+
     @property
     def slots(self) -> int:
         return self.cols * self.rows
@@ -165,7 +169,9 @@ class Layout:
         self.pages = [[self._wrap(r, f"p{i}") for r in item_list(page)] for i, page in enumerate(raw_state[1:], 1)]
         self.library = None if library is None else [self._wrap(r, "library") for r in item_list(library)]
         # App Bank: a draft-only tray for items set aside while rearranging. Never written.
-        self.bank = [self._wrap(r, "bank") for r in bank or []]
+        self.bank = [self._wrap(r, "bank") for r in item_list(bank)] if bank is not None else []
+        self.page_origins = list(range(len(self.pages)))
+        self.page_origins_known = True
         if identity is not None:
             self._restore_identity(identity)
         self.source_identity = copy.deepcopy(source_identity) if source_identity is not None else (
@@ -215,7 +221,8 @@ class Layout:
 
     def current_fields(self) -> dict[str, Any]:
         return {"state": self.to_state(), "library": self.to_library(), "bank": self.to_bank(),
-                "pins": self.pins, "identity": self.identity(), "grid": self.grid.to_dict()}
+                "pins": self.pins, "identity": self.identity(), "grid": self.grid.to_dict(),
+                "page_origins": self.page_origins, "page_origins_known": self.page_origins_known}
 
     def current_snapshot(self) -> dict[str, Any]:
         """An undo step owns its editable state and local allocation identities."""
@@ -230,11 +237,26 @@ class Layout:
 
     @classmethod
     def from_snapshot(cls, snap: dict[str, Any]) -> "Layout":
-        return cls(snap["state"], source=snap["source"], library=snap.get("library"),
+        lay = cls(snap["state"], source=snap["source"], library=snap.get("library"),
                    source_library=snap.get("source_library"), bank=snap.get("bank"),
                    pins=snap.get("pins"), source_pins=snap.get("source_pins"),
                    grid=Grid(**snap["grid"]) if "grid" in snap else Grid(),
                    identity=snap.get("identity"), source_identity=snap.get("source_identity"))
+        if "page_origins" in snap:
+            origins = snap["page_origins"]
+            if (not isinstance(origins, list) or len(origins) != len(lay.pages)
+                    or any(type(i) is not int or not -1 <= i < len(lay.source) - 1 for i in origins)
+                    or len(set(i for i in origins if i >= 0)) != sum(i >= 0 for i in origins)):
+                raise LayoutError("saved draft page identities are invalid; read the device again")
+            lay.page_origins = list(origins)
+            if type(snap.get("page_origins_known", True)) is not bool:
+                raise LayoutError("saved draft page identities are invalid; read the device again")
+            lay.page_origins_known = snap.get("page_origins_known", True)
+        elif lay.to_state() != lay.source:
+            # Older drafts did not track page moves independently of their contents.
+            lay.page_origins_known = False
+            lay.page_origins = [i if i < len(lay.source) - 1 else -1 for i in range(len(lay.pages))]
+        return lay
 
     def refold(self, folder: Node, items: list[Node] | None = None) -> None:
         """Lay a folder's items (or the given ones) out in full folder pages."""
@@ -466,6 +488,7 @@ class Layout:
                 if idx > len(self.pages) + 1:
                     raise LayoutError(f"page {idx} does not exist (there are {len(self.pages)})")
                 self.pages.append([])
+                self.page_origins.append(-1)
             if idx < 1:
                 raise LayoutError("pages are numbered from 1")
             return self.pages[idx - 1]
@@ -565,12 +588,14 @@ class Layout:
         if not 1 <= at <= len(self.pages) + 1:
             raise LayoutError(f"can't insert page {at}; there are {len(self.pages)}")
         self.pages.insert(at - 1, [])
+        self.page_origins.insert(at - 1, -1)
 
     def move_page(self, page: int, to: int) -> None:
         n = len(self.pages)
         if not (1 <= page <= n and 1 <= to <= n):
             raise LayoutError(f"pages are 1..{n}")
         self.pages.insert(to - 1, self.pages.pop(page - 1))
+        self.page_origins.insert(to - 1, self.page_origins.pop(page - 1))
 
     def delete_page(self, page: int) -> None:
         """Remove a page like iOS does: its apps (folders' too) go to the App Library."""
@@ -588,6 +613,7 @@ class Layout:
             if n.kind == "folder":
                 del self.nodes[n.id]
         self.pages.pop(page - 1)
+        self.page_origins.pop(page - 1)
 
     def dissolve_folder(self, folder_id: str) -> None:
         """Put a folder's apps where the folder was, in order, and remove the folder."""
@@ -655,7 +681,7 @@ class Layout:
             raise LayoutError("; ".join(problems))
         old_page = {n.id: k for k, p in enumerate(self.pages) for n in p}
         self.dock = [self.nodes[i] for i in dock]
-        self.pages = [[self.nodes[i] for i in p] for p in pages]
+        self.repack_pages([[self.nodes[i] for i in p] for p in pages])
         if self.library is not None:
             self.library = [self.nodes[i] for i in library]
         self.bank = [n for n in self.bank if n.id not in set(wanted)]
@@ -674,8 +700,17 @@ class Layout:
         for n in self.dock:
             if n.kind == "folder" and not n.children:
                 n.children = [[]]
-        self.pages = [p for p in self.pages if p]
+        self.remove_empty_pages()
         self.tidy_pins()
+
+    def repack_pages(self, pages: list[list[Node]]) -> None:
+        """Replace the contents of each page in order, extending or retiring the tail."""
+        self.page_origins = (self.page_origins + [-1] * len(pages))[:len(pages)]
+        self.pages = pages
+
+    def remove_empty_pages(self) -> None:
+        self.page_origins = [origin for origin, page in zip(self.page_origins, self.pages) if page]
+        self.pages = [p for p in self.pages if p]
 
     # ---- checks -----------------------------------------------------------------
 

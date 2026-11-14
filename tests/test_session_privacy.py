@@ -51,3 +51,12 @@ def test_existing_shared_root_remains_intact_and_private_data_is_not_opened(tmp_
         else:
             config.enable_device_switching()
     assert record.read_bytes() == b"original" and grants(root) and grants(record)
+
+
+def test_deny_only_acl_remains_usable_and_unchanged(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    subprocess.run(["/bin/chmod", "+a", "everyone deny delete", root], check=True)
+    session = Session(MemorySource(), root)
+    asyncio.run(session.read())
+    assert " deny delete" in subprocess.check_output(["/bin/ls", "-lde", root], text=True)
