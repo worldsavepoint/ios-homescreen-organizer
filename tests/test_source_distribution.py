@@ -773,47 +773,16 @@ def test_binding_failure(tmp_path, monkeypatch):
     assert "payload-secret.swift" not in rendered and "byte-marker-for-pytest" not in rendered
 
 
-@pytest.mark.parametrize("provider_status,build_status", [(0, 0), (9, 0), (0, 7)])
-def test_intel_package_diagnostic_preserves_test_failure_and_build_gates(tmp_path, provider_status, build_status):
-    import os
-    import subprocess
-    import textwrap
+def test_native_workflow_returns_to_success_gated_package_builds():
     workflow = (ROOT / ".github/workflows/tests.yml").read_text()
-    test_job = workflow.split("\n  test:\n", 1)[1].split("\n  assemble:\n", 1)[0]
-    full_tests = test_job.split("      - name: Validate layouts, draft edits, backups and editor routes\n", 1)[1].split("\n      - ", 1)[0]
-    assert "        id: full_tests\n" in full_tests
-    step = test_job.split("      - name: Diagnose Intel package after failed tests\n", 1)[1].split("\n      - ", 1)[0]
-    assert test_job.index("        id: full_tests\n") < test_job.index("      - name: Diagnose Intel package after failed tests\n")
-    assert "        if: ${{ failure() && matrix.arch == 'x86_64' && steps.full_tests.outcome == 'failure' }}\n" in step
-    assert "HOMESCREEN_BUILD_PYTHON: ${{ runner.temp }}/release-python/bin/python3.12" in step
-    assert "HOMESCREEN_BUILD_ARCH: ${{ matrix.arch }}" in step
-    assert "continue-on-error" not in test_job
-    for title in ("Upload matching native source inputs", "Upload installable archives"):
-        upload = test_job.split("      - name: " + title + "\n", 1)[1].split("\n      - ", 1)[0]
-        assert "        if:" not in upload
+    native = workflow.split("\n  test:\n", 1)[1].split("\n  assemble:\n", 1)[0]
+    assert "Diagnose Intel package after failed tests" not in native
+    assert "failure()" not in native and "continue-on-error" not in native
+    assert native.index(".venv/bin/python -m pytest -q tests") < native.index("      - name: Build and verify the Mac app")
+    for title in ("Build and verify the Mac app", "Upload matching native source inputs", "Upload installable archives"):
+        step = native.split("      - name: " + title + "\n", 1)[1].split("\n      - ", 1)[0]
+        assert "        if:" not in step
     assert "    needs: test\n" in workflow.split("\n  assemble:\n", 1)[1]
-    body = textwrap.dedent(step.split("        run: |\n", 1)[1])
-    macapp = tmp_path / "macapp"
-    macapp.mkdir()
-    (macapp / "native_sources.py").write_text('''import os, pathlib, sys
-assert sys.argv[1:] == ["--arch", "x86_64", "--destination", os.environ["RUNNER_TEMP"] + "/release-python"]
-pathlib.Path("provider-ran").touch()
-sys.exit(int(os.environ["PROVIDER_STATUS"]))
-''')
-    build = macapp / "build.sh"
-    build.write_text('#!/bin/bash\nset -eu\ntest "$HOMESCREEN_BUILD_ARCH" = x86_64\ntest "$HOMESCREEN_BUILD_PYTHON" = "$RUNNER_TEMP/release-python/bin/python3.12"\ntouch build-ran\nexit "$BUILD_STATUS"\n')
-    build.chmod(0o755)
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    (tools / "python").symlink_to(sys.executable)
-    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=tmp_path, capture_output=True,
-                            env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
-                                 "BUILD_ARCH": "x86_64", "HOMESCREEN_BUILD_ARCH": "x86_64", "RUNNER_TEMP": str(tmp_path),
-                                 "HOMESCREEN_BUILD_PYTHON": str(tmp_path / "release-python/bin/python3.12"),
-                                 "PROVIDER_STATUS": str(provider_status), "BUILD_STATUS": str(build_status)})
-    assert result.returncode == (provider_status or build_status)
-    assert (tmp_path / "provider-ran").is_file()
-    assert (tmp_path / "build-ran").is_file() == (provider_status == 0)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Uses the native Swift compiler and Mach-O signer")
@@ -948,7 +917,7 @@ PyMODINIT_FUNC PyInit_r2native(void) { return PyModule_Create(&module); }
 
 @pytest.mark.parametrize("cpu,page", [(0x0100000C, 16384), (0x01000007, 4096)])
 @pytest.mark.parametrize("damage", [None, "cpu", "header", "commands", "segment", "bounds", "signature"])
-def test_canonical_launcher_changes_only_bounded_linkedit_virtual_size(cpu, page, damage):
+def test_canonical_launcher_changes_only_bounded_linkedit_alignment(cpu, page, damage):
     import struct
     from frozen_sources import canonical_launcher_payload
     payload = bytearray(page + 7)
@@ -962,12 +931,79 @@ def test_canonical_launcher_changes_only_bounded_linkedit_virtual_size(cpu, page
         with pytest.raises(ValueError, match="launcher"):
             canonical_launcher_payload(payload)
     else:
-        expected = bytearray(payload)
+        expected = bytearray(payload + bytes(-len(payload) % 16))
         struct.pack_into("<Q", expected, 64, page)
+        struct.pack_into("<Q", expected, 80, 16)
         assert canonical_launcher_payload(payload) == expected
         assert canonical_launcher_payload(expected) == expected
         expected[-1] ^= 1
         assert canonical_launcher_payload(expected) != canonical_launcher_payload(payload)
+
+
+def test_canonical_launcher_appends_alignment_without_discarding_original_bytes():
+    import struct
+    from frozen_sources import canonical_launcher_payload
+    page = 4096
+    before = bytearray(page + 24)
+    struct.pack_into("<IiiIIIII", before, 0, 0xFEEDFACF, 0x01000007, 3, 2, 2, 96, 0, 0)
+    struct.pack_into("<II16sQQQQiiII", before, 32, 0x19, 72, b"__LINKEDIT", page * 4, page, page, 24, 1, 1, 0, 0)
+    struct.pack_into("<6I", before, 104, 2, 24, page, 1, page + 16, 8)
+    before[-24:] = b"meaningful bytes" + b"strings\0"
+    after = bytearray(before + bytes(8))
+    struct.pack_into("<Q", after, 64, page * 2)
+    struct.pack_into("<Q", after, 80, 32)
+    canonical = canonical_launcher_payload(before)
+    assert len(canonical) == page + 32
+    assert canonical[page:page + 24] == before[page:]
+    assert canonical[-8:] == bytes(8)
+    assert canonical == canonical_launcher_payload(after)
+    after[-1] = 1
+    assert canonical != canonical_launcher_payload(after)
+    after = bytearray(before)
+    after[page] ^= 1
+    assert canonical != canonical_launcher_payload(after)
+
+
+@pytest.mark.parametrize("reference", ["symbols", "strings", "dynamic-symbols", "dyld-info", "linkedit-data",
+                                        "section", "relocations", "note", "entrypoint"])
+def test_canonical_launcher_never_restores_truncated_referenced_zero_bytes(reference):
+    import struct
+    from frozen_sources import canonical_launcher_payload
+    page, file_size, sections = 4096, 8, 0
+    if reference == "symbols":
+        file_size = 16
+        extra = struct.pack("<6I", 2, 24, page, 1, 0, 0)
+    elif reference == "strings":
+        extra = struct.pack("<6I", 2, 24, 0, 0, page, file_size)
+    elif reference == "dynamic-symbols":
+        fields = [0] * 18
+        fields[12:14] = [page, 2]
+        extra = struct.pack("<20I", 0xB, 80, *fields)
+    elif reference == "dyld-info":
+        extra = struct.pack("<12I", 0x80000022, 48, page, file_size, *([0] * 8))
+    elif reference == "linkedit-data":
+        extra = struct.pack("<4I", 0x80000033, 16, page, file_size)
+    elif reference == "note":
+        extra = struct.pack("<II16sQQ", 0x31, 40, b"owner", page, file_size)
+    elif reference == "entrypoint":
+        extra = struct.pack("<IIQQ", 0x80000028, 24, page + file_size - 1, 0)
+    else:
+        sections = 1
+        extra = struct.pack("<16s16sQQ8I", b"data", b"__LINKEDIT", page * 4,
+                            file_size if reference == "section" else 0, page, 0,
+                            page if reference == "relocations" else 0, 1 if reference == "relocations" else 0, 0, 0, 0, 0)
+    segment_size = 72 + sections * 80
+    payload = bytearray(page + file_size)
+    struct.pack_into("<IiiIIIII", payload, 0, 0xFEEDFACF, 0x01000007, 3, 2,
+                     1 if sections else 2, 72 + len(extra), 0, 0)
+    struct.pack_into("<II16sQQQQiiII", payload, 32, 0x19, segment_size, b"__LINKEDIT",
+                     page * 4, page, page, file_size, 1, 1, sections, 0)
+    payload[104:104 + len(extra)] = extra
+    canonical_launcher_payload(payload)
+    truncated = payload[:-1]
+    struct.pack_into("<Q", truncated, 80, file_size - 1)
+    with pytest.raises(ValueError, match="launcher"):
+        canonical_launcher_payload(truncated)
 
 
 def test_native_compiler_keeps_supplied_rust_flags_and_remaps_tool_roots(tmp_path, monkeypatch):

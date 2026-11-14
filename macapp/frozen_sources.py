@@ -115,7 +115,7 @@ def project_release_version(root, installed):
     return version
 
 
-LAUNCHER_DIGEST = "sha256-unsigned-macho64-page-rounded-linkedit-vmsize-v1"
+LAUNCHER_DIGEST = "sha256-unsigned-macho64-linkedit-align16-v2"
 
 
 def canonical_launcher_payload(data):
@@ -126,7 +126,11 @@ def canonical_launcher_payload(data):
     page = {0x0100000C: 16384, 0x01000007: 4096}.get(cpu)
     if magic != 0xFEEDFACF or page is None or filetype != 2 or not 0 < count <= 4096 or size > len(data) - 32:
         raise ValueError(error)
-    offset, end, linkedit = 32, 32 + size, None
+    offset, end, linkedit, references = 32, 32 + size, None, []
+    linkedit_commands = {0x1E, 0x26, 0x29, 0x2B, 0x2E, 0x80000033, 0x80000034, 0x36, 0x37, 0x38}
+    inline_commands = {0x4, 0x5, 0xC, 0xD, 0xE, 0xF, 0x10, 0x12, 0x13, 0x14, 0x15,
+                       0x80000018, 0x1A, 0x1B, 0x8000001C, 0x8000001F, 0x20, 0x80000023,
+                       0x24, 0x25, 0x2A, 0x2D, 0x2F, 0x30, 0x32}
     for _ in range(count):
         if offset + 8 > end:
             raise ValueError(error)
@@ -139,21 +143,67 @@ def canonical_launcher_payload(data):
             _, _, name, address, virtual_size, file_offset, file_size, _, _, sections, _ = struct.unpack_from("<II16sQQQQiiII", data, offset)
             if length != 72 + 80 * sections or file_offset + file_size > len(data):
                 raise ValueError(error)
+            for index in range(sections):
+                section = struct.unpack_from("<16s16sQQ8I", data, offset + 72 + 80 * index)
+                section_size, section_offset, relocations, relocation_count, flags = section[3], section[4], section[6], section[7], section[8]
+                if (flags & 0xFF) not in (1, 0xC, 0x12) and section_size:
+                    if section_offset < file_offset or section_offset + section_size > file_offset + file_size:
+                        raise ValueError(error)
+                    references.append((section_offset, section_size))
+                references.append((relocations, relocation_count * 8))
             if name.rstrip(b"\0") == b"__LINKEDIT":
                 rounded = (file_size + page - 1) // page * page
-                if linkedit is not None or file_offset < end or address % page or virtual_size % page or virtual_size < rounded:
+                if (linkedit is not None or file_offset < end or address % page or virtual_size % page
+                        or virtual_size < rounded or file_offset + file_size != len(data)):
                     raise ValueError(error)
-                linkedit = offset + 32, rounded
+                linkedit = offset, file_size
+        elif command == 2:
+            if length != 24:
+                raise ValueError(error)
+            symbols, count, strings, string_size = struct.unpack_from("<4I", data, offset + 8)
+            references.extend(((symbols, count * 16), (strings, string_size)))
+        elif command == 0xB:
+            if length != 80:
+                raise ValueError(error)
+            values = struct.unpack_from("<18I", data, offset + 8)
+            references.extend((values[index], values[index + 1] * width)
+                              for index, width in zip(range(6, 18, 2), (8, 56, 4, 4, 8, 8)))
+        elif command in (0x22, 0x80000022):
+            if length != 48:
+                raise ValueError(error)
+            values = struct.unpack_from("<10I", data, offset + 8)
+            references.extend(zip(values[::2], values[1::2]))
+        elif command in linkedit_commands or command == 0x16:
+            if length != 16:
+                raise ValueError(error)
+            start, size = struct.unpack_from("<II", data, offset + 8)
+            references.append((start, size * 4 if command == 0x16 else size))
+        elif command == 0x31:
+            if length != 40:
+                raise ValueError(error)
+            references.append(struct.unpack_from("<QQ", data, offset + 24))
+        elif command == 0x80000028:
+            if length != 24:
+                raise ValueError(error)
+            references.append((struct.unpack_from("<Q", data, offset + 8)[0], 1))
+        elif command not in inline_commands:
+            raise ValueError(error)
         offset += length
-    if offset != end or linkedit is None:
+    if (offset != end or linkedit is None
+            or any(size and (start < end or start + size > len(data)) for start, size in references)):
         raise ValueError(error)
     payload = bytearray(data)
-    struct.pack_into("<Q", payload, *linkedit)
+    padding = -len(payload) % 16
+    payload.extend(bytes(padding))
+    offset, file_size = linkedit
+    file_size += padding
+    struct.pack_into("<Q", payload, offset + 32, (file_size + page - 1) // page * page)
+    struct.pack_into("<Q", payload, offset + 48, file_size)
     return bytes(payload)
 
 
 def launcher_digest(executable):
-    """Hash all unsigned launcher bytes, normalizing only LINKEDIT's virtual extent."""
+    """Hash every unsigned launcher byte with deterministic LINKEDIT alignment."""
     try:
         with tempfile.TemporaryDirectory() as folder:
             payload = Path(folder) / "launcher"

@@ -75,16 +75,7 @@ jobs:
       - name: Validate shared translation catalogs
         run: .venv/bin/python tools/check_translations.py
       - name: Validate layouts, draft edits, backups and editor routes
-        id: full_tests
         run: .venv/bin/python -m pytest -q tests
-      - name: Diagnose Intel package after failed tests
-        if: ${{ failure() && matrix.arch == 'x86_64' && steps.full_tests.outcome == 'failure' }}
-        env:
-          HOMESCREEN_BUILD_PYTHON: ${{ runner.temp }}/release-python/bin/python3.12
-          HOMESCREEN_BUILD_ARCH: ${{ matrix.arch }}
-        run: |
-          python macapp/native_sources.py --arch "$BUILD_ARCH" --destination "$RUNNER_TEMP/release-python"
-          macapp/build.sh
       - name: Locate the release Python distribution
         run: python macapp/native_sources.py --arch "$BUILD_ARCH" --destination "$RUNNER_TEMP/release-python"
       - name: Build and verify the Mac app

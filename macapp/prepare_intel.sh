@@ -65,6 +65,7 @@ export OPENSSL_LIB_DIR="$OPENSSL_DIR/lib" OPENSSL_INCLUDE_DIR="$OPENSSL_DIR/incl
 "$BUILD_PYTHON" -m pip wheel --no-cache-dir --no-deps --no-build-isolation \
     --require-hashes --no-binary=cryptography --wheel-dir "$WORK/wheels" \
     -r "$ROOT/requirements-cryptography-x86_64.lock"
+"$BUILD_PYTHON" "$ROOT/macapp/wheel_sbom.py" "$WORK/wheels"
 "$BUILD_PYTHON" - "$WORK/wheels" "$OUTPUT" "$ROOT/requirements-build-x86_64.lock" \
     "$WORK/openssl-$OPENSSL_VERSION/LICENSE.txt" <<'PY'
 import email
