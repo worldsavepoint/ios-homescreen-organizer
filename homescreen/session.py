@@ -803,10 +803,22 @@ class Session:
     def redo(self, *, expected: dict | None = None) -> bool:
         return self._step_history(self._redo, self._undo, expected)
 
-    def _adopt_usage(self, result: dict, expected: dict, selected: Callable[[], bool] | None) -> dict:
+    @contextmanager
+    def _usage_review(self, expected: dict, selected: Callable[[], bool] | None):
         with self._exclusive(expected=expected):
             if selected is not None and not selected():
                 raise ReviewChanged("the reviewed device changed; load usage for the current device")
+            yield self.require()
+
+    async def _assert_usage_identity(self, expected: dict, selected: Callable[[], bool] | None) -> None:
+        with self._usage_review(expected, selected):
+            pass
+        await self._assert_identity()
+        with self._usage_review(expected, selected):
+            pass
+
+    def _adopt_usage(self, result: dict, expected: dict, selected: Callable[[], bool] | None) -> dict:
+        with self._usage_review(expected, selected):
             self.usage = result
         return result
 
@@ -814,8 +826,8 @@ class Session:
                    selected: Callable[[], bool] | None = None) -> dict[str, Any]:
         from . import usage
         binding = self.binding if expected is None else expected
-        lay = self.require()
-        known = {n.bundle_id for n in lay.nodes.values() if n.bundle_id}
+        with self._usage_review(binding, selected) as lay:
+            known = {n.bundle_id for n in lay.nodes.values() if n.bundle_id}
         return self._adopt_usage(usage.load(known, days), binding, selected)
 
     async def load_device_usage(self, *, expected: dict | None = None,
@@ -823,12 +835,17 @@ class Session:
         """Usage from the device's own memory reports (no Screen Time sync needed)."""
         from . import usage
         binding = self.binding if expected is None else expected
-        lay = self.require()
+        with self._usage_review(binding, selected) as lay:
+            known = {n.bundle_id for n in lay.nodes.values() if n.bundle_id}
         if not hasattr(self.source, "memory_reports"):
             return self._adopt_usage({"ok": False, "error": "This source can't report usage."}, binding, selected)
-        files = await self.source.memory_reports(self._dev_dir("usage"))
+        await self._assert_usage_identity(binding, selected)
+        with self._usage_review(binding, selected):
+            directory = self._dev_dir("usage")
+        files = await self.source.memory_reports(directory)
+        await self._assert_usage_identity(binding, selected)
         apps = await self.source.installed_apps()
-        known = {n.bundle_id for n in lay.nodes.values() if n.bundle_id}
+        await self._assert_usage_identity(binding, selected)
         return self._adopt_usage(usage.from_memory_reports(files, apps, known), binding, selected)
 
     def history(self) -> dict[str, int]:
