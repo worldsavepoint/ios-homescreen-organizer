@@ -351,8 +351,9 @@ function setView(v) {
 
 function focusItem(item) {
   if (!item) return;
-  const node = [...document.querySelectorAll("[data-focus-context]")].find(node =>
-    node.dataset.id === item.id && node.dataset.focusContext === item.context);
+  const controls = [...document.querySelectorAll("[data-focus-context]")];
+  const node = controls.find(node => node.dataset.id === item.id && node.dataset.focusContext === item.context)
+    || controls.find(node => item.id && node.dataset.id === item.id);
   node?.focus({preventScroll: true});
 }
 
@@ -513,6 +514,7 @@ function renderPages() {
     box.appendChild(card);
   });
   const add = localizedEl("button", "add-page", () => t("editor.newPage"));
+  add.dataset.focusContext = "add-page";
   add.title = t("editor.newPageHint");
   add.onclick = () => op("insert_page", { page: V.pages.length + 1 });
   wireZone(add, { target: `page:${V.pages.length + 1}`, newPage: true });

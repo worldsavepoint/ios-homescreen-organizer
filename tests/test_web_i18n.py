@@ -681,6 +681,28 @@ assert.equal($('#pages').querySelector('.add-page').tagName,'button');
 ''', native=True)
 
 
+def test_add_page_keeps_focus_after_its_response_replaces_the_button():
+    browser('''
+context.fetch=async(path,options)=>{
+ assert.equal(path,'/api/op');const body=JSON.parse(options.body);
+ assert.equal(body.op,'insert_page');assert.equal(body.args.page,2);
+ return {ok:true,json:async()=>fixture};
+};
+const add=$('#pages').querySelector('.add-page');add.focus();add.click();await tick();await tick();
+assert.equal(document.activeElement,$('#pages').querySelector('.add-page'));
+''', native=True)
+
+
+def test_focus_follows_a_placement_to_its_new_container_on_the_same_device():
+    browser('''
+const app=$('#pages').querySelector('[data-id="synthetic.app"]');app.focus();
+fixture.library=fixture.pages[0];fixture.pages=[[]];vm.runInContext('setView(V)',context);
+assert.equal(document.activeElement,$('#library').querySelector('[data-id="synthetic.app"]'));
+vm.runInContext("setView({...V,device_id:'another-device'})",context);
+assert.notEqual(document.activeElement,$('#library').querySelector('[data-id="synthetic.app"]'));
+''', native=True, setup="fixture.pages=[[item]];fixture.device_id='synthetic';")
+
+
 def test_folder_prompt_has_separate_name_and_description():
     browser('''
 $('#pages').querySelector('[data-id="synthetic.folder"]').click();
