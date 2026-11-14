@@ -25,7 +25,8 @@ final class Localization: ObservableObject {
     let languages: [Language]
     private let directory: URL
     private let defaults: LanguagePreferences
-    private let preferredLanguages: [String]
+    private let preferredLanguages: () -> [String]
+    private var systemLocaleObserver: NSObjectProtocol?
     private let english: [String: String]
     // Use the system ECMA-402 implementation shared by WebKit and our catalog
     // validator. Foundation canonicalizes several distinct tags differently.
@@ -38,15 +39,33 @@ final class Localization: ObservableObject {
     private var catalog: [String: String] = [:]
 
     init(catalogDirectory: URL = Bundle.main.resourceURL!.appendingPathComponent("Localization"),
-         defaults: LanguagePreferences = UserDefaults.standard, preferredLanguages: [String] = Locale.preferredLanguages) {
+         defaults: LanguagePreferences = UserDefaults.standard, preferredLanguages: [String]? = nil,
+         preferredLanguageProvider: @escaping () -> [String] = { Locale.preferredLanguages }) {
         directory = catalogDirectory
         self.defaults = defaults
-        self.preferredLanguages = preferredLanguages
+        if let preferredLanguages { self.preferredLanguages = { preferredLanguages } }
+        else { self.preferredLanguages = preferredLanguageProvider }
         let manifest = try? JSONDecoder().decode(Manifest.self, from: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
         languages = manifest?.languages ?? [Language(code: "en", name: "English", aliases: ["en"])]
         english = Self.load("en", from: directory)
         preference = "system"
         setPreference(defaults.string(forKey: "screenOrganizer.language") ?? "system")
+        systemLocaleObserver = NotificationCenter.default.addObserver(forName: NSLocale.currentLocaleDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.refreshSystemLocale() }
+            }
+    }
+
+    deinit {
+        if let systemLocaleObserver { NotificationCenter.default.removeObserver(systemLocaleObserver) }
+    }
+
+    private func refreshSystemLocale() {
+        guard preference == "system" else { return }
+        let resolved = resolveLocale(preference)
+        guard resolved != locale else { return }
+        locale = resolved
+        catalog = Self.load(locale, from: directory)
     }
 
     func setPreference(_ value: String) {
@@ -58,7 +77,7 @@ final class Localization: ObservableObject {
 
     func resolveLocale(_ value: String) -> String {
         if value != "system" { return match(value) ?? "en" }
-        return preferredLanguages.compactMap(match).first ?? "en"
+        return preferredLanguages().compactMap(match).first ?? "en"
     }
 
     func recognizedPreference(_ value: String) -> String? {
@@ -75,9 +94,6 @@ final class Localization: ObservableObject {
         let parts = tag.split(separator: "-").map(String.init)
         let owners = languages.map { language in (language.code, (language.aliases + [language.code]).compactMap(normalized)) }
         var candidates: [String] = []
-        if parts.first == "zh", parts.count > 1, ["hans", "hant"].contains(parts[1]) {
-            candidates.append("zh-" + parts[1])
-        }
         candidates += stride(from: parts.count, through: 1, by: -1).map { parts.prefix($0).joined(separator: "-") }
         for candidate in candidates {
             if let owner = owners.first(where: { $0.1.contains(candidate) }) { return owner.0 }

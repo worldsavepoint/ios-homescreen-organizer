@@ -69,6 +69,11 @@ final class TemporaryPreferences: LanguagePreferences {
   try! JSONEncoder().encode([key:value as! String]).write(to:path)
  }
 }
+final class MemoryPreferences: LanguagePreferences {
+ var values: [String:String] = [:]
+ func string(forKey key: String) -> String? { values[key] }
+ func set(_ value: Any?, forKey key: String) { values[key] = value as? String }
+}
 @MainActor func accepted() -> LaunchConsent {
  let c = LaunchConsent()
  c.observeEnd(CGRect(x:0,y:20,width:20,height:2),viewport:CGSize(width:600,height:300))
@@ -122,6 +127,9 @@ actor Gate {
    let fromAlias = Localization(catalogDirectory:directory,defaults:defaults,preferredLanguages:["en"])
    assert(fromAlias.preference == "zh-Hant")
    assert(l.recognizedPreference("en-a-foo-a-bar") == nil)
+   for tag in ["zh-Hant-MO", "zh-Hant-HK-u-nu-hanidec", "zh-Hant-MO-u-nu-hanidec"] {
+    assert(l.resolveLocale(tag) == "zh-Hant-HK", tag)
+   }
    l.setPreference("fr")
    assert(l.t("common.cancel") == "Annuler")
    assert(l.t("app.name") == "Screen Organizer")
@@ -327,6 +335,74 @@ actor Gate {
    let draft = try await web.evaluateJavaScript("window.draft.name") as? String
    assert(draft == "Kept draft")
    config.userContentController.removeScriptMessageHandler(forName:"screenOrganizer")
+  case "system-locale":
+   NSApplication.shared.setActivationPolicy(.accessory)
+   let preferences = MemoryPreferences()
+   var hostLanguages = ["ja-JP","de-DE","fr-FR"]
+   let system = Localization(catalogDirectory:directory,defaults:preferences,preferredLanguageProvider:{hostLanguages})
+   let origin = URL(string:"http://127.0.0.1:47985/")!
+   let coordinator = WebView.Coordinator(origin:origin,localization:system,consent:accepted(),openSetup:{})
+   let config = WKWebViewConfiguration()
+   config.websiteDataStore = .nonPersistent()
+   config.userContentController.add(coordinator,name:"screenOrganizer")
+   coordinator.installBootstrap(config.userContentController)
+   let web = WKWebView(frame:.zero,configuration:config)
+   web.navigationDelegate = coordinator
+   web.loadHTMLString(try String(contentsOfFile:CommandLine.arguments[3],encoding:.utf8),baseURL:origin)
+   func waitFor(_ script: String) async throws {
+    for _ in 0..<200 {
+     if (try? await web.evaluateJavaScript(script)) as? Bool == true { return }
+     try await Task.sleep(nanoseconds:10_000_000)
+    }
+    fatalError("System locale fixture timed out: " + script)
+   }
+   try await waitFor("window.fixtureReady === true")
+   let boot = try await web.evaluateJavaScript("window.screenOrganizerHost.languageLocale") as? String
+   assert(boot == "de", "bootstrap must include the host-resolved System locale")
+   try await waitFor("document.documentElement.lang === 'de' && ScreenOrganizerI18n.preference === 'system'")
+   assert(system.locale == "de" && preferences.string(forKey:"screenOrganizer.language") == "system")
+   for code in ["en", "system"] {
+    _ = try await web.callAsyncJavaScript("await chooseLanguage(code);return true",arguments:["code":code],in:nil,in:.page)
+    for _ in 0..<100 where system.preference != code { try await Task.sleep(nanoseconds:10_000_000) }
+   }
+   try await waitFor("ScreenOrganizerI18n.preference === 'system' && ScreenOrganizerI18n.locale === 'de'")
+   assert(system.locale == "de")
+   hostLanguages = ["ja-JP","fr-FR","de-DE"]
+   NotificationCenter.default.post(name:NSLocale.currentLocaleDidChangeNotification,object:nil)
+   for _ in 0..<100 where system.locale != "fr" { try await Task.sleep(nanoseconds:10_000_000) }
+   assert(system.preference == "system" && system.locale == "fr")
+   coordinator.installBootstrap(config.userContentController)
+   coordinator.synchronizeLanguage(web)
+   try await waitFor("ScreenOrganizerI18n.locale === 'fr' && document.querySelector('#language-select').value === 'system' && document.querySelector('#consent-language-select').value === 'system'")
+   assert(preferences.string(forKey:"screenOrganizer.language") == "system")
+   system.setPreference("en")
+   hostLanguages = ["de-DE","ja-JP"]
+   NotificationCenter.default.post(name:NSLocale.currentLocaleDidChangeNotification,object:nil)
+   try await Task.sleep(nanoseconds:20_000_000)
+   assert(system.locale == "en")
+   coordinator.synchronizeLanguage(web)
+   try await waitFor("ScreenOrganizerI18n.preference === 'en'")
+   _ = try await web.evaluateJavaScript("chooseLanguage('system');true")
+   try await waitFor("ScreenOrganizerI18n.locale === 'de' && ScreenOrganizerI18n.preference === 'system'")
+   assert(system.locale == "de")
+   _ = try await web.evaluateJavaScript("holdCatalog('pt');true")
+   hostLanguages = ["pt-BR","fr-FR"]
+   NotificationCenter.default.post(name:NSLocale.currentLocaleDidChangeNotification,object:nil)
+   for _ in 0..<100 where system.locale != "pt" { try await Task.sleep(nanoseconds:10_000_000) }
+   coordinator.synchronizeLanguage(web)
+   try await waitFor("typeof releaseCatalog === 'function'")
+   _ = try await web.evaluateJavaScript("chooseLanguage('en');true")
+   try await waitFor("ScreenOrganizerI18n.preference === 'en'")
+   _ = try await web.evaluateJavaScript("releaseCatalog();true")
+   try await waitFor("ScreenOrganizerI18n.locale === 'en' && !ScreenOrganizerI18n.pending")
+   for _ in 0..<100 where system.preference != "en" { try await Task.sleep(nanoseconds:10_000_000) }
+   assert(system.preference == "en" && system.locale == "en")
+   hostLanguages = ["de-DE","ja-JP"]
+   system.setPreference("system")
+   coordinator.installBootstrap(config.userContentController)
+   web.loadHTMLString(try String(contentsOfFile:CommandLine.arguments[3],encoding:.utf8),baseURL:origin)
+   try await waitFor("window.fixtureReady === true && ScreenOrganizerI18n.locale === 'de' && ScreenOrganizerI18n.preference === 'system'")
+   config.userContentController.removeScriptMessageHandler(forName:"screenOrganizer")
   case "language-origin":
    NSApplication.shared.setActivationPolicy(.accessory)
    let origin = URL(string:"http://127.0.0.1:47985/")!
@@ -503,7 +579,7 @@ actor Gate {
     coordinator.synchronizeLanguage(web)
     try await waitFor("document.documentElement.lang==='fr' && document.querySelector('#language-select').value==='fr' && localStorage.getItem('screenOrganizer.language')==='fr'")
     let nativeCalls = try await web.evaluateJavaScript("JSON.stringify(calls.filter(c=>c[1]!=='picker'))") as! String
-    assert(nativeCalls == #"[["fr","native"]]"#,nativeCalls)
+    assert(nativeCalls == #"[["fr","native","fr"]]"#,nativeCalls)
     l.setPreference("de")
     coordinator.synchronizeLanguage(web)
     try await waitFor("document.documentElement.lang==='de'")
@@ -735,7 +811,7 @@ def catalogs(tmp_path):
     shutil.copytree(ROOT / "homescreen/web/locales", target)
     # Locale fallback assumptions belong to this fixed manifest.
     codes = {"en":["en"],"zh-Hans":["zh","zh-CN","zh-SG"],"zh-Hant":["zh-HK","zh-TW"],
-             "zh-Hant-HK":["zh-Hant-HK"],"de-1901":["de-1901"],"sr-Latn":["sr-Latn"],"fr":["fr"],"pt":["pt"],"de":["gsw_CH"],"es":["es"]}
+             "zh-Hant-HK":["zh-Hant-HK","zh-Hant-MO"],"de-1901":["de-1901"],"sr-Latn":["sr-Latn"],"fr":["fr"],"pt":["pt"],"de":["gsw_CH"],"es":["es"]}
     (target/"manifest.json").write_text(json.dumps({"languages":[
         {"code":code,"name":code,"aliases":aliases} for code,aliases in codes.items()]}))
     (target/"zh-Hant-HK.json").write_text(json.dumps({"common.cancel":"Regional cancel"}))
@@ -830,7 +906,7 @@ time.sleep(60)
     assert result.returncode == 0, result.stderr
 
 
-def run_webkit_language(native_binary, catalogs, tmp_path, *scenario):
+def run_webkit_language(native_binary, catalogs, tmp_path, *scenario, mode="language-origin"):
     web = ROOT / "homescreen/web"
     # All resources are embedded, including the production picker and locale engine.
     files = {path.name: json.loads(path.read_text()) for path in catalogs.glob("*.json")}
@@ -890,13 +966,17 @@ def run_webkit_language(native_binary, catalogs, tmp_path, *scenario):
         html = html.replace(f'<script src="/static/{name}"></script>', f"<script>{script}</script>")
     fixture = tmp_path / "language.html"
     fixture.write_text(html)
-    result = subprocess.run([str(native_binary), "language-origin", str(catalogs), str(fixture), *scenario],
+    result = subprocess.run([str(native_binary), mode, str(catalogs), str(fixture), *scenario],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_webkit_delivers_genuine_native_language_after_browser_round_trip(native_binary, catalogs, tmp_path):
     run_webkit_language(native_binary, catalogs, tmp_path)
+
+
+def test_webkit_system_uses_full_host_language_list(native_binary, catalogs, tmp_path):
+    run_webkit_language(native_binary, catalogs, tmp_path, mode="system-locale")
 
 
 @pytest.mark.parametrize("scenario", [

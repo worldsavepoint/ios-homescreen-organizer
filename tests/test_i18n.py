@@ -320,3 +320,40 @@ manifest.languages.find(l=>l.code==='de').aliases.push('gsw_CH');
 for(const code of ['zh-Hant-HK','de-1901','sr-Latn']) manifest.languages.push({code,name:code,aliases:[]});
 catalogs['zh-Hant-HK']={hello:'Regional'};
 ''')
+
+
+def test_regional_alias_and_unicode_extensions_precede_script_fallback():
+    run_browser('''
+for(const value of ['zh-Hant-HK','zh-Hant-MO','zh-Hant-HK-u-nu-hanidec','zh-Hant-MO-u-nu-hanidec'])
+ assert.equal(i18n.resolveLocale(value,[]),'zh-Hant-HK',value);
+for(const [value,want] of [['zh-Hant-TW','zh-Hant'],['zh-Hans-TW','zh-Hans'],['zh-Hant-CN','zh-Hant'],['zh_TW','zh-Hant'],['gsw-CH-u-nu-latn','de']])
+ assert.equal(i18n.resolveLocale(value,[]),want,value);
+''', '''
+manifest.languages.push({code:'zh-Hant-HK',name:'Regional',aliases:['zh-Hant-MO']});
+manifest.languages.find(l=>l.code==='de').aliases.push('gsw-CH');
+''')
+
+
+def test_native_system_locale_uses_host_resolution_and_refreshes_without_preference_change():
+    run_browser('''
+assert.equal(i18n.preference,'system');assert.equal(i18n.locale,'de');
+await i18n.setLocale('system','native','fr');
+assert.equal(i18n.preference,'system');assert.equal(i18n.locale,'fr');
+assert.equal(stored.get('screenOrganizer.language'),'system');
+await i18n.setLocale('de','picker');await i18n.setLocale('system','native','fr');
+assert.equal(i18n.preference,'system');assert.equal(i18n.locale,'fr');
+''', '''
+context.navigator.languages=['ja-JP'];
+context.screenOrganizerHost={native:true,languageSync:'native-origin',languagePreference:'system',languageLocale:'de'};
+''')
+
+
+def test_delayed_native_system_catalog_does_not_override_newer_picker():
+    run_browser('''
+let release;const original=context.fetch;
+context.fetch=url=>url.endsWith('/fr.json')?new Promise(resolve=>{release=()=>resolve({ok:true,json:async()=>catalogs.fr});}):original(url);
+const old=i18n.setLocale('system','native','fr');await new Promise(resolve=>setImmediate(resolve));
+assert.equal(typeof release,'function','native System resolution starts the French catalog');
+await i18n.setLocale('en','picker');release();await old;
+assert.equal(i18n.preference,'en');assert.equal(i18n.locale,'en');
+''', '''context.screenOrganizerHost={native:true,languageSync:'native-origin',languagePreference:'system',languageLocale:'de'};''')

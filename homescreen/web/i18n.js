@@ -7,7 +7,7 @@
   let manifest, english = {}, catalog = {}, locale = "en", preference = "system", revision = 0;
   const listeners = new Set(), transitions = new Set(), catalogs = new Map();
   let requested, committedTarget, pending = false, initialized = false, resolveReady, rejectReady;
-  let numberFormatter, pickerIntent;
+  let numberFormatter, pickerIntent, nativeSystemLocale;
   const host = globalThis.screenOrganizerHost;
   const legacyHost = host?.native && host.languageSync !== "native-origin";
   let awaitingHostEcho = [];
@@ -26,7 +26,6 @@
     if (exact) return exact.code;
     const parts = code.split("-");
     const candidates = [];
-    if (parts[0] === "zh" && ["Hans", "Hant"].includes(parts[1])) candidates.push("zh-" + parts[1]);
     for (let length = parts.length; length > 0; length--) candidates.push(parts.slice(0, length).join("-"));
     for (const candidate of candidates) {
       const language = manifest.languages.find(item => [item.code, ...item.aliases].some(tag => canonical(tag) === candidate));
@@ -85,11 +84,14 @@
     for (const listener of transitions) listener({phase, source, revision});
   }
 
-  async function select(request, source, current) {
+  async function select(request, source, current, resolvedLocale) {
     if (!initialized) await resources;
     if (current !== revision) return locale;
     requested = request === "system" ? request : match(request) || "system";
-    const target = resolveLocale(requested);
+    if (host?.native && requested === "system" && ["native", "bootstrap"].includes(source)) {
+      nativeSystemLocale = match(resolvedLocale) || nativeSystemLocale;
+    }
+    const target = host?.native && requested === "system" && nativeSystemLocale ? nativeSystemLocale : resolveLocale(requested);
     if (!pending && preference === requested && committedTarget === target && locale === target) return locale;
     const nextPreference = requested;
     if (source === "picker") pickerIntent = nextPreference;
@@ -130,7 +132,7 @@
     return locale;
   }
 
-  function setLocale(request, source = "host") {
+  function setLocale(request, source = "host", resolvedLocale) {
     if (source === "native") awaitingHostEcho = [];
     if (source === "host" && legacyHost && initialized) {
       const owner = request === "system" ? request : match(request) || "system";
@@ -146,7 +148,7 @@
     }
     if (source !== "system") pickerIntent = null;
     requested = request;
-    return select(request, source, ++revision);
+    return select(request, source, ++revision, resolvedLocale);
   }
 
   const api = {
@@ -171,7 +173,8 @@
     english = await loadCatalog(manifest.default);
     initialized = true;
   })();
-  setLocale(host?.native && typeof host.languagePreference === "string" ? host.languagePreference : preference, "bootstrap").catch(rejectReady);
+  setLocale(host?.native && typeof host.languagePreference === "string" ? host.languagePreference : preference,
+    "bootstrap", host?.languageLocale).catch(rejectReady);
   globalThis.addEventListener?.("languagechange", () => {
     if (requested === "system") setLocale("system", "system");
   });
