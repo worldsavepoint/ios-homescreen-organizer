@@ -5,7 +5,7 @@ import plistlib
 import pytest
 from starlette.requests import Request
 
-from homescreen import config, ui
+from homescreen import config, ui, usage
 from homescreen.session import Session
 from test_integrity import MemorySource
 
@@ -144,6 +144,25 @@ def test_state_refresh_exposes_recoverable_external_draft_damage(pair):
     assert not current["loaded"] and current["draft_error"]
     assert first.draft_path.read_bytes() == b"bplist00incomplete"
     assert asyncio.run(ui.post_read(request({"binding": current["binding"]}))).status_code == 200
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_usage_response_rechecks_selection_after_worker_adoption(pair, monkeypatch, switch):
+    first, second = pair
+    monkeypatch.setattr(usage, "load", lambda known, days: {"ok": True, "days": days, "opens": {"a": 3}})
+    async def handoff(fn, *args, **kwargs):
+        result = fn(*args, **kwargs)
+        if switch:
+            response = await ui.post_device(request({"binding": first.binding, "udid": "second"}))
+            assert response.status_code == 200
+        return result
+    monkeypatch.setattr(ui.asyncio, "to_thread", handoff)
+    response = asyncio.run(ui.post_op(request({"binding": first.binding, "op": "load_usage", "args": {"source": "mac"}})))
+    assert response.status_code == (409 if switch else 200)
+    body = json.loads(response.body)
+    current = body["view"] if switch else body
+    assert current["device_id"] == config.current_device() == ("second" if switch else "first")
+    assert first.usage["opens"] == {"a": 3} and second.usage is None
 
 
 def test_discovery_failure_retains_known_devices_with_unknown_status(pair, monkeypatch):

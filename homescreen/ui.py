@@ -470,6 +470,9 @@ async def post_op(request: Request) -> Response:
                     await s.load_device_usage(expected=expected, selected=selected)
             else:
                 await asyncio.to_thread(s.load_usage, int(args.get("days", 30)), expected=expected, selected=selected)
+            _reviewed_session(body)
+            with s._exclusive(expected=expected):
+                return JSONResponse(view(s))
         elif name == "optimize_usage":
             if s.usage is None:  # the device's own reports first, then Screen Time on this Mac
                 try:
