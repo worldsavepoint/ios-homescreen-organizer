@@ -117,6 +117,35 @@ def test_reviewed_read_checks_shared_committed_draft_before_source_access(pair):
     assert first.draft_path.read_bytes() == prior and first.source.reads == reads
 
 
+@pytest.mark.parametrize("action", ["read", "device"])
+def test_state_refresh_reopens_an_external_commit_without_reviving_the_old_view(pair, action):
+    first, _ = pair
+    first.edit(lambda lay: lay.move("a", "dock"))
+    old = view_binding(first)
+    another = Session(first.source, first.dir, device=first.device_id)
+    another.edit(lambda lay: lay.move("b", "dock"))
+    saved, reads = first.draft_path.read_bytes(), first.source.reads
+    assert asyncio.run(ui.post_read(request({"binding": old}))).status_code == 409
+    state = asyncio.run(ui.get_state(request({})))
+    current = json.loads(state.body)
+    assert state.status_code == 200 and current["binding"] == another.binding
+    assert [row["id"] for row in current["dock"]] == ["a", "b"]
+    assert first.history() == {"undo": 0, "redo": 0}
+    assert first.draft_path.read_bytes() == saved and first.source.reads == reads
+    assert asyncio.run(ui.post_read(request({"binding": old}))).status_code == 409
+    handler = ui.post_read if action == "read" else ui.post_device
+    assert asyncio.run(handler(request({"binding": current["binding"], "udid": "second"}))).status_code == 200
+
+
+def test_state_refresh_exposes_recoverable_external_draft_damage(pair):
+    first, _ = pair
+    first.draft_path.write_bytes(b"bplist00incomplete")
+    current = json.loads(asyncio.run(ui.get_state(request({}))).body)
+    assert not current["loaded"] and current["draft_error"]
+    assert first.draft_path.read_bytes() == b"bplist00incomplete"
+    assert asyncio.run(ui.post_read(request({"binding": current["binding"]}))).status_code == 200
+
+
 def test_discovery_failure_retains_known_devices_with_unknown_status(pair, monkeypatch):
     from pymobiledevice3 import usbmux
     async def failed():

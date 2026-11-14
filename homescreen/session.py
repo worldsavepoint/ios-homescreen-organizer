@@ -578,6 +578,25 @@ class Session:
     def binding(self) -> dict:
         return {"device": self.device_id, "revision": self._draft_digest.hex() if self._draft_digest else ""}
 
+    @contextmanager
+    def refreshed_draft(self):
+        """Present a saved draft and its binding under the same local lock."""
+        with self._exclusive(refresh=True):
+            try:
+                digest = hashlib.sha256(self.draft_path.read_bytes()).digest()
+            except FileNotFoundError:
+                digest = None
+            if digest != self._draft_digest:
+                fresh = Session(self.source, self.dir, device=self._draft_key)
+                self.layout, self.device_id, self.info, self.grid = fresh.layout, fresh.device_id, fresh.info, fresh.grid
+                self._draft_error, self._draft_digest = fresh._draft_error, fresh._draft_digest
+                self._observed_placement, self._page_identity = fresh._observed_placement, fresh._page_identity
+                self._reported_clips, self._placement_revision = fresh._reported_clips, fresh._placement_revision
+                self.usage = None
+                self._undo, self._redo = [], []
+                self._history_baseline = None
+            yield
+
     @property
     def _pending_path(self) -> Path:
         return self.dir / ".pending-write.json"

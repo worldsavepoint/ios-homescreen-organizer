@@ -432,7 +432,13 @@ async def index(request: Request) -> Response:
 async def get_state(request: Request) -> Response:
     if (bad := _guard(request)):
         return bad
-    return JSONResponse(view())
+    async with _device_lock:
+        s = session()
+        try:
+            with s.refreshed_draft():
+                return JSONResponse(view(s))
+        except (LayoutError, OSError) as e:
+            return _err(e, 502, s)
 
 
 async def post_op(request: Request) -> Response:
