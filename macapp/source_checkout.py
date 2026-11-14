@@ -6,17 +6,43 @@ from source_inputs import relative_name
 
 
 def tracked_blobs(root, commit):
-    records = subprocess.check_output(["git", "-C", root, "ls-tree", "-rz", "--full-tree", commit]).split(b"\0")
-    for row in records:
-        if not row:
-            continue
-        header, raw_name = row.split(b"\t", 1)
-        mode, kind, object_id = header.split()
-        name = relative_name(raw_name.decode())
-        if kind != b"blob" or mode not in (b"100644", b"100755"):
-            raise ValueError("Unsupported tracked release member type")
-        data = subprocess.check_output(["git", "-C", root, "cat-file", "blob", object_id])
-        yield name, int(mode, 8) & 0o777, data
+    records = subprocess.check_output(["git", "-C", root, "ls-tree", "-rzl", "--full-tree", commit]).split(b"\0")
+    child = subprocess.Popen(["git", "-C", root, "cat-file", "--batch"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    error = "Could not verify the requested Git blob"
+    try:
+        for row in records:
+            if not row:
+                continue
+            header, raw_name = row.split(b"\t", 1)
+            mode, kind, object_id, raw_size = header.split()
+            name = relative_name(raw_name.decode())
+            if kind != b"blob" or mode not in (b"100644", b"100755") or not raw_size.isdigit():
+                raise ValueError("Unsupported tracked release member type")
+            size = int(raw_size)
+            child.stdin.write(object_id + b"\n")
+            child.stdin.flush()
+            if child.stdout.readline(256) != object_id + b" blob " + str(size).encode() + b"\n":
+                raise ValueError(error)
+            data = child.stdout.read(size)
+            if len(data) != size or child.stdout.read(1) != b"\n":
+                raise ValueError(error)
+            yield name, int(mode, 8) & 0o777, data
+        child.stdin.close()
+        if child.stdout.read(1) or child.wait() != 0:
+            raise ValueError(error)
+    except (BrokenPipeError, OSError) as exc:
+        raise ValueError(error) from exc
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.stdin.close()
+        child.stdout.close()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
 
 
 def export_project(root, target):

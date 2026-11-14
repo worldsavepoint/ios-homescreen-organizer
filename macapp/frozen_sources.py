@@ -11,7 +11,7 @@ import tarfile
 import zipfile
 
 from source_inputs import (cache_directory, canonical, fetch, json_bytes, read_locks, relative_name,
-                           sha256, source_member)
+                           sha256, source_member, source_members)
 
 NOTICE = re.compile(r"^(?:licenses?|licences?|copying|copyright|notice|authors|patents)(?:[._-].*)?$", re.I)
 
@@ -19,7 +19,8 @@ NOTICE = re.compile(r"^(?:licenses?|licences?|copying|copyright|notice|authors|p
 def installed_files(packages):
     result = {}
     for dist in packages:
-        owner = canonical(dist.metadata["Name"])
+        metadata = dist.metadata
+        owner, version = canonical(metadata["Name"]), metadata["Version"]
         for item in dist.files or ():
             relative = str(item)
             if relative.startswith("../") or "/__pycache__/" in relative:
@@ -27,7 +28,7 @@ def installed_files(packages):
             path = Path(dist.locate_file(item)).resolve()
             if path in result and result[path][0] != owner:
                 raise ValueError(f"Multiple owners for installed file: {item}")
-            result[path] = (owner, dist.version, relative)
+            result[path] = (owner, version, relative)
     return result
 
 
@@ -99,6 +100,15 @@ def distribution_notice(repository, version):
     ).encode()
 
 
+def project_release_version(root, installed):
+    from packaging.version import Version
+    from release import project_version
+    version = project_version(root=root)
+    if Version(version) != Version(installed):
+        raise ValueError("Installed project version differs from the release version")
+    return version
+
+
 def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch, repository, runtime, project_commit, local_build=None):
     from PyInstaller.archive.readers import CArchiveReader
     from PyInstaller.depend.analysis import get_bootstrap_modules
@@ -108,7 +118,7 @@ def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch
     replacements = local["components"] if local else {}
     wheel_paths = {canonical(path.name.split("-", 1)[0]): path for path in wheel_dir.glob("*.whl")}
     installed = installed_files(distributions())
-    version = package_version("home-screen-organizer")
+    version = project_release_version(root, package_version("home-screen-organizer"))
     entries, owners, editable, opened = [], {}, defaultdict(set), {}
     notices, overlays = output / "ThirdPartyLicenses", output / "overlays"
     cache = cache_directory()
@@ -212,10 +222,7 @@ def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch
         for owner, wheel in sorted(opened.items()):
             source = fetch(packages[owner]["source"], cache)
             wheel_material(owner, wheel, source, editable[owner], notices, overlays)
-            for member, expected in packages[owner].get("notices", {}).items():
-                data = source_member(source, member)
-                if digest(data).hexdigest() != expected:
-                    raise ValueError("Different embedded source license")
+            for member, data in source_members(source, packages[owner].get("notices", {})).items():
                 put(notices / owner / "upstream", member, data)
             if owner == "developer-disk-image":
                 metadata = next(n for n in wheel.namelist() if n.endswith(".dist-info/METADATA"))

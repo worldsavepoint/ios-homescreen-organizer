@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tarfile
 import tempfile
 from urllib.parse import unquote, urlsplit
@@ -88,17 +89,39 @@ def json_bytes(value):
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def source_member(path, member):
-    """Read a specific authenticated member verbatim, without extracting a tree."""
-    relative_name(member)
+def source_members(path, members):
+    """Read selected regular notices once, checking their optional pinned digests."""
+    for member in members:
+        relative_name(member)
+    found = {}
+    if not members:
+        return found
+
+    def record(name, size, regular, stream):
+        if name in found or not regular or not 0 <= size <= 32 * BLOCK:
+            raise ValueError("Unexpected source notice size, type or duplicate")
+        with stream() as source:
+            data = source.read(32 * BLOCK + 1)
+        if len(data) != size or (members[name] is not None and hashlib.sha256(data).hexdigest() != members[name]):
+            raise ValueError("Different embedded source license")
+        found[name] = data
+
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
-            info = archive.getinfo(member)
-            if info.file_size > 32 * BLOCK or info.is_dir():
-                raise ValueError("Unexpected source notice size or type")
-            return archive.read(info)
-    with tarfile.open(path) as archive:
-        info = archive.getmember(member)
-        if not info.isfile() or info.size > 32 * BLOCK:
-            raise ValueError("Unexpected source notice size or type")
-        return archive.extractfile(info).read()
+            for info in archive.infolist():
+                if info.filename in members:
+                    regular = not info.is_dir() and stat.S_IFMT(info.external_attr >> 16) in (0, stat.S_IFREG)
+                    record(info.filename, info.file_size, regular, lambda: archive.open(info))
+    else:
+        with tarfile.open(path, "r|*") as archive:
+            for info in archive:
+                if info.name in members:
+                    record(info.name, info.size, info.isfile(), lambda: archive.extractfile(info))
+    if found.keys() != members.keys():
+        raise ValueError("Missing embedded source license")
+    return found
+
+
+def source_member(path, member):
+    """Read a specific regular member verbatim, without extracting a tree."""
+    return source_members(path, {member: None})[member]

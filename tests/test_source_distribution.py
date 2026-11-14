@@ -326,3 +326,206 @@ def test_git_export_ignores_local_archive_attributes(tmp_path):
     output = tmp_path.parent / (tmp_path.name + "-export")
     export_project(tmp_path, output)
     assert (output / "tracked").read_text() == "original blob\n"
+
+
+def test_owner_map_reads_one_metadata_document_per_distribution(tmp_path):
+    from importlib.metadata import PathDistribution
+    from frozen_sources import installed_files
+
+    documents = []
+    class RecordedDistribution(PathDistribution):
+        def read_text(self, filename):
+            if filename == "METADATA":
+                documents.append(self._path.name)
+            return super().read_text(filename)
+
+    packages = []
+    for owner in ("first", "second"):
+        metadata = tmp_path / f"{owner}-1.0.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Name: {owner}\nVersion: 1.0\n")
+        files = [f"{owner}/shared.py", f"{owner}/other.py", f"{owner}/data"]
+        (tmp_path / owner).mkdir()
+        for name in files:
+            (tmp_path / name).write_bytes(b"owned input")
+        (metadata / "RECORD").write_text("".join(name + ",,\n" for name in files))
+        packages.append(RecordedDistribution(metadata))
+    result = installed_files(packages)
+    assert result == {tmp_path / owner / name: (owner, "1.0", f"{owner}/{name}")
+                      for owner in ("first", "second") for name in ("shared.py", "other.py", "data")}
+    assert documents == ["first-1.0.dist-info", "second-1.0.dist-info"]
+
+
+@pytest.mark.parametrize("format", ["zip", "tar"])
+@pytest.mark.parametrize("damage", [None, "missing", "changed", "duplicate", "link", "large"])
+def test_selected_source_notices_are_verified_in_one_archive_pass(tmp_path, monkeypatch, format, damage):
+    import io
+    import stat
+    import tarfile
+    import zipfile
+    import source_inputs
+
+    records = [("first/LICENSE", b"first notice"), ("second/LICENSE", b"second notice")]
+    expected = {name: hashlib.sha256(data).hexdigest() for name, data in records}
+    path = tmp_path / ("source." + format)
+    if damage == "missing":
+        records.pop()
+    elif damage == "changed":
+        records[-1] = (records[-1][0], b"changed")
+    elif damage == "duplicate":
+        records.append(records[-1])
+    if format == "zip":
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, data in records:
+                info = zipfile.ZipInfo(name)
+                info.external_attr = (stat.S_IFLNK | 0o777 if damage == "link" else stat.S_IFREG | 0o644) << 16
+                if name in archive.NameToInfo:
+                    with pytest.warns(UserWarning, match="Duplicate name"):
+                        archive.writestr(info, data)
+                else:
+                    archive.writestr(info, data)
+    else:
+        with tarfile.open(path, "w") as archive:
+            for name, data in records:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                if damage == "link":
+                    info.type, info.linkname = tarfile.SYMTYPE, "other"
+                    archive.addfile(info)
+                else:
+                    archive.addfile(info, io.BytesIO(data))
+    if damage == "large":
+        monkeypatch.setattr(source_inputs, "BLOCK", 0)
+    opens = []
+    original = zipfile.ZipFile if format == "zip" else tarfile.open
+    def tracked(*args, **kwargs):
+        opens.append(args[0])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(zipfile if format == "zip" else tarfile, "ZipFile" if format == "zip" else "open", tracked)
+    if damage:
+        with pytest.raises(ValueError):
+            source_inputs.source_members(path, expected)
+    else:
+        assert source_inputs.source_members(path, expected) == dict(records)
+        assert opens == [path]
+        assert source_inputs.source_member(path, "second/LICENSE") == b"second notice"
+
+
+@pytest.mark.parametrize("declared,normalized", [
+    ("1.3.0", "1.3.0"), ("1.3.0-alpha.2", "1.3.0a2"),
+    ("1.3.0-beta.1", "1.3.0b1"), ("1.3.0-rc.3", "1.3.0rc3"),
+])
+def test_capture_uses_declared_release_spelling_after_real_wheel_metadata(tmp_path, declared, normalized):
+    import subprocess
+    import zipfile
+    from importlib.metadata import distributions
+    from frozen_sources import project_release_version, distribution_notice
+    from source_archive import check_zip, validate_inventory
+    from source_fixture import release_source
+
+    project = tmp_path / "editable"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[build-system]\nrequires = ["setuptools", "wheel"]\n'
+        'build-backend = "setuptools.build_meta"\n[project]\nname = "home-screen-organizer"\n'
+        f'version = "{declared}"\n[tool.setuptools]\npy-modules = ["example"]\n')
+    (project / "example.py").write_text("value = 1\n")
+    wheels = tmp_path / "wheels"
+    subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-index", "--no-deps", "--no-build-isolation",
+                    "--wheel-dir", wheels, project], check=True, capture_output=True)
+    wheel, = wheels.glob("*.whl")
+    installed = tmp_path / "installed"
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--target", installed, wheel],
+                   check=True, capture_output=True)
+    package, = distributions(path=[str(installed)])
+    assert package.version == normalized
+    selected = project_release_version(project, package.version)
+    assert selected == declared
+    with pytest.raises(ValueError, match="version"):
+        project_release_version(project, "9.0.0")
+    release = tmp_path / "release"
+    release.mkdir()
+    checkout = tmp_path / "checkout"
+    release_source(release, selected, checkout)
+    packages = json.loads((checkout / "macapp/sources/python.json").read_bytes())
+    native = json.loads((checkout / "macapp/sources/native.json").read_bytes())
+    for arch in ("arm64", "x86_64"):
+        archive = release / f"home-screen-organizer-{declared}-macos-{arch}.zip"
+        with zipfile.ZipFile(archive) as zipped:
+            inventory = json.loads(zipped.read("Screen Organizer.app/Contents/Resources/SourceInventory.json"))
+        validate_inventory(inventory, arch, declared, packages, native)
+        assert check_zip(archive, inventory) == distribution_notice("example/project", declared)
+        assert f"/v{declared}/".encode() in check_zip(archive, inventory)
+
+
+def git_blob_tree(tmp_path):
+    import subprocess
+    def git(*args):
+        return subprocess.check_output(["git", "-C", tmp_path, *args]).strip()
+    git("init", "-q")
+    files = {"empty": (b"", 0o644), "space name": (b"\x00\xff\r\n", 0o644), "executable": (b"run", 0o755)}
+    for name, (data, mode) in files.items():
+        (tmp_path / name).write_bytes(data)
+        (tmp_path / name).chmod(mode)
+    git("add", ".")
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "-c", "commit.gpgsign=false", "commit", "-qm", "Fixture")
+    return git("rev-parse", "HEAD").decode(), files
+
+
+def test_git_export_streams_verified_blobs_through_one_child_and_reaps_early_exit(tmp_path, monkeypatch):
+    import subprocess
+    import source_checkout
+    commit, files = git_blob_tree(tmp_path)
+    original = subprocess.Popen
+    children = []
+    def started(args, *a, **kw):
+        process = original(args, *a, **kw)
+        if "cat-file" in args:
+            children.append((args, process))
+        return process
+    monkeypatch.setattr(subprocess, "Popen", started)
+    assert {name: (data, mode) for name, mode, data in source_checkout.tracked_blobs(tmp_path, commit)} == files
+    assert len(children) == 1 and "--batch" in children[0][0]
+    assert children[0][1].poll() == 0
+    iterator = source_checkout.tracked_blobs(tmp_path, commit)
+    next(iterator)
+    iterator.close()
+    assert len(children) == 2 and children[-1][1].poll() is not None
+
+
+@pytest.mark.parametrize("damage", ["missing", "id", "type", "size", "truncated", "separator", "trailing", "exit"])
+def test_git_export_rejects_invalid_batch_frames(tmp_path, monkeypatch, damage):
+    import subprocess
+    import source_checkout
+    commit, files = git_blob_tree(tmp_path)
+    values = {subprocess.check_output(["git", "-C", tmp_path, "rev-parse", f"{commit}:{name}"]).strip(): data
+              for name, (data, _) in files.items()}
+    responder = tmp_path / "responder.py"
+    responder.write_text("values = " + repr(values) + "\n" + '''import sys
+damage = sys.argv[1]
+while request := sys.stdin.buffer.readline():
+    oid = request.strip()
+    if damage == "missing":
+        sys.stdout.buffer.write(oid + b" missing\\n")
+    else:
+        identity = b"0" * len(oid) if damage == "id" else oid
+        kind = b"tree" if damage == "type" else b"blob"
+        payload = values[oid]
+        size = str(len(payload) + (1 if damage == "size" else 0)).encode()
+        sys.stdout.buffer.write(identity + b" " + kind + b" " + size + b"\\n")
+        if damage == "truncated":
+            sys.stdout.buffer.flush()
+            break
+        sys.stdout.buffer.write(payload + (b"x" if damage == "separator" else b"\\n"))
+    sys.stdout.buffer.flush()
+if damage == "trailing":
+    sys.stdout.buffer.write(b"unexpected")
+sys.exit(7 if damage == "exit" else 0)
+''')
+    original = subprocess.Popen
+    def started(args, *a, **kw):
+        if "cat-file" in args:
+            args = [sys.executable, responder, damage]
+        return original(args, *a, **kw)
+    monkeypatch.setattr(subprocess, "Popen", started)
+    with pytest.raises(ValueError, match="Git blob"):
+        list(source_checkout.tracked_blobs(tmp_path, commit))

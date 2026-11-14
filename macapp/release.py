@@ -25,8 +25,8 @@ ARCHITECTURES = ("arm64", "x86_64")
 RELEASE_VERSION = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:alpha|beta|rc)\.(?:0|[1-9]\d*))?"
 
 
-def project_version(tag=None):
-    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+def project_version(tag=None, *, root=ROOT):
+    version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     if not re.fullmatch(RELEASE_VERSION, version):
         raise ValueError("Set the project version to a SemVer release or alpha/beta/rc version")
     if tag is not None and tag != f"v{version}":
