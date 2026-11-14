@@ -130,17 +130,40 @@ def cargo_vendor(root, destination):
 
 def local_wheel(root, source, arch, wheelhouse, output):
     from wheelhouse import records
+    from build_paths import RECORD, read_roots, write_record
+    from check_package_paths import check_archive
     python = sys.executable
     wheelhouse.mkdir(parents=True, exist_ok=True)
+    previous_roots = read_roots(wheelhouse, sorted(wheelhouse.glob("*.whl"))) if (wheelhouse / RECORD).exists() else []
     with tempfile.TemporaryDirectory() as folder:
+        stage = Path(folder)
+        editable = stage / "source"
+        def generated(directory, names):
+            return [name for name in names if name in (".git", "__pycache__") or name.endswith(".egg-info")
+                    or Path(directory) == source and name in ("build", "dist", "target")]
+        shutil.copytree(source, editable, symlinks=True, ignore=generated)
+        temporary = stage / "temporary"
+        temporary.mkdir()
+        roots = [source.absolute(), source.resolve(), root.absolute(), root.resolve(), stage,
+                 Path(sys.prefix), Path(sys.base_prefix), Path(sys.executable).absolute().parent]
+        roots.extend(Path(os.environ.get(key, Path.home() / default)) for key, default in
+                     (("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")))
+        env = compiler_environment(roots, arch)
+        env.update(TMPDIR=str(temporary), PIP_NO_CACHE_DIR="1", PIP_DISABLE_PIP_VERSION_CHECK="1")
         subprocess.run([python, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
-                        "--wheel-dir", folder, source.resolve()], check=True)
+                        "--wheel-dir", folder, editable], env=env, check=True)
         wheel, = Path(folder).glob("*.whl")
+        check_archive(wheel, roots, engine=None)
         owner, version = wheel.name.split("-")[:2]
         with zipfile.ZipFile(wheel) as package:
             meta, = (name for name in package.namelist() if name.endswith(".dist-info/METADATA"))
             from email import message_from_bytes
             header = message_from_bytes(package.read(meta))
+            for name in package.namelist():
+                if name.endswith((".so", ".dylib", ".bundle")):
+                    binary = stage / "native-extension"
+                    binary.write_bytes(package.read(name))
+                    subprocess.run(["lipo", binary, "-verify_arch", arch], check=True, capture_output=True)
         owner = canonical(owner)
         if canonical(header["Name"]) != owner or header["Version"] != version:
             raise ValueError("Wheel name differs from metadata")
@@ -160,8 +183,26 @@ def local_wheel(root, source, arch, wheelhouse, output):
         if not replaced:
             raise ValueError("Wheel is absent from the release build lock")
         shutil.copyfile(wheel, wheelhouse / wheel.name)
+        write_record(wheelhouse, [*previous_roots, *roots], sorted(wheelhouse.glob("*.whl")))
         output.write_text(selected_lock(selected, wheelhouse.resolve(), {owner}))
         print(wheelhouse / wheel.name)
+
+
+def compiler_environment(roots, arch):
+    env = dict(os.environ)
+    roots = [*roots, *(Path(env.get(key, Path.home() / default)) for key, default in
+                       (("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")))]
+    paths = sorted({str(form) for path in roots for form in (path.absolute(), path.resolve())}, key=len)
+    flags = [flag for path in paths for flag in (f"-ffile-prefix-map={path}=.", f"-fdebug-prefix-map={path}=.")]
+    for key in ("CFLAGS", "CXXFLAGS", "CPPFLAGS"):
+        env[key] = (env.get(key, "") + " " + shlex.join(flags)).strip()
+    env["LDFLAGS"] = (env.get("LDFLAGS", "") + " -Wl,-S").strip()
+    rust = env.get("CARGO_ENCODED_RUSTFLAGS")
+    rust = (rust.split("\x1f") if rust else []) if rust is not None else shlex.split(env.get("RUSTFLAGS", ""))
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join([*rust, *(f"--remap-path-prefix={path}=." for path in paths)])
+    env.setdefault("ARCHFLAGS", f"-arch {arch}")
+    env.setdefault("MACOSX_DEPLOYMENT_TARGET", "14.0")
+    return env
 
 
 def selected_lock(records, wheelhouse, changed, *, cached=False):
@@ -218,6 +259,12 @@ def refreeze(root, arch, wheelhouse, lock, output):
     if changed and wheelhouse is None:
         raise ValueError("Supply the wheelhouse containing your modified components")
     wheels = wheelhouse.resolve() if wheelhouse is not None else None
+    roots = [root, project, output, lock.parent, Path(sys.prefix), Path(sys.base_prefix)]
+    if wheels is not None:
+        from build_paths import RECORD, read_roots
+        roots.append(wheels)
+        if (wheels / RECORD).exists():
+            roots.extend(read_roots(wheels, sorted(wheels.glob("*.whl"))))
     for wheel, value in entries(lock):
         owner = canonical(wheel.split("-")[0])
         if owner in changed and sha256(wheels / wheel) != value:
@@ -232,7 +279,9 @@ def refreeze(root, arch, wheelhouse, lock, output):
         effective_lock = Path(temporary) / "local-download.lock"
         effective_lock.write_text(selected_lock(records(lock), wheels, changed, cached=True))
         settings = Path(temporary) / "rebuild.json"
-        settings.write_text(json.dumps({"upstreamCommit": manifest["commit"], "components": changed}))
+        settings.write_text(json.dumps({"upstreamCommit": manifest["commit"], "components": changed,
+                                        "manifest": str(root / "MANIFEST.json"),
+                                        "buildRoots": [str(path.absolute()) for path in [*roots, Path(temporary)]]}))
         env = {**os.environ, "HOMESCREEN_BUILD_ARCH": arch, "HOMESCREEN_BUILD_PYTHON": sys.executable,
                "HOMESCREEN_SOURCE_CACHE": str(root / "sources")}
         subprocess.run([str(project / "macapp/build.sh"), "--local-build", output.resolve(), effective_lock,

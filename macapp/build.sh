@@ -139,12 +139,17 @@ PLIST
 "$VENV/bin/python" "$ROOT/tools/check_translations.py"
 "$VENV/bin/python" "$ROOT/macapp/release.py" localize --app "$APP"
 "$VENV/bin/python" "$ROOT/macapp/release.py" check-localization --app "$APP"
+if [[ -n "$LOCAL_LOCK" ]]; then
+  "$VENV/bin/python" "$ROOT/macapp/frozen_sources.py" local-record --project "$ROOT" --settings "$HOMESCREEN_LOCAL_SOURCE" --app "$APP"
+fi
 
 echo "• ad-hoc signing"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
 
 if [[ -n "$LOCAL_LOCK" ]]; then
+  "$VENV/bin/python" "$ROOT/macapp/frozen_sources.py" verify-local-record --app "$APP"
+  "$VENV/bin/python" "$ROOT/macapp/check_package_paths.py" --local-build "$HOMESCREEN_LOCAL_SOURCE" "${BUILD_PATH_ARGS[@]}" "$APP" "$CHECKOUT" "$ROOT" "$BUILD" "$VENV"
   echo "Built locally modified $APP"
   exit 0
 fi

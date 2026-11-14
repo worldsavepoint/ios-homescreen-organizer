@@ -3,11 +3,17 @@ from collections import defaultdict
 from hashlib import sha256 as digest
 from importlib.metadata import distributions, version as package_version
 from pathlib import Path
+import argparse
 import json
 import re
+import shutil
+import stat
+import struct
+import subprocess
 import sys
 import sysconfig
 import tarfile
+import tempfile
 import zipfile
 
 from source_inputs import (cache_directory, canonical, fetch, json_bytes, read_locks, relative_name,
@@ -107,6 +113,89 @@ def project_release_version(root, installed):
     if Version(version) != Version(installed):
         raise ValueError("Installed project version differs from the release version")
     return version
+
+
+LAUNCHER_DIGEST = "sha256-unsigned-macho64-page-rounded-linkedit-vmsize-v1"
+
+
+def canonical_launcher_payload(data):
+    error = "Could not canonicalize the native launcher"
+    if len(data) < 32:
+        raise ValueError(error)
+    magic, cpu, _, filetype, count, size, _, _ = struct.unpack_from("<IiiIIIII", data)
+    page = {0x0100000C: 16384, 0x01000007: 4096}.get(cpu)
+    if magic != 0xFEEDFACF or page is None or filetype != 2 or not 0 < count <= 4096 or size > len(data) - 32:
+        raise ValueError(error)
+    offset, end, linkedit = 32, 32 + size, None
+    for _ in range(count):
+        if offset + 8 > end:
+            raise ValueError(error)
+        command, length = struct.unpack_from("<II", data, offset)
+        if length < 8 or length % 8 or offset + length > end or command == 0x1D:
+            raise ValueError(error)
+        if command == 0x19:
+            if length < 72:
+                raise ValueError(error)
+            _, _, name, address, virtual_size, file_offset, file_size, _, _, sections, _ = struct.unpack_from("<II16sQQQQiiII", data, offset)
+            if length != 72 + 80 * sections or file_offset + file_size > len(data):
+                raise ValueError(error)
+            if name.rstrip(b"\0") == b"__LINKEDIT":
+                rounded = (file_size + page - 1) // page * page
+                if linkedit is not None or file_offset < end or address % page or virtual_size % page or virtual_size < rounded:
+                    raise ValueError(error)
+                linkedit = offset + 32, rounded
+        offset += length
+    if offset != end or linkedit is None:
+        raise ValueError(error)
+    payload = bytearray(data)
+    struct.pack_into("<Q", payload, *linkedit)
+    return bytes(payload)
+
+
+def launcher_digest(executable):
+    """Hash all unsigned launcher bytes, normalizing only LINKEDIT's virtual extent."""
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            payload = Path(folder) / "launcher"
+            shutil.copyfile(executable, payload)
+            subprocess.run(["codesign", "--remove-signature", payload], check=True, capture_output=True)
+            return digest(canonical_launcher_payload(payload.read_bytes())).hexdigest()
+    except (OSError, subprocess.CalledProcessError):
+        raise ValueError("Could not fingerprint the native launcher") from None
+
+
+def finalize_local_record(project, manifest, record, executable):
+    public = json.loads(record.read_bytes())
+    baseline = json.loads(manifest.read_bytes())["files"]
+    package = project / "macapp/Shell/Package.swift"
+    target = project / "macapp/Shell/Sources"
+    paths = [package, *sorted(target.rglob("*"))]
+    inputs = {}
+    for path in paths:
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError("Use regular local Swift source inputs")
+        inputs[path.relative_to(project).as_posix()] = sha256(path)
+    public["projectFiles"].update(inputs)
+    relevant = {name.removeprefix("project/") for name in baseline
+                if name == "project/macapp/Shell/Package.swift" or name.startswith("project/macapp/Shell/Sources/")}
+    current = public["projectFiles"]
+    public["projectChanges"] = {
+        "modified": {name: value for name, value in current.items()
+                     if "project/" + name in baseline and baseline["project/" + name] != value},
+        "added": {name: value for name, value in current.items() if "project/" + name not in baseline},
+        "removed": sorted(relevant - current.keys())}
+    public["launcher"] = {"algorithm": LAUNCHER_DIGEST, "sha256": launcher_digest(executable)}
+    record.write_bytes(json_bytes(public))
+
+
+def verify_local_record(app):
+    record = json.loads((app / "Contents/Resources/LOCAL-BUILD.json").read_bytes())
+    if record["launcher"] != {"algorithm": LAUNCHER_DIGEST,
+                              "sha256": launcher_digest(app / "Contents/MacOS/HomeScreenOrganizer")}:
+        raise ValueError("The signed native launcher differs from the local build record")
 
 
 def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch, repository, runtime, project_commit, local_build=None):
@@ -263,3 +352,25 @@ def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch
     finally:
         for wheel in opened.values():
             wheel.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    local = commands.add_parser("local-record")
+    local.add_argument("--project", type=Path, required=True)
+    local.add_argument("--settings", type=Path, required=True)
+    local.add_argument("--app", type=Path, required=True)
+    verify = commands.add_parser("verify-local-record")
+    verify.add_argument("--app", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        if args.action == "local-record":
+            settings = json.loads(args.settings.read_bytes())
+            finalize_local_record(args.project, Path(settings["manifest"]),
+                                  args.app / "Contents/Resources/LOCAL-BUILD.json",
+                                  args.app / "Contents/MacOS/HomeScreenOrganizer")
+        else:
+            verify_local_record(args.app)
+    except (OSError, ValueError, KeyError):
+        parser.exit(1, "Could not verify the local native build record\n")

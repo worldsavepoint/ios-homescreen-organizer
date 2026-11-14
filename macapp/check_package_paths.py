@@ -2,6 +2,7 @@
 import argparse
 import codecs
 import io
+import json
 from importlib.util import MAGIC_NUMBER
 import marshal
 import os
@@ -11,6 +12,7 @@ import re
 import stat
 import struct
 import subprocess
+import sys
 import sysconfig
 import tempfile
 from types import CodeType
@@ -85,7 +87,7 @@ def is_xml_plist(data):
         return False
 
 
-def check_archive(path, blocked):
+def check_archive(path, blocked, *, engine=ENGINE):
     try:
         from PyInstaller import __version__
         from PyInstaller.archive.readers import CArchiveReader
@@ -200,9 +202,10 @@ def check_archive(path, blocked):
         with zipfile.ZipFile(path) as archive, tempfile.TemporaryDirectory() as folder:
             check_zip_metadata(archive)
             check_zip(archive)
-            engine = Path(folder) / "engine"
-            engine.write_bytes(archive.read(ENGINE))
-            check_engine(engine)
+            if engine is not None:
+                executable = Path(folder) / "engine"
+                executable.write_bytes(archive.read(engine))
+                check_engine(executable)
     except (BuildPathError, PackageMetadataError):
         raise
     except (Exception, SystemExit):
@@ -210,14 +213,40 @@ def check_archive(path, blocked):
         raise ValueError("Could not verify the native release archive") from None
 
 
+def check_app(app, blocked):
+    from release import check_tree_metadata, native_zip
+    try:
+        check_tree_metadata(app)
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder) / "local-app.zip"
+            native_zip(app, archive)
+            check_archive(archive, [*blocked, Path(folder)])
+    except (BuildPathError, PackageMetadataError):
+        raise
+    except (Exception, SystemExit):
+        raise ValueError("Could not verify the local native app") from None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--local-build", type=Path)
+    parser.add_argument("--intel", type=Path)
     parser.add_argument("archive", type=Path)
     parser.add_argument("build_roots", type=Path, nargs="+")
     args = parser.parse_args()
-    from build_paths import runner_roots
+    from build_paths import intel_inputs, read_roots, runner_roots
     try:
-        check_archive(args.archive, [*args.build_roots, *runner_roots()])
+        roots = [*args.build_roots, Path(sys.prefix), Path(sys.base_prefix), Path(sys.executable).absolute().parent, *runner_roots()]
+        if args.local_build:
+            roots.extend(Path(root) for root in json.loads(args.local_build.read_bytes())["buildRoots"])
+        if args.intel:
+            roots.extend(read_roots(args.intel, intel_inputs(args.intel)))
+        if args.archive.is_dir():
+            check_app(args.archive, roots)
+        else:
+            check_archive(args.archive, roots)
+    except (OSError, TypeError, KeyError, json.JSONDecodeError):
+        parser.exit(1, "Could not verify native build locations\n")
     except ValueError as error:
         parser.exit(1, f"{error}\n")
     print("Native archive build-path check passed")

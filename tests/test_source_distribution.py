@@ -630,3 +630,171 @@ def test_documented_install_selects_edited_wheel_and_original_direct_pure_wheel(
     portable = tmp_path / "portable.lock"
     subprocess.run([sys.executable, ROOT / "macapp/wheelhouse.py", lock, "--install-lock", portable], check=True)
     assert "file:" not in portable.read_text() and str(tmp_path) not in portable.read_text()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Uses the native Swift compiler and Mach-O signer")
+def test_swift_only_changes_and_canonical_launcher_are_sealed_into_local_record(tmp_path):
+    import plistlib
+    import subprocess
+    from frozen_sources import finalize_local_record, launcher_digest, verify_local_record
+
+    root = tmp_path / "editable project"
+    target = root / "macapp/Shell/Sources/Homescreen"
+    target.mkdir(parents=True)
+    package = root / "macapp/Shell/Package.swift"
+    package.write_text('// swift-tools-version:5.9\nimport PackageDescription\n')
+    main = target / "main.swift"
+    main.write_text('print("original launcher")\n')
+    original = tmp_path / "original-launcher"
+    subprocess.run(["swiftc", "-O", "-module-cache-path", tmp_path / "module-cache", main, "-o", original],
+                   check=True, capture_output=True)
+    original_digest = launcher_digest(original)
+    baseline = {"project/macapp/Shell/Package.swift": hashlib.sha256(package.read_bytes()).hexdigest(),
+                "project/macapp/Shell/Sources/Homescreen/main.swift": hashlib.sha256(main.read_bytes()).hexdigest(),
+                "project/macapp/Shell/Sources/Homescreen/Removed.swift": "a" * 64,
+                "project/homescreen/module.py": "b" * 64}
+    manifest = tmp_path / "MANIFEST.json"
+    manifest.write_text(json.dumps({"files": baseline}))
+    main.write_text('print(Added.value)\n')
+    added = target / "Added.swift"
+    added.write_text('enum Added { static let value = "modified native launcher" }\n')
+    app = tmp_path / "Screen Organizer.app"
+    launcher = app / "Contents/MacOS/HomeScreenOrganizer"
+    launcher.parent.mkdir(parents=True)
+    subprocess.run(["swiftc", "-O", "-module-cache-path", tmp_path / "module-cache", main, added, "-o", launcher],
+                   check=True, capture_output=True)
+    subprocess.run(["/usr/bin/strip", "-S", launcher], check=True, capture_output=True)
+    resources = app / "Contents/Resources"
+    resources.mkdir()
+    record = resources / "LOCAL-BUILD.json"
+    record.write_text(json.dumps({"upstreamCommit": "c" * 40, "arch": "arm64", "components": {},
+                                  "projectFiles": {"homescreen/module.py": "b" * 64},
+                                  "engine": "e" * 64, "editableOverlayHashes": {"cpython/config.py": "d" * 64}}))
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "org.example.local-native",
+        "CFBundleExecutable": launcher.name, "CFBundlePackageType": "APPL"}))
+    finalize_local_record(root, manifest, record, launcher)
+    data = json.loads(record.read_bytes())
+    assert data["projectFiles"]["macapp/Shell/Sources/Homescreen/main.swift"] == hashlib.sha256(main.read_bytes()).hexdigest()
+    assert data["projectChanges"] == {
+        "modified": {"macapp/Shell/Sources/Homescreen/main.swift": hashlib.sha256(main.read_bytes()).hexdigest()},
+        "added": {"macapp/Shell/Sources/Homescreen/Added.swift": hashlib.sha256(added.read_bytes()).hexdigest()},
+        "removed": ["macapp/Shell/Sources/Homescreen/Removed.swift"]}
+    assert data["launcher"]["sha256"] != original_digest
+    assert data["engine"] == "e" * 64 and data["editableOverlayHashes"] == {"cpython/config.py": "d" * 64}
+    assert str(tmp_path).encode() not in record.read_bytes()
+    before_signing = record.read_bytes()
+    subprocess.run(["codesign", "--force", "--sign", "-", app], check=True, capture_output=True)
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", app], check=True, capture_output=True)
+    assert record.read_bytes() == before_signing
+    verify_local_record(app)
+    assert launcher_digest(launcher) == data["launcher"]["sha256"]
+    subprocess.run(["swiftc", "-O", "-module-cache-path", tmp_path / "module-cache", target / "main.swift", added,
+                    "-o", original], check=True, capture_output=True)
+    # A distinct executable must fail even with unchanged Python/component evidence.
+    main.write_text('print("another launcher")\n')
+    subprocess.run(["swiftc", "-O", "-module-cache-path", tmp_path / "module-cache", main, "-o", launcher],
+                   check=True, capture_output=True)
+    with pytest.raises(ValueError, match="launcher"):
+        verify_local_record(app)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Builds and loads a native Darwin C extension")
+def test_native_wheel_rebuilds_stale_objects_and_remaps_private_compiler_paths(tmp_path, monkeypatch):
+    import csv
+    import base64
+    import io
+    import os
+    import platform
+    import subprocess
+    import zipfile
+    from rebuild_sources import local_wheel
+    from build_paths import read_roots
+
+    source = tmp_path / "private-marker-editable source"
+    source.mkdir()
+    (source / "pyproject.toml").write_text('[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n')
+    (source / "setup.py").write_text('from setuptools import setup,Extension\nsetup(name="r2native",version="1.0",ext_modules=[Extension("r2native",["native.c"])])\n')
+    (source / "native.c").write_text('''#include <Python.h>
+#ifndef R2_VALUE
+#define R2_VALUE 7
+#endif
+static PyObject *value(PyObject *self, PyObject *args) { return Py_BuildValue("is", R2_VALUE, __FILE__); }
+static PyMethodDef methods[] = {{"value", value, METH_NOARGS, "fixture"}, {NULL, NULL, 0, NULL}};
+static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "r2native", NULL, -1, methods};
+PyMODINIT_FUNC PyInit_r2native(void) { return PyModule_Create(&module); }
+''')
+    stale = tmp_path / "stale wheels"
+    subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation", "--wheel-dir", stale, source],
+                   check=True, capture_output=True)
+    old, = stale.glob("*.whl")
+    assert any((source / "build").rglob("*.o"))
+    root = tmp_path / "source release"
+    (root / "project").mkdir(parents=True)
+    arch = platform.machine()
+    lock = root / ("project/requirements-build.lock" if arch == "arm64" else "project/build/dependencies/x86_64/requirements-build.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(f"# {old.name}\nr2native==1.0 --hash=sha256:{hashlib.sha256(old.read_bytes()).hexdigest()}\n")
+    monkeypatch.setenv("CFLAGS", "-g -DR2_VALUE=41")
+    monkeypatch.setenv("LDFLAGS", "-Wl,-headerpad_max_install_names")
+    wheels = tmp_path / "replacement wheels"
+    local_wheel(root, source, arch, wheels, tmp_path / "local.lock")
+    wheel, = wheels.glob("*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        extension, = (name for name in archive.namelist() if name.endswith(".so"))
+        assert b"private-marker-editable" not in archive.read(extension)
+        assert bytes(tmp_path) not in archive.read(extension)
+        record, = (name for name in archive.namelist() if name.endswith(".dist-info/RECORD"))
+        for name, checksum, size in csv.reader(io.StringIO(archive.read(record).decode())):
+            if checksum:
+                assert checksum == "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(archive.read(name)).digest()).decode().rstrip("=")
+                assert len(archive.read(name)) == int(size)
+        extracted = tmp_path / "extension"
+        archive.extractall(extracted)
+    result = subprocess.check_output([sys.executable, "-c", "import r2native,json; print(json.dumps(r2native.value()))"],
+                                    env={**os.environ, "PYTHONPATH": str(extracted)}, text=True)
+    value, filename = json.loads(result)
+    assert value == 41 and "private-marker-editable" not in filename
+    assert source in read_roots(wheels, [wheel])
+
+
+@pytest.mark.parametrize("cpu,page", [(0x0100000C, 16384), (0x01000007, 4096)])
+@pytest.mark.parametrize("damage", [None, "cpu", "header", "commands", "segment", "bounds", "signature"])
+def test_canonical_launcher_changes_only_bounded_linkedit_virtual_size(cpu, page, damage):
+    import struct
+    from frozen_sources import canonical_launcher_payload
+    payload = bytearray(page + 7)
+    struct.pack_into("<IiiIIIII", payload, 0, 0xFEEDFACF, cpu, 0, 2, 1, 72, 0, 0)
+    struct.pack_into("<II16sQQQQiiII", payload, 32, 0x19, 72, b"__LINKEDIT", page * 4, page * 2, page, 7, 1, 1, 0, 0)
+    payload[-7:] = b"payload"
+    if damage:
+        offset, value = {"cpu": (4, 12), "header": (0, 0), "commands": (20, 80),
+                         "segment": (36, 64), "bounds": (80, page * 4), "signature": (32, 0x1D)}[damage]
+        struct.pack_into("<I", payload, offset, value)
+        with pytest.raises(ValueError, match="launcher"):
+            canonical_launcher_payload(payload)
+    else:
+        expected = bytearray(payload)
+        struct.pack_into("<Q", expected, 64, page)
+        assert canonical_launcher_payload(payload) == expected
+        assert canonical_launcher_payload(expected) == expected
+        expected[-1] ^= 1
+        assert canonical_launcher_payload(expected) != canonical_launcher_payload(payload)
+
+
+def test_native_compiler_keeps_supplied_rust_flags_and_remaps_tool_roots(tmp_path, monkeypatch):
+    from rebuild_sources import compiler_environment
+    cargo = tmp_path / "Cargo tools with spaces"
+    rustup = tmp_path / "Rust tools with spaces"
+    monkeypatch.setenv("CARGO_HOME", str(cargo))
+    monkeypatch.setenv("RUSTUP_HOME", str(rustup))
+    monkeypatch.setenv("RUSTFLAGS", "-C opt-level=2")
+    monkeypatch.setenv("ARCHFLAGS", "-arch x86_64")
+    monkeypatch.delenv("CARGO_ENCODED_RUSTFLAGS", raising=False)
+    selected = compiler_environment([tmp_path / "editable source"], "x86_64")
+    flags = selected["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+    assert flags[:2] == ["-C", "opt-level=2"]
+    assert f"--remap-path-prefix={cargo}=." in flags
+    assert f"--remap-path-prefix={rustup}=." in flags
+    assert selected["ARCHFLAGS"] == "-arch x86_64"
+    monkeypatch.setenv("CARGO_ENCODED_RUSTFLAGS", "")
+    assert compiler_environment([tmp_path], "x86_64")["CARGO_ENCODED_RUSTFLAGS"].startswith("--remap-path-prefix=")

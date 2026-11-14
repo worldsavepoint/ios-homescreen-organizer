@@ -315,3 +315,29 @@ def test_native_zip_rejects_appledouble_metadata(tmp_path, name):
         archive.writestr(name, b"unrelated provenance origin")
     with pytest.raises(ValueError, match="metadata"):
         check_archive(path, [tmp_path / "unrelated"])
+
+
+@pytest.mark.parametrize("location", ["config", "extra", "nested"])
+def test_complete_local_app_uses_the_compressed_archive_path_reader(tmp_path, location):
+    from macapp.check_package_paths import check_app
+    marker = tmp_path / "recipient source"
+    path = native_zip(tmp_path, **{location: str(marker) if location == "config" else bytes(marker)})
+    if location == "config":
+        assert bytes(marker) not in (tmp_path / "engine").read_bytes()
+    with zipfile.ZipFile(path) as archive:
+        archive.extractall(tmp_path / "local-output")
+    app = tmp_path / "local-output/Screen Organizer.app"
+    with pytest.raises(ValueError, match="build path") as error:
+        check_app(app, [marker])
+    assert str(tmp_path) not in str(error.value)
+    with pytest.raises(ValueError, match="build path"):
+        check_app(app, [marker.resolve()])
+
+
+def test_complete_local_app_allows_an_unrelated_prefix_sibling(tmp_path):
+    from macapp.check_package_paths import check_app
+    root = tmp_path / "recipient"
+    path = native_zip(tmp_path, config=str(root) + "-other/lib")
+    with zipfile.ZipFile(path) as archive:
+        archive.extractall(tmp_path / "local-output")
+    check_app(tmp_path / "local-output/Screen Organizer.app", [root])
