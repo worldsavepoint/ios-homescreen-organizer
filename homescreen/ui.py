@@ -176,12 +176,12 @@ def _placement_changes(lay: Layout, original: Layout, pins: set[str], old_cells:
 
 
 def _locations(lay: Layout, wanted: set[str], physical: set[str],
-               page_cells: dict[int, _PageCells]) -> dict[str, tuple[str, dict[str, Any]]]:
+               page_cells: dict[int, _PageCells],
+               qualified: set[str]) -> dict[str, tuple[str, dict[str, Any]]]:
     """Only materialize endpoints needed by Review or the visible usage list."""
     found = {}
-    labels = lay.folder_labels()
 
-    def walk(nodes: list[Node], kind: str, where: str, page: int = 0, name: str = "") -> None:
+    def walk(nodes: list[Node], kind: str, where: str, page: int = 0, name: str = "", folder_id: str = "") -> None:
         cells = page_cells.get(page, {}) if kind == "page" else {}
         for index, node in enumerate(nodes, 1):
             if node.id in wanted:
@@ -194,13 +194,16 @@ def _locations(lay: Layout, wanted: set[str], physical: set[str],
                     descriptor["page"] = page
                 if kind == "folder":
                     descriptor["name"] = name
+                    if folder_id in qualified:
+                        descriptor["folder_id"] = folder_id
                 if node.id in physical and node.id in cells:
                     row, col, _, _ = cells[node.id]
                     descriptor.update(row=row + 1, column=col + 1)
                 found[node.id] = (raw, descriptor)
             if node.kind == "folder":
                 for p, children in enumerate(node.children, 1):
-                    walk(children, "folder", f"folder {labels[node.id]!r} p{p}", p, labels[node.id])
+                    suffix = f" [{node.id}]" if node.id in qualified else ""
+                    walk(children, "folder", f"folder {node.name!r}{suffix} p{p}", p, node.name, node.id)
 
     walk(lay.dock, "dock", "dock")
     for page, nodes in enumerate(lay.pages, 1):
@@ -230,6 +233,8 @@ def _problem_details(lay: Layout, problems: list[str]) -> list[dict[str, Any]]:
                 row, column = divmod(lay.pins[node.id], lay.grid.cols)
                 add(f"page {page}: {node.name} can't be pinned at row {row + 1}, column {column + 1}",
                     "pin", page=page, name=node.name, row=row + 1, column=column + 1)
+    for nodes in [lay.dock, *lay.pages]:
+        for node in nodes:
             if node.kind == "folder":
                 for folder_page, children in enumerate(node.children, 1):
                     add(f"folder {node.name!r} page {folder_page} has {len(children)} items (max {lay.grid.folder})",
@@ -283,8 +288,9 @@ def view(s=None) -> dict[str, Any]:
     changed_ids = moved.keys() | placements.keys()
     wanted = changed_ids | {usage_ids[row["id"]] for row in top}
     physical = set(placements)
-    old = _locations(original(), changed_ids, physical, old_cells) if changed_ids else {}
-    new = _locations(lay, wanted, physical, new_cells) if wanted else {}
+    qualified = lay.qualified_folders(original()) if changed_ids else lay.qualified_folders()
+    old = _locations(original(), changed_ids, physical, old_cells, qualified) if changed_ids else {}
+    new = _locations(lay, wanted, physical, new_cells, qualified) if wanted else {}
     labels = dict(old.values())
     labels.update(new.values())
     for row in top:

@@ -49,7 +49,8 @@ function locationText(descriptor) {
   if (descriptor.kind === "bank") return t("editor.bank");
   const params = Object.fromEntries(Object.entries(descriptor).map(([key, value]) =>
     [key, typeof value === "number" ? number(value) : value]));
-  return t(descriptor.row ? "location.cell" : "location." + descriptor.kind, params);
+  const label = t(descriptor.row ? "location.cell" : "location." + descriptor.kind, params);
+  return descriptor.folder_id ? label + " [" + descriptor.folder_id + "]" : label;
 }
 function locationLabel(raw) { return V.location_labels?.[raw] ? locationText(V.location_labels[raw]) : raw; }
 function diagnostic(message) {

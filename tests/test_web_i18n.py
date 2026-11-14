@@ -915,9 +915,9 @@ def test_usage_ranking_avoids_full_positions_in_web_view(monkeypatch):
     lay=Layout([[],apps[:24]],library=apps[24:])
     calls=[]
     positions=Layout.positions
-    def counted(layout):
+    def counted(layout, *args):
         calls.append(layout)
-        return positions(layout)
+        return positions(layout, *args)
     monkeypatch.setattr(Layout,'positions',counted)
     view_for(monkeypatch,lay)
     baseline=len(calls)

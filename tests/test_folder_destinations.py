@@ -112,3 +112,63 @@ def test_reordered_unpinned_widgets_must_fit_before_write(tmp_path):
     assert not session.backups() and source.writes == 0
     session.edit(lambda draft: draft.arrange([ordered[:2] + ordered[2:][::-1]]))
     assert asyncio.run(session.apply(lay.token()))["ok"]
+
+
+def test_numeric_wire_folder_id_remains_reserved_after_retirement_and_reload(tmp_path):
+    source = MemorySource()
+    source.state = [[], [{**folder("Old", apps(1)), "uniqueIdentifier": "3"}, app("x", "X")]]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.dissolve_folder("folder:3"))
+    reopened = Session(source, tmp_path)
+    ids = []
+    for i in range(3):
+        ids.append(reopened.edit(lambda lay: lay.create_folder("New", ["x"], "page:1")))
+        reopened.edit(lambda lay: lay.dissolve_folder(ids[-1]))
+    assert "folder:3" not in ids
+
+
+@pytest.mark.parametrize(("item", "target", "before"), [
+    ("x", "folder:1:3", None), ("app0", "folder:1:2", None), ("x", "folder:1:0", "x"),
+])
+def test_unrepresentable_folder_target_keeps_draft_and_history(tmp_path, item, target, before):
+    source = MemorySource()
+    source.state = [[], [folder("Work", apps(1)), app("x", "X")]]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    image = session.draft_path.read_bytes()
+    with pytest.raises(LayoutError):
+        session.edit(lambda lay: lay.move(item, target, before=before))
+    assert image == session.draft_path.read_bytes() and session.history()["undo"] == 0
+
+
+@pytest.mark.parametrize("replacement", [True, False])
+def test_review_distinguishes_replaced_and_literal_folder_names(tmp_path, replacement):
+    source = MemorySource()
+    source.state = [[], [folder("Team", [app("a", "A")]), folder("Team", [app("b", "B")]),
+                         folder("Team [folder:1]", [app("c", "C")])]]
+    if replacement:
+        source.state[1] = [source.state[1][0], app("other", "Other")]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    if replacement:
+        session.edit(lambda lay: lay.dissolve_folder("folder:1"))
+        session.edit(lambda lay: lay.create_folder("Team", ["a"], "page:1"))
+    else:
+        session.edit(lambda lay: lay.swap("a", "c"))
+    reviewed = ui.view(session)
+    detail = reviewed["move_details"]["A [a]"]
+    assert detail["from"] != detail["to"]
+    before, after = reviewed["moves"]["A [a]"].split(" -> ")
+    assert before != after
+
+
+def test_appending_child_of_full_folder_retains_original_subpage_and_localizes_capacity(tmp_path):
+    source = MemorySource()
+    source.state = [[folder("Dock", apps(9))], [app("x", "X"), app("tail", "Tail")]]
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.move_many(["app8"], "folder:1"))
+    assert [len(p) for p in session.require().dock[0].children] == [9]
+    session.edit(lambda lay: lay.move("x", "folder:1:1"))
+    assert ui.view(session)["diff"]["problem_details"][0]["key"] == "validation.folderCapacity"

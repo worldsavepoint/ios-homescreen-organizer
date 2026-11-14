@@ -13,7 +13,6 @@ import copy
 import hashlib
 import json
 import plistlib
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -211,6 +210,8 @@ class Layout:
             node.id = nid
         self.nodes = {node.id: node for node in nodes}
         self._counter = dict(counters)
+        for node in nodes:
+            self._reserve_wire_id(node.id)
 
     def current_snapshot(self) -> dict[str, Any]:
         """An undo step owns its editable state and local allocation identities."""
@@ -331,6 +332,12 @@ class Layout:
         self._counter[prefix] = n
         return f"{prefix}{n}"
 
+    def _reserve_wire_id(self, nid: str) -> None:
+        prefix, sep, suffix = nid.partition(":")
+        if sep and prefix in ("folder", "widget") and suffix.isascii() and suffix.isdecimal():
+            key = prefix + ":"
+            self._counter[key] = max(self._counter.get(key, 0), int(suffix))
+
     def _wrap(self, raw: Any, where: str) -> Node:
         if not isinstance(raw, dict):
             node = Node(self._new_id("other:"), "other", repr(raw)[:40], {"__value__": raw})
@@ -346,6 +353,7 @@ class Layout:
             nid = str(bundle)
         elif kind in ("widget", "folder") and uid and f"{kind}:{uid}" not in self.nodes and ":" not in str(uid):
             nid = f"{kind}:{uid}"  # iOS's own id: stays the same across undo, reloads and moves
+            self._reserve_wire_id(nid)
         else:
             nid = self._new_id(f"{kind}:")
             while nid in self.nodes:
@@ -467,7 +475,9 @@ class Layout:
             folder = self.get(fid)
             if folder.kind != "folder":
                 raise LayoutError(f"{fid} is not a folder")
-            while len(folder.children) < page:
+            if page > len(folder.children) + 1 or any(not children for children in folder.children[:page - 1]):
+                raise LayoutError("a folder page needs an item on each preceding page")
+            if len(folder.children) < page:
                 folder.children.append([])
             return folder.children[page - 1]
         raise LayoutError(f"bad target {target!r}; use dock, library, bank, page:N or folder:<id>[:N]")
@@ -485,12 +495,21 @@ class Layout:
     def move(self, node_id: str, target: str, index: int | None = None, before: str | None = None) -> None:
         """Move an item to target, at index (0-based, default end) or just before item `before`."""
         node = self.get(node_id)
-        if before == node_id:
-            return
         if problem := self._destination_problem(node.kind, target):
             raise LayoutError(problem)
         dest = self._target(target)
         src, i = self.locate(node_id)
+        if before == node_id:
+            if src is not dest:
+                raise LayoutError(f"{before!r} is not in {target}")
+            return
+        if target.startswith("folder:") and len(src) == 1:
+            folder = self.get(":".join(target.split(":")[:2]))
+            for page in folder.children:
+                if page is dest:
+                    break
+                if page is src:
+                    raise LayoutError("a folder page needs an item on each preceding page")
         src.pop(i)
         self.pins.pop(node_id, None)
         if before is not None:
@@ -506,7 +525,8 @@ class Layout:
             folder = self.get(target)
             for item in ids:
                 page = len(folder.children) or 1
-                if folder.children and len(folder.children[-1]) >= self.grid.folder:
+                if (folder.children and len(folder.children[-1]) >= self.grid.folder and
+                        self.get(item) not in folder.children[-1]):
                     page += 1
                 self.move(item, f"{target}:{page}")
         else:
@@ -731,22 +751,27 @@ class Layout:
             },
         }
 
-    def folder_labels(self) -> dict[str, str]:
-        folders = [n for n in self.nodes.values() if n.kind == "folder"]
-        counts = Counter(n.name for n in folders)
-        return {n.id: f"{n.name} [{n.id}]" if counts[n.name] > 1 else n.name for n in folders}
+    def qualified_folders(self, other: "Layout | None" = None) -> set[str]:
+        names = {}
+        for lay in (self, other) if other is not None else (self,):
+            for node in lay.nodes.values():
+                if node.kind == "folder":
+                    names.setdefault(node.name, set()).add(node.id)
+        return {nid for owners in names.values() if len(owners) > 1 for nid in owners}
 
-    def positions(self) -> dict[str, str]:
+    def positions(self, qualified: set[str] | None = None) -> dict[str, str]:
         """id -> human-readable position, for diffs."""
         pos: dict[str, str] = {}
-        labels = self.folder_labels()
+        if qualified is None:
+            qualified = self.qualified_folders()
 
         def walk(nodes: list[Node], where: str) -> None:
             for i, n in enumerate(nodes, 1):
                 pos[n.id] = f"{where} #{i}"
                 if n.kind == "folder":
                     for j, page in enumerate(n.children, 1):
-                        walk(page, f"folder {labels[n.id]!r} p{j}")
+                        suffix = f" [{n.id}]" if n.id in qualified else ""
+                        walk(page, f"folder {n.name!r}{suffix} p{j}")
 
         walk(self.dock, "dock")
         for i, page in enumerate(self.pages, 1):
@@ -781,7 +806,8 @@ class Layout:
         """Items that really moved: changed container, or broke relative order within one.
         Icons that only slid over because a neighbor moved don't count."""
         src = self.original()
-        old, new = src.positions(), self.positions()
+        qualified = self.qualified_folders(src)
+        old, new = src.positions(qualified), self.positions(qualified)
         old_c, new_c = src.containers(), self.containers()
         where_old = {i: c for c, ids in old_c.items() for i in ids}
         moved: dict[str, str] = {}
