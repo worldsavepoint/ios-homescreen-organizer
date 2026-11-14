@@ -125,8 +125,9 @@ def test_short_gap_memory_write_preserves_previous_bytes_and_recovery(tmp_path, 
     with monkeypatch.context() as patch:
         patch.setattr(session_module, "_exclusive_file", short_file)
         patch.setattr(Path, "write_text", short_text)
-        with pytest.raises(OSError):
-            apply(session)
+        result = apply(session)
+    assert not result["ok"] and result["readback"] == "matched" and result["recovery"] == "read"
+    assert result["backup"] in session.backups()
     assert session._pending_path.exists()
     assert reviewed(session) == before
     run(session.read())

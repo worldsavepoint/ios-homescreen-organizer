@@ -1156,7 +1156,7 @@ class Session:
                          else self.source.write(target, target_lib, want_pins, self.grid, **archive_args))
             await asyncio.wait_for(operation, OPERATION_TIMEOUT)
         except Exception as e:
-            write_error = str(e) or type(e).__name__
+            write_error = type(e).__name__
         verification_note = "Readback compares the layout fields returned by the selected source."
         try:
             after, after_lib = await self._read_source((target, target_lib))
@@ -1190,17 +1190,24 @@ class Session:
                     if plistlib.dumps(wanted, fmt=plistlib.FMT_BINARY) != plistlib.dumps(present, fmt=plistlib.FMT_BINARY):
                         raise LayoutError("readback changed an exported page field")
         except Exception as e:
-            return {"ok": False, "status": "unknown", "backup": backup.name,
-                    "warnings": [verification_note],
-                    "error": f"Readback failed ({type(e).__name__}); run Read before applying another change."}
+            readback_error = type(e).__name__
+            result = {"ok": False, "status": "unknown", "backup": backup.name, "recovery": "read",
+                      "warnings": [verification_note], "readback_error": readback_error,
+                      "error": f"Readback failed ({readback_error}); run Read before applying another change."}
+            if write_error:
+                result["write_error"] = write_error
+                result["error"] = f"Write returned {write_error}. " + result["error"]
+            return result
         res: dict[str, Any] = {"ok": ok, "status": "verified" if ok else "unknown",
                                "backup": backup.name, "warnings": [verification_note]}
         if write_error is not None:
+            res["write_error"] = write_error
             res["error"] = (f"Write returned {write_error}. "
                             f"Readback result: {'matched' if ok else 'different'}.")
         if after_lib is not None:
             res["app_library_only"] = len(after_lib)
         if not ok:
+            res["recovery"] = "read"
             res["error"] = (res.get("error", "Readback differs from the target layout.")
                             + " Run Read before applying another change.")
             want = Layout(target, library=target_lib, grid=self.grid)
@@ -1239,9 +1246,14 @@ class Session:
                 self._page_identity = copy.deepcopy(getattr(self.source, "page_identity", {}))
                 self._save_draft()
                 self._clear_pending()
-        except BaseException:
+        except BaseException as e:
             (self.layout, self._observed_placement, self._page_identity, self._draft_digest,
              self._placement_revision) = previous
+            if isinstance(e, Exception):
+                detail = f"Readback matched. Saving the local draft failed ({type(e).__name__}). Run Read to recover."
+                return {**res, "ok": False, "status": "unknown", "readback": "matched",
+                        "local_adoption": "failed", "recovery": "read",
+                        "error": f"{res['error']} {detail}" if "error" in res else detail}
             raise
         self._undo, self._redo = [], []
         self._history_baseline = None

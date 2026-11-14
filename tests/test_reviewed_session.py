@@ -85,8 +85,10 @@ def test_adoption_rolls_back_both_local_files_and_history(tmp_path, monkeypatch,
 
     with monkeypatch.context() as patch:
         patch.setattr(s, "_save_draft" if failure == "draft" else "_clear_pending", fail)
-        with pytest.raises(OSError):
-            apply(s)
+        result = apply(s)
+        assert not result["ok"] and result["readback"] == "matched"
+        assert result["local_adoption"] == "failed" and result["recovery"] == "read"
+        assert result["backup"] in s.backups()
     assert s.require() is original and reviewed(s) == before
     assert Session(src, s.dir)._snap() == before[0]
     assert s._pending_path.exists()

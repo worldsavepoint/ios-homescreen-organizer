@@ -40,13 +40,17 @@ async def run(args: argparse.Namespace) -> int:
         print(f"{d['items_moved']} items moved, pages {d['pages_before']} -> {d['pages_after']}.")
         if not _confirm("This writes the draft to the phone (a backup is saved first)."):
             return 1
-        _print(await s.apply(args.token))
+        result = await s.apply(args.token)
+        _print(result)
+        return 0 if result["ok"] else 1
     elif args.cmd == "backups":
         print("\n".join(s.backups()) or "no backups yet")
     elif args.cmd == "restore":
         if not _confirm(f"This writes backup {args.name} to the phone."):
             return 1
-        _print(await s.restore(args.name))
+        result = await s.restore(args.name)
+        _print(result)
+        return 0 if result["ok"] else 1
     elif args.cmd == "probe":
         # Dump the raw icon state in every format version, to learn what this iOS exposes
         # (e.g. whether App Library-only apps are marked somewhere).
