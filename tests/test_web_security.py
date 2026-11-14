@@ -136,7 +136,7 @@ def test_preview_widget_size_cannot_inject_attributes(web, tmp_path):
     out = asyncio.run(preview.render(ui.session(), tmp_path / "preview.html", show_original=False))
     html = out.read_text()
     assert 'onclick="alert(1)' not in html
-    assert '<div class="widget w-small">' in html
+    assert '<div class="widget w-small" style="grid-row:' in html
 
 
 @pytest.mark.parametrize("path", ["/api/op", "/api/read", "/api/apply", "/api/device", "/api/restore"])

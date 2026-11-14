@@ -61,6 +61,18 @@ def test_check_initializes_discovers_tools_and_closes_process(tmp_path):
     assert "ios-homescreen-mcp" in result.stdout
 
 
+def test_real_server_initializes_and_discovers_without_device_operations(tmp_path):
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("HOMESCREEN_")}
+    env.update(HOMESCREEN_DATA=str(tmp_path / "unused data"), HOMESCREEN_ALLOW_APPLY="0")
+    result = subprocess.run([sys.executable, str(SCRIPT), "--timeout", "30", "--",
+                             sys.executable, "-m", "homescreen.server"],
+                            cwd=ROOT, env=env, capture_output=True, text=True, timeout=35)
+    assert result.returncode == 0, result.stderr
+    assert "ios-homescreen-mcp initialized; required tools discovered" in result.stdout
+    assert not (tmp_path / "unused data").exists()
+
+
 @pytest.mark.parametrize("behavior", ["name", "tools", "error", "eof"])
 def test_invalid_server_fails_and_closes_process(tmp_path, behavior):
     result, _ = check(tmp_path, behavior)

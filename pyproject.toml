@@ -1,6 +1,6 @@
 [project]
 name = "home-screen-organizer"
-version = "1.2.0"
+version = "1.2.1"
 description = "Arrange your iPhone Home Screen from your Mac: drag-and-drop app, CLI and MCP server. Keeps App Library apps in the App Library."
 readme = "README.md"
 license = "MIT"

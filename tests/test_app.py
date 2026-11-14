@@ -298,7 +298,7 @@ class HiddenWebClipPhone:
     async def read(self):
         return [list(p) for p in self.state], list(self.apps)  # installed apps only
 
-    async def write(self, state, library, pins=None):
+    async def write(self, state, library, pins=None, grid=None):
         self.writes += 1
         listed = {x.get("displayIdentifier") for x in library}
         state = [list(p) for p in state]

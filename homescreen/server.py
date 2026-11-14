@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
 from mcp.server.mcpserver import Image, MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from . import organize, preview, usage
 from .config import DATA, session
@@ -19,12 +21,19 @@ draft (arrange / move / create_folder / sort_* / file_into_folders ...) -> diff 
 Item ids: apps use their bundle id; folders and widgets use folder:N / widget:N.
 Targets: 'dock', 'library', 'bank' (a holding tray; empty it before applying), 'page:N'
 (1-based; N = last+1 makes a new page), 'folder:<id>[:N]'.
-To take an app off the Home Screen, move it to 'library' (App Library only). Leaving it out
-does NOT work: iOS puts it back. Pages hold 24 slots (6 rows x 4 columns); widgets take
-small=2x2, medium=4x2, large=4x4. place_at puts an item in an exact spot, leaving gaps; any move
-drops that. iOS doesn't report gaps made on the phone over USB, so those close on apply. Folders hold 9 per page. Leave page 1 and the dock alone unless asked: they are
-muscle memory. To sort by color, call icon_colors first; get_icons only for the few you
-can't judge."""
+Move an app to 'library' to keep it in App Library; iOS restores apps omitted from the layout.
+Read show_layout.grid for page cols/rows, Dock capacity (dock) and folder-page capacity (folder).
+Pages hold cols * rows slots. Widget footprints are small=2x2, medium=4x2, large=4x4.
+For fixed positions, inspect grid and call place_at with 1-based page/row/column coordinates.
+Use move for sequential item order. For sequential arrange, call close_gaps on pinned items
+first; arrange retains fixed positions for items staying on the same page. On iOS 16, use
+these sequential-order edits.
+Moving an item clears its fixed position. Dictionary reads retain exported fixed locations;
+unreported/list observations use remembered positions. Apply uses the draft's positions.
+Preserve page 1 and Dock placement unless the user requests changes. optimize_by_usage preserves
+page-1 top-level placement when requested and optimizes folder contents throughout the draft,
+including page-1, Dock and holding-tray folders. To sort by color, call icon_colors first;
+use get_icons for icons needing visual review."""
 
 mcp = MCPServer("ios-homescreen-mcp", instructions=INSTRUCTIONS)
 
@@ -44,37 +53,56 @@ def _edit(fn: Callable[[Layout], Any]) -> dict[str, Any]:
     return res
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=True))
 async def read_phone() -> dict[str, Any]:
-    """Read the Home Screen from the connected iPhone and start a fresh draft from it.
-    Discards any unapplied draft."""
+    """Read the selected iPhone source and return device details and item counts.
+    Replaces the saved draft, clears undo/redo, and saves/prunes local read snapshots.
+    Requires the selected source to be available."""
     return await session().read()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=False))
 def show_layout() -> dict[str, Any]:
-    """The current draft: dock, every page and the App Library-only apps, as {id, name} items
-    (folders carry their contents, widgets their size)."""
-    return session().require().summary()
+    """Return the loaded draft: Dock, pages, App Library and holding tray.
+    Items include ids and names; folders include contents and widgets include sizes.
+    grid supplies page cols/rows and Dock/folder-page capacities for layout edits.
+    Requires a loaded draft. Session setup creates and sets permissions on the local data directory."""
+    lay = session().require()
+    return {**lay.summary(), "grid": lay.grid.to_dict()}
 
 
-@mcp.tool()
-def find_apps(query: str) -> list[dict[str, Any]]:
-    """Find items by name or bundle id substring."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=False))
+def find_apps(
+    query: Annotated[str, Field(description="Substring to match against loaded draft item names or bundle ids.")],
+) -> list[dict[str, Any]]:
+    """Search the loaded draft by name or bundle-id substring; return matching items and positions.
+    Session setup creates and sets permissions on the local data directory."""
     lay = session().require()
     pos = lay.positions()
     return [{**n.describe(), "position": pos.get(n.id, "not placed")} for n in lay.find(query)]
 
 
-@mcp.tool()
-async def icon_colors(ids: list[str] | None = None) -> dict[str, Any]:
-    """Dominant icon color per app (family, background, hex, hue 0-360). Omit ids for every app."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=True))
+async def icon_colors(
+    ids: Annotated[list[str] | None, Field(description="Item ids from show_layout; omitted or empty selects every app with a bundle id.")] = None,
+) -> dict[str, Any]:
+    """Return results keyed by item id, with name and dominant icon family.
+    Analyzed icons add hex, background and hue; unavailable or empty icons have family='unknown'.
+    Reads uncached icons from the selected source and saves them locally."""
     return await session().icon_colors(ids)
 
 
-@mcp.tool()
-async def get_icons(ids: list[str]) -> list[str | Image]:
-    """Icon images for up to 24 apps, in the order given."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=True))
+async def get_icons(
+    ids: Annotated[list[str], Field(description="Item ids from show_layout in display order; reads up to 24 items.")],
+) -> list[str | Image]:
+    """Return labels and available PNG images for the first 24 requested loaded draft items.
+    Preserves request order; reads uncached icons from the selected source and saves them locally."""
     s = session()
     lay = s.require()
     out: list[str | Image] = []
@@ -87,102 +115,179 @@ async def get_icons(ids: list[str]) -> list[str | Image]:
     return out
 
 
-@mcp.tool()
-def arrange(pages: list[list[str]], dock: list[str] | None = None,
-            library: list[str] | None = None) -> dict[str, Any]:
-    """Set the whole top-level layout at once. pages = list of pages, each a list of ids in
-    order (row by row). library = apps kept only in the App Library. Every top-level item and
-    library app must appear exactly once. dock / library omitted = unchanged."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def arrange(
+    pages: Annotated[list[list[str]], Field(description="Pages in 1-based order; unpinned items flow in the supplied order. Clear same-page pins with close_gaps for row-major placement.")],
+    dock: Annotated[list[str] | None, Field(description="Ordered Dock item ids; omitted leaves the Dock unchanged.")] = None,
+    library: Annotated[list[str] | None, Field(description="App ids kept only in App Library; omitted leaves it unchanged.")] = None,
+) -> dict[str, Any]:
+    """Replace the loaded draft's top-level layout in one saved undo step.
+    Every top-level item and App Library app must appear exactly once.
+    Same-page items retain fixed positions; items moved between pages lose them.
+    For sequential row-major placement, call close_gaps on pinned item ids before arranging.
+    Omitted dock/library stay unchanged. Return ok and validation problems."""
     return _edit(lambda lay: lay.arrange(pages, dock, library))
 
 
-@mcp.tool()
-def move(item_id: str, target: str, index: int | None = None, before: str | None = None) -> dict[str, Any]:
-    """Move one item to target ('dock', 'library', 'page:N', 'folder:<id>[:N]'), at index
-    (0-based, default end) or just before the item with id `before`.
-    'library' = App Library only, off the Home Screen."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def move(
+    item_id: Annotated[str, Field(description="Item id from show_layout: app bundle id, folder:N or widget:N.")],
+    target: Annotated[str, Field(description="dock, library, bank, page:N (1-based; last+1 creates a page), or folder:N[:P] (P defaults to 1).")],
+    index: Annotated[int | None, Field(description="0-based insertion index, clamped to destination bounds; omitted appends.")] = None,
+    before: Annotated[str | None, Field(description="Destination item id to insert before; takes precedence over index.")] = None,
+) -> dict[str, Any]:
+    """Move one loaded draft item and clear its fixed-position gaps, in one saved undo step.
+    App Library removes an app from the Home Screen; empty the holding tray before apply.
+    Return ok and validation problems."""
     return _edit(lambda lay: lay.move(item_id, target, index, before))
 
 
-@mcp.tool()
-def create_folder(name: str, item_ids: list[str], target: str, index: int | None = None) -> dict[str, Any]:
-    """Make a folder at target/index holding item_ids (in order)."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def create_folder(
+    name: Annotated[str, Field(description="Display name for the new folder.")],
+    item_ids: Annotated[list[str], Field(description="App item ids from the loaded draft, in the desired folder order.")],
+    target: Annotated[str, Field(description="Top-level destination: dock, bank or page:N (1-based; last+1 creates a page).")],
+    index: Annotated[int | None, Field(description="0-based destination insertion index; omitted appends.")] = None,
+) -> dict[str, Any]:
+    """Create a folder from loaded draft items in the supplied order, in one saved undo step.
+    Return folder_id, ok and validation problems."""
     return _edit(lambda lay: {"folder_id": lay.create_folder(name, item_ids, target, index)})
 
 
-@mcp.tool()
-def rename_folder(folder_id: str, name: str) -> dict[str, Any]:
-    """Rename a folder."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def rename_folder(
+    folder_id: Annotated[str, Field(description="Folder id from show_layout, such as folder:1.")],
+    name: Annotated[str, Field(description="Replacement folder display name.")],
+) -> dict[str, Any]:
+    """Rename a loaded draft folder in one saved undo step.
+    Return ok and validation problems."""
     return _edit(lambda lay: lay.rename_folder(folder_id, name))
 
 
-@mcp.tool()
-def dissolve_folder(folder_id: str) -> dict[str, Any]:
-    """Remove a folder, putting its apps where it was."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def dissolve_folder(
+    folder_id: Annotated[str, Field(description="Folder id from show_layout, such as folder:1.")],
+) -> dict[str, Any]:
+    """Remove a loaded draft folder and put its apps in its former position, in one saved undo step.
+    Return ok and validation problems."""
     return _edit(lambda lay: lay.dissolve_folder(folder_id))
 
 
-@mcp.tool()
-def file_into_folders(groups: dict[str, list[str]], keep_first_page: bool = True) -> dict[str, Any]:
-    """File loose apps into folders: {folder name: [app ids]}. Apps join an existing folder
-    with that name, or a new folder (2+ apps). Apps on page 1 are left alone by default."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def file_into_folders(
+    groups: Annotated[dict[str, list[str]], Field(description="Mapping of folder display names to ordered loose app bundle ids.")],
+    keep_first_page: Annotated[bool, Field(description="Leave apps on page 1 alone; defaults to true.")] = True,
+) -> dict[str, Any]:
+    """File loose loaded draft apps into named folders in one saved undo step.
+    Join an existing page folder with that name or create one for at least two eligible apps.
+    Return filed names/count, ok and validation problems."""
     return _edit(lambda lay: organize.into_folders(lay, groups, keep_first_page))
 
 
-@mcp.tool()
-async def sort_by_color(keep_first_page: bool = True) -> dict[str, Any]:
-    """Rainbow-sort loose apps (red -> purple, then white/gray/black). Folders and widgets
-    go first. Page 1 is left alone by default."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=True))
+async def sort_by_color(
+    keep_first_page: Annotated[bool, Field(description="Leave page 1 unchanged; defaults to true.")] = True,
+) -> dict[str, Any]:
+    """Combine eligible draft pages, rainbow-sort loose apps after folders/widgets and repack them.
+    Repacking clears gaps, moves folders/widgets across those pages and removes empty pages.
+    Saves one undo step; reads and locally caches source icons as needed.
+    Return ok and validation problems."""
     colors = await session().icon_colors()
     return _edit(lambda lay: organize.by_color(lay, colors, keep_first_page))
 
 
-@mcp.tool()
-def sort_alphabetically(keep_first_page: bool = True, folders_first: bool = True) -> dict[str, Any]:
-    """A-Z sort of folders and loose apps. Page 1 is left alone by default."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def sort_alphabetically(
+    keep_first_page: Annotated[bool, Field(description="Leave page 1 unchanged; defaults to true.")] = True,
+    folders_first: Annotated[bool, Field(description="Place folders before loose apps after widgets; defaults to true.")] = True,
+) -> dict[str, Any]:
+    """Combine eligible draft pages, sort items A-Z with widgets first and repack them.
+    Repacking clears gaps, moves folders/widgets across those pages and removes empty pages.
+    Saves one undo step; Dock and App Library stay unchanged.
+    Return ok and validation problems."""
     return _edit(lambda lay: organize.alphabetical(lay, keep_first_page, folders_first))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
 def sort_folder_contents() -> dict[str, Any]:
-    """A-Z inside every folder."""
+    """Sort apps A-Z inside each placed loaded draft folder, in one saved undo step.
+    Refills folder pages; return ok and validation problems."""
     return _edit(lambda lay: organize.sort_folder_contents(lay))
 
 
-@mcp.tool()
-def app_store_categories(ids: list[str] | None = None) -> dict[str, str]:
-    """App Store genre per app (Apple apps are 'Apple'). This sends the bundle ids to Apple's
-    public lookup API, so only call it when the user is fine with that. Cached locally."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=True))
+def app_store_categories(
+    ids: Annotated[list[str] | None, Field(description="App bundle ids; omitted or empty selects every app in the loaded draft.")] = None,
+) -> dict[str, str]:
+    """Return App Store genres for loaded draft apps; Apple apps use Apple and misses use an empty string.
+    Sends uncached bundle ids to Apple's public US lookup API and saves results locally.
+    Requires user agreement to send bundle ids to Apple."""
     lay = session().require()
     ids = ids or [n.id for n in lay.nodes.values() if n.kind == "app"]
     return organize.fetch_categories(ids, DATA / "categories.json")
 
 
-@mcp.tool()
-def place_at(item_id: str, page: int, row: int, column: int) -> dict[str, Any]:
-    """Put an item in an exact spot (row 1-6, column 1-4) on a page, leaving empty spaces
-    around it, like dragging it to an empty spot on the iPhone. Other items flow around it."""
-    return _edit(lambda lay: lay.pin(item_id, page, (row - 1) * 4 + (column - 1)))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def place_at(
+    item_id: Annotated[str, Field(description="Item id from show_layout: app bundle id, folder:N or widget:N.")],
+    page: Annotated[int, Field(description="1-based page number; last+1 creates a page.")],
+    row: Annotated[int, Field(description="1-based grid row, from 1 through show_layout.grid.rows.")],
+    column: Annotated[int, Field(description="1-based grid column, from 1 through show_layout.grid.cols.")],
+) -> dict[str, Any]:
+    """Use show_layout.grid to pin a draft item at a page coordinate in one saved undo step.
+    Fixed-position placement leaves gaps. Use move for sequential order, or close_gaps then arrange.
+    On iOS 16, use these sequential-order edits.
+    Other items flow around it; return ok and validation problems."""
+    def run(lay: Layout) -> None:
+        if not 1 <= row <= lay.grid.rows:
+            raise LayoutError(f"row must be 1-{lay.grid.rows}")
+        if not 1 <= column <= lay.grid.cols:
+            raise LayoutError(f"column must be 1-{lay.grid.cols}")
+        lay.pin(item_id, page, (row - 1) * lay.grid.cols + (column - 1))
+    return _edit(run)
 
 
-@mcp.tool()
-def close_gaps(item_ids: list[str]) -> dict[str, Any]:
-    """Let placed items flow with the rest again (removes their gaps)."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def close_gaps(
+    item_ids: Annotated[list[str], Field(description="Item ids whose fixed-position pins should be removed.")],
+) -> dict[str, Any]:
+    """Remove fixed-position pins from loaded draft items in one saved undo step.
+    Items flow with the page again; return ok and validation problems."""
     return _edit(lambda lay: [lay.unpin(i) for i in item_ids])
 
 
-@mcp.tool()
-def swap(a: str, b: str) -> dict[str, Any]:
-    """Trade the places of two items."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def swap(
+    a: Annotated[str, Field(description="First loaded draft item id from show_layout.")],
+    b: Annotated[str, Field(description="Second loaded draft item id from show_layout.")],
+) -> dict[str, Any]:
+    """Swap the positions and pins of two loaded draft items in one saved undo step.
+    Return ok and validation problems."""
     return _edit(lambda lay: lay.swap(a, b))
 
 
-@mcp.tool()
-async def screen_time(days: int = 30, source: str = "device") -> dict[str, Any]:
-    """Which apps get used, the top apps with where they are now, and estimated page swipes for
-    the device vs the draft. source='device': the device's own memory reports (no setup; apps iOS
-    keeps running for calls or in memory every day count less, listed under 'background');
-    source='mac': Screen Time synced to this Mac (Share Across Devices), last `days` days."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=True))
+async def screen_time(
+    days: Annotated[int, Field(description="Number of recent days for mac mode, default 30; device mode uses report coverage.")] = 30,
+    source: Annotated[str, Field(description="device (default) reads device memory reports; mac reads synced macOS Screen Time.")] = "device",
+) -> dict[str, Any]:
+    """Return estimated top-app usage, background apps and phone-versus-draft page swipes.
+    Requires a loaded draft and replaces cached usage. Device mode reads memory reports and
+    installed apps, saving reports locally; mac mode reads synced macOS Screen Time files."""
     s = session()
     u = await s.load_device_usage() if source == "device" else s.load_usage(days)
     if not u.get("ok"):
@@ -194,11 +299,16 @@ async def screen_time(days: int = 30, source: str = "device") -> dict[str, Any]:
             "swipes_in_draft": usage.swipes(lay, u["opens"])}
 
 
-@mcp.tool()
-async def optimize_by_usage(keep_first_page: bool = False) -> dict[str, Any]:
-    """Most-used apps and folders onto the earliest pages, most-used apps onto each folder's
-    first page (usage from screen_time, else the device's memory reports, else Screen Time).
-    Widgets keep their pages; dock and App Library untouched."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=True))
+async def optimize_by_usage(
+    keep_first_page: Annotated[bool, Field(description="Preserve page 1 top-level placement; folder contents are optimized throughout the draft. Defaults to false.")] = False,
+) -> dict[str, Any]:
+    """Reorder loaded draft apps/folders by estimated usage in one saved undo step.
+    Uses cached usage, else reads device reports into local files, then tries synced macOS
+    Screen Time. Seeds repacked pages with their existing widgets; preserves Dock item placement and App Library.
+    Sorts/refills every folder's contents, including page-1, Dock and holding-tray folders.
+    Return ok and validation problems or an error."""
     s = session()
     if s.usage is None:
         try:
@@ -213,10 +323,16 @@ async def optimize_by_usage(keep_first_page: bool = False) -> dict[str, Any]:
     return _edit(lambda lay: usage.optimize(lay, opens, keep_first_page))
 
 
-@mcp.tool()
-def page_op(op: str, page: int, to: int | None = None) -> dict[str, Any]:
-    """Page operations: op='insert' (new empty page at `page`), 'move' (page -> `to`),
-    'delete' (its apps go to the App Library, like iOS)."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
+def page_op(
+    op: Annotated[str, Field(description="Page operation: insert, move or delete.")],
+    page: Annotated[int, Field(description="1-based page number; insert accepts last+1.")],
+    to: Annotated[int | None, Field(description="Required 1-based destination page for move; otherwise unused.")] = None,
+) -> dict[str, Any]:
+    """Insert, move or delete a loaded draft page in one saved undo step.
+    Delete sends its apps, including folder contents, to App Library; widgets prevent deletion.
+    Return ok and validation problems."""
     def run(lay: Layout) -> None:
         if op == "insert":
             lay.insert_page(page)
@@ -231,50 +347,69 @@ def page_op(op: str, page: int, to: int | None = None) -> dict[str, Any]:
     return _edit(run)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
 def remove_empty() -> dict[str, Any]:
-    """Drop empty pages and empty folders from the draft."""
+    """Remove empty Home Screen pages and empty folders on those pages in one saved undo step.
+    Trims empty child pages in page/Dock folders; retains Dock and holding-tray folder containers.
+    Return ok and validation problems."""
     return _edit(lambda lay: lay.drop_empty())
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
 def undo() -> dict[str, Any]:
-    """Undo the last draft edit."""
+    """Undo one available draft edit and persist the result.
+    Return whether an edit was undone and the remaining undo/redo depths."""
     s = session()
     return {"ok": s.undo(), **s.history()}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
 def redo() -> dict[str, Any]:
-    """Redo the last undone draft edit."""
+    """Redo one available undone draft edit and persist the result.
+    Return whether an edit was redone and the remaining undo/redo depths."""
     s = session()
     return {"ok": s.redo(), **s.history()}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=False))
 def reset_draft() -> dict[str, Any]:
-    """Throw away draft edits and go back to the layout as read from the phone (undoable)."""
+    """Replace the loaded draft with its last-read source layout in one saved undo step.
+    Discards draft changes and returns ok."""
     session().reset()
     return {"ok": True}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=False))
 def diff() -> dict[str, Any]:
-    """What applying the draft would change, any problems, and the apply_token."""
+    """Return loaded draft changes, validation problems and its current apply_token.
+    Compares with the last-read layout.
+    Session setup creates and sets permissions on the local data directory."""
     return session().require().diff()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=True, openWorldHint=True))
 async def render_preview() -> dict[str, Any]:
-    """Write an HTML preview (draft vs phone, moved icons outlined) and return its path."""
+    """Replace local preview.html with a draft-versus-last-read HTML preview; return its path.
+    Requires a loaded draft; reads and locally caches source icons as needed."""
     path = await preview.render(session(), DATA / "preview.html")
     return {"path": str(path)}
 
 
-@mcp.tool()
-async def apply(apply_token: str) -> dict[str, Any]:
-    """Write the draft to the iPhone. Only call when the user explicitly asked to apply this
-    draft. Needs the apply_token from the latest diff. Backs up first and verifies after."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=True))
+async def apply(
+    apply_token: Annotated[str, Field(description="Exact token from diff for the current draft; obtain a fresh token after edits.")],
+) -> dict[str, Any]:
+    """Write the loaded draft to the iPhone.
+    Requires explicit user approval, HOMESCREEN_ALLOW_APPLY=1, a writable source and the latest diff token.
+    Backs up first, checks identity and source changes, writes once and verifies; returns status.
+    Replaces the local draft and clears history after readback."""
     if not ALLOW_APPLY:
         return {"ok": False, "error": "apply from the assistant is off. The user can apply in the app "
                 f"(`home-screen-organizer ui`), run `home-screen-organizer apply {apply_token}`, or set HOMESCREEN_ALLOW_APPLY=1."}
@@ -284,15 +419,25 @@ async def apply(apply_token: str) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=False))
 def list_backups() -> list[str]:
-    """Layouts saved before each apply/restore, oldest first."""
+    """Return saved backup filenames for this session's device, sorted by filename.
+    Creates the local session/backup directory as needed and sets session-directory permissions."""
     return session().backups()
 
 
-@mcp.tool()
-async def restore(backup: str) -> dict[str, Any]:
-    """Write a backup to the iPhone. Only when the user explicitly asked. Same gate as apply."""
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                      idempotentHint=False, openWorldHint=True))
+async def restore(
+    backup: Annotated[str, Field(description="Exact filename returned by list_backups for the previously read device.")],
+) -> dict[str, Any]:
+    """Write a named trusted backup to the iPhone.
+    Requires explicit user approval, HOMESCREEN_ALLOW_APPLY=1, a writable source
+    and a previously read device identity.
+    Pinned backups require saved grid dimensions; trusted unpinned legacy backups remain supported.
+    Restored item footprints must fit the loaded grid.
+    Backs up first and verifies after writing; returns status, replaces the draft and clears history."""
     if not ALLOW_APPLY:
         return {"ok": False, "error": f"restore from the assistant is off. The user can run `home-screen-organizer restore {backup}`."}
     try:

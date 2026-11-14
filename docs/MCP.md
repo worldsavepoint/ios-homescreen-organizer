@@ -166,6 +166,8 @@ home-screen-organizer apply <apply_token>
 
 The CLI asks you to type `yes`. Use the token from the latest `diff`. For assistant writes, configure **both** `HOMESCREEN_READ_ONLY=0` and `HOMESCREEN_ALLOW_APPLY=1`, then restart the server. Its instructions require an explicit user request; the environment gates are enforced by the server and do not add a separate confirmation dialog. Apply checks the token, validates the draft, refreshes device identity/layout, saves a backup and verifies readback. Restore uses matching backup provenance. After an interrupted or mismatching write, read the device again.
 
+Since 1.2.1, pinned backups require saved grid dimensions for Restore. Trusted unpinned legacy backups remain supported. Restore maps saved pin coordinates and requires every item footprint to fit the loaded grid.
+
 ## Distribution and discovery
 
 GitHub Releases host the DMGs, ZIPs, dual-architecture MCPB, `server.json` and shared checksums. Registry publication uses the name **`io.github.worldsavepoint/home-screen-organizer`**, with metadata pointing clients to the exact versioned MCPB download and its SHA256.

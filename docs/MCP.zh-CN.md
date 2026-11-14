@@ -166,6 +166,8 @@ home-screen-organizer apply <apply_token>
 
 CLI 要求输入 `yes`，令牌取自最新的 `diff`。若需要助手写入，同时设置 <strong>`HOMESCREEN_READ_ONLY=0`</strong> 和 <strong>`HOMESCREEN_ALLOW_APPLY=1`</strong>，再重启服务器。工具说明要求用户明确提出写入请求；环境开关由服务器强制检查，不会额外弹出确认对话框。应用时检查令牌、校验草稿、刷新设备身份和布局、保存备份并核对回读。恢复时检查备份来源匹配。写入中断或结果不匹配后，请重新读取设备。
 
+从 1.2.1 起，恢复含固定位置的备份需要备份中保存的网格尺寸。可信且不含固定位置的旧版备份仍受支持。恢复时映射保存的位置坐标，并要求每个项目的占用范围都能放入当前读取的网格。
+
 <a id="distribution-and-discovery"></a>
 
 ## 分发与发现

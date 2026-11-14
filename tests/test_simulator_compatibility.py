@@ -90,7 +90,7 @@ class VersionedSource:
     async def read(self):
         return copy.deepcopy(self.state), []
 
-    async def write(self, state, library, pins=None):
+    async def write(self, state, library, pins=None, grid=None):
         self.writes += 1
         self.state = copy.deepcopy(state)
 

@@ -45,7 +45,7 @@ class MemorySource:
             self.state[1].reverse()
         return copy.deepcopy(self.state), None
 
-    async def write(self, state, library, pins=None):
+    async def write(self, state, library, pins=None, grid=None):
         self.io += 1
         self.writes += 1
         self.state = copy.deepcopy(state)

@@ -34,7 +34,9 @@ The import preserves existing device values by omitting Today View and page-ID k
 
 ### Gaps and placement
 
-iOS stores pinned empty cells in `listMetadata` → `fixedLocations`, keyed by page ID. USB reads do not supply the gaps created on the device in a form the editor can retain automatically. Create the desired spacing by dropping an app on its target empty position in the editor. The engine remembers those pins per device and sends them with the corresponding page IDs.
+iOS stores pinned empty cells in `listMetadata` → `fixedLocations`, keyed by page ID. Dictionary-format reads expose that position data; ordinary USB list reads use the engine's remembered pins. Create the desired spacing by dropping an app on its target empty position in the editor. The engine remembers those pins per device and sends them with the corresponding page IDs.
+
+Pins and remembered gaps retain page ownership, including separate copies of the same app on different pages. Remembered coordinates retain their saved grid; a later Read maps their row and column to the current grid and clears a page's remembered gaps if they no longer fit. Older gap files migrate keys that identify a single item.
 
 On iOS 16, use sequential app order and keep folders after widgets originally read at a page’s start. New fixed positions are rejected with placement guidance. On iOS 17, 18, 26 and 27, the engine uses fixed-position editing. See [version-family layout modes](COMPATIBILITY.md).
 
@@ -43,6 +45,12 @@ On iOS 16, use sequential app order and keep folders after widgets originally re
 Validation checks page, Dock and folder capacities; item duplication or loss; nested folders or widgets inside folders; and an empty App Bank. A standard iPhone 4×6 page has 24 slots; small, medium and large widgets occupy 4, 8 and 16 slots; the Dock holds 4 apps; folders hold 9 items per page. iPad capacities follow the device’s icon metrics.
 
 Apply requires the token from the latest layout comparison. The session refreshes device identity and layout, saves a backup with provenance, writes the draft and reads back the result. Restore checks that backup provenance matches the selected device and also saves a backup before writing. An interrupted or mismatching operation requires a fresh **Read** before continuing.
+
+Read checks that both device-info observations agree on the effective page, Dock and folder capacities. Apply and Restore check those capacities against the loaded draft before backup/write and after readback. A changed frame requires Read; a change detected after writing leaves the result unknown and pending. Unavailable metrics retain the standard iPhone fallback.
+
+Drafts and undo history retain local node identities separately from device identifiers, so rearranging or renaming folders preserves pin ownership. Older drafts with ambiguous pin identities require Read; their saved draft remains intact until that Read succeeds. Unknown write outcomes preserve the reviewed draft and history.
+
+Since 1.2.1, pinned backups require saved grid dimensions for Restore. Trusted unpinned legacy backups remain supported. Restore maps saved pin coordinates to the loaded grid and checks every item's footprint before writing.
 
 `HOMESCREEN_READ_ONLY=1` blocks Apply and Restore across the app, CLI and MCP while allowing local draft editing. MCP writes additionally require `HOMESCREEN_ALLOW_APPLY=1`; see [MCP write controls](MCP.md#data-and-write-controls).
 
