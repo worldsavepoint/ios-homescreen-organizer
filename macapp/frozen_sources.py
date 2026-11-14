@@ -118,6 +118,52 @@ def project_release_version(root, installed):
 LAUNCHER_DIGEST = "sha256-unsigned-macho64-linkedit-align16-v2"
 
 
+def valid_inline_command(data, offset, length, command, cpu):
+    fixed = {0x1A: 72, 0x1B: 24, 0x24: 16, 0x25: 16, 0x2A: 16, 0x2F: 16, 0x30: 16}
+    if command in fixed:
+        return length == fixed[command]
+    if command == 0x32:
+        return length >= 24 and length == 24 + 8 * struct.unpack_from("<I", data, offset + 20)[0]
+    dylibs = {0xC, 0xD, 0x80000018, 0x8000001F, 0x20, 0x80000023}
+    strings = {0xE, 0xF, 0x12, 0x13, 0x14, 0x15, 0x8000001C}
+    header = 24 if command in dylibs else 12 if command in strings else 20 if command == 0x10 else 0
+    if header:
+        if length < header:
+            return False
+        start = struct.unpack_from("<I", data, offset + 8)[0]
+        if start < header or start >= length or data.find(b"\0", offset + start, offset + length) < 0:
+            return False
+        if command == 0x10:
+            modules, bitmap = struct.unpack_from("<II", data, offset + 12)
+            if modules and (bitmap < header or bitmap + (modules + 7) // 8 > length):
+                return False
+        return True
+    if command in (4, 5):
+        cursor, end = offset + 8, offset + length
+        if cursor == end:
+            return False
+        while cursor + 8 <= end:
+            flavor, count = struct.unpack_from("<II", data, cursor)
+            if (flavor, count) != ({0x0100000C: (6, 68), 0x01000007: (4, 42)}[cpu]):
+                return False
+            cursor += 8 + count * 4
+        return cursor == end
+    if command == 0x2D:
+        if length < 16:
+            return False
+        count = struct.unpack_from("<I", data, offset + 8)[0]
+        cursor, end = offset + 12, offset + length
+        if count > end - cursor:
+            return False
+        for _ in range(count):
+            terminator = data.find(b"\0", cursor, end)
+            if terminator < 0:
+                return False
+            cursor = terminator + 1
+        return (cursor - offset + 7) // 8 * 8 == length and not any(data[cursor:end])
+    return False
+
+
 def canonical_launcher_payload(data):
     error = "Could not canonicalize the native launcher"
     if len(data) < 32:
@@ -128,9 +174,6 @@ def canonical_launcher_payload(data):
         raise ValueError(error)
     offset, end, linkedit, references = 32, 32 + size, None, []
     linkedit_commands = {0x1E, 0x26, 0x29, 0x2B, 0x2E, 0x80000033, 0x80000034, 0x36, 0x37, 0x38}
-    inline_commands = {0x4, 0x5, 0xC, 0xD, 0xE, 0xF, 0x10, 0x12, 0x13, 0x14, 0x15,
-                       0x80000018, 0x1A, 0x1B, 0x8000001C, 0x8000001F, 0x20, 0x80000023,
-                       0x24, 0x25, 0x2A, 0x2D, 0x2F, 0x30, 0x32}
     for _ in range(count):
         if offset + 8 > end:
             raise ValueError(error)
@@ -186,7 +229,7 @@ def canonical_launcher_payload(data):
             if length != 24:
                 raise ValueError(error)
             references.append((struct.unpack_from("<Q", data, offset + 8)[0], 1))
-        elif command not in inline_commands:
+        elif not valid_inline_command(data, offset, length, command, cpu):
             raise ValueError(error)
         offset += length
     if (offset != end or linkedit is None

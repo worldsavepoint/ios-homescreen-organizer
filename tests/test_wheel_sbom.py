@@ -198,3 +198,25 @@ def test_unverified_wheel_is_never_rewritten(tmp_path, damage):
     with pytest.raises(ValueError, match="wheel"):
         rewrite_cryptography_wheel(wheel)
     assert wheel.read_bytes() == before
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_rewrite_preserves_global_comment_and_keeps_unknown_private_metadata_visible(tmp_path, private):
+    from check_package_paths import check_archive, BuildPathError
+    from wheel_sbom import rewrite_cryptography_wheel
+    wheel, _ = make_wheel(tmp_path)
+    root = Path("/private/unrecognized-archive-metadata")
+    comment = bytes(root) + b"/worker" if private else b"unchanged wheel metadata\xff\0"
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.comment = comment
+    if private:
+        with pytest.raises(BuildPathError):
+            check_archive(wheel, [root], engine=None)
+    rewrite_cryptography_wheel(wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        assert archive.comment == comment
+    if private:
+        with pytest.raises(BuildPathError):
+            check_archive(wheel, [root], engine=None)
+    else:
+        check_archive(wheel, [root], engine=None)

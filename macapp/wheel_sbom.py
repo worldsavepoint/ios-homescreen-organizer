@@ -90,6 +90,7 @@ def rewrite_cryptography_wheel(wheel):
         if wheel.is_symlink() or not wheel.is_file():
             raise ValueError
         with zipfile.ZipFile(wheel) as archive:
+            comment = archive.comment
             entries = archive.infolist()
             names = [entry.filename for entry in entries]
             if (len(names) != len(set(names)) or SBOM not in names or RECORD not in names
@@ -123,6 +124,7 @@ def rewrite_cryptography_wheel(wheel):
             temporary = Path(stream.name)
         try:
             with zipfile.ZipFile(temporary, "w") as archive:
+                archive.comment = comment
                 for entry in entries:
                     archive.writestr(entry, files[entry.filename])
             temporary.chmod(stat.S_IMODE(wheel.stat().st_mode))
