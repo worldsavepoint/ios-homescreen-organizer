@@ -78,7 +78,7 @@ def _page(page: list[Node], lay: Layout, pos: _PageCells) -> list[dict[str, Any]
     return out
 
 
-def _usage_view(lay: Layout, u: dict[str, Any] | None, original: Callable[[], Layout]) -> dict[str, Any] | None:
+def _usage_view(lay: Layout, u: dict[str, Any] | None, original: Layout) -> dict[str, Any] | None:
     if u is None:
         return None
     if not u.get("ok"):
@@ -86,7 +86,7 @@ def _usage_view(lay: Layout, u: dict[str, Any] | None, original: Callable[[], La
     opens = u["opens"]
     return {"ok": True, "days": u["days"], "source": u.get("source", "mac"), "reports": u.get("reports"),
             "background": [lay.nodes[b].name for b in u.get("background", []) if b in lay.nodes],
-            "original": usage.swipes(original(), opens),
+            "original": usage.swipes(original, opens),
             "now": usage.swipes(lay, opens), "top": usage.top_apps(lay, opens, 12, locations=False)}
 
 
@@ -107,14 +107,14 @@ def _same_fields(a: Any, b: Any) -> bool:
     return a == b
 
 
-def _has_changes(lay: Layout, original: Callable[[], Layout]) -> bool:
+def _has_changes(lay: Layout, original: Layout) -> bool:
     if (lay.bank or lay.pins != lay.source_pins or
             lay.identity()["ids"] != lay.source_identity["ids"] or
             not _same_fields(lay.to_library(), lay.source_library)):
         return True
     state = lay.to_state()
     # Serialization normalizes imported folders with unnamed or empty subpages.
-    return not _same_fields(state, lay.source) and not _same_fields(state, original().to_state())
+    return not _same_fields(state, lay.source) and not _same_fields(state, original.to_state())
 
 
 def _original_cells(original: Layout, lay: Layout, current_cells: dict[int, _PageCells],
@@ -255,23 +255,16 @@ def view(s=None) -> dict[str, Any]:
             result["draft_error"] = s._draft_error
         return result
     lay = s.layout
-    d = lay.diff()
-    baseline = None
-
-    def original() -> Layout:
-        nonlocal baseline
-        if baseline is None:
-            baseline = lay.original()
-        return baseline
-
+    original = lay.original()
+    d = lay.diff(original)
     has_changes = _has_changes(lay, original)
     new_cells = {page: lay.place(nodes)[0] for page, nodes in enumerate(lay.pages, 1)}
     old_cells = {}
     placements = {}
     if has_changes:
         pins = {key for key in lay.pins.keys() | lay.source_pins.keys() if lay.pins.get(key) != lay.source_pins.get(key)}
-        old_cells = _original_cells(original(), lay, new_cells, pins)
-        placements = _placement_changes(lay, original(), pins, old_cells, new_cells)
+        old_cells = _original_cells(original, lay, new_cells, pins)
+        placements = _placement_changes(lay, original, pins, old_cells, new_cells)
     moved = {}
     if d["moves"]:
         for node in lay.nodes.values():
@@ -284,8 +277,8 @@ def view(s=None) -> dict[str, Any]:
     changed_ids = moved.keys() | placements.keys()
     wanted = changed_ids | {usage_ids[row["id"]] for row in top}
     physical = set(placements)
-    qualified = lay.qualified_folders(original()) if changed_ids else lay.qualified_folders()
-    old = _locations(original(), changed_ids, physical, old_cells, qualified) if changed_ids else {}
+    qualified = lay.qualified_folders(original) if changed_ids else lay.qualified_folders()
+    old = _locations(original, changed_ids, physical, old_cells, qualified) if changed_ids else {}
     new = _locations(lay, wanted, physical, new_cells, qualified) if wanted else {}
     labels = dict(old.values())
     labels.update(new.values())

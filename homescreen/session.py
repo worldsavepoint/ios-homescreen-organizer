@@ -338,19 +338,22 @@ def node_pins(lay: Layout, keyed: dict[str, Any] | list[dict[str, int]], by_memo
 def _retains_pins(requested: Layout, observed: Layout, memory: dict[str, Any] | None = None) -> bool:
     instances = _instance_ids(requested, memory or {})
     for index, page in enumerate(requested.pages):
-        for owner in page:
-            if owner.id not in requested.pins:
-                continue
+        pinned = [node for node in page if node.id in requested.pins]
+        if not pinned:
+            continue
+        others = observed.pages[index] if index < len(observed.pages) else []
+        requested_shapes = {node.id: node_structure(node) for node in page}
+        observed_shapes = {node.id: node_structure(node) for node in others}
+        for owner in pinned:
             cell = requested.pins[owner.id]
-            others = observed.pages[index] if index < len(observed.pages) else []
-            shape = node_structure(owner)
-            matches = [node for node in others if node_structure(node) == shape]
+            shape = requested_shapes[owner.id]
+            matches = [node for node in others if observed_shapes[node.id] == shape]
             if owner.kind == "folder":
                 wire = pin_key(owner)
                 same_wire = [node for node in others if wire and pin_key(node) == wire]
                 if same_wire:
-                    matches = [node for node in same_wire if node_structure(node) == shape]
-                elif owner.id in instances or sum(node_structure(node) == shape for node in page) != 1:
+                    matches = [node for node in same_wire if observed_shapes[node.id] == shape]
+                elif owner.id in instances or sum(value == shape for value in requested_shapes.values()) != 1:
                     return False
             if len(matches) != 1 or observed.pins.get(matches[0].id) != cell:
                 return False
@@ -596,7 +599,7 @@ class Session:
     def _save_draft(self) -> None:
         assert self.layout is not None
         blob = {"device": self.device_id, "info": self.info, "draft_revision": uuid.uuid4().hex,
-                **self.layout.snapshot()}
+                **self.layout.current_fields(), **self.layout.baseline()}
         blob["placement_revision"] = self._placement_revision
         if self._page_identity is not _MISSING:
             blob["source_page_identity"] = self._page_identity
@@ -679,17 +682,17 @@ class Session:
     def _snap(self) -> dict[str, Any]:
         return self.require().snapshot()
 
-    def _history_snapshot(self) -> dict[str, Any]:
-        lay = self.require()
+    def _history_snapshot(self, detached: Layout | None = None) -> dict[str, Any]:
+        lay = self.require() if detached is None else detached
         baseline = lay.baseline()
         if baseline != self._history_baseline:
-            self._history_baseline = copy.deepcopy(baseline)
-        return {**lay.current_snapshot(), **self._history_baseline}
+            self._history_baseline = copy.deepcopy(baseline) if detached is None else baseline
+        fields = lay.current_snapshot() if detached is None else lay.current_fields()
+        return {**fields, **self._history_baseline}
 
     def edit(self, fn: Callable[[Layout], Any], *, expected: dict | None = None) -> Any:
         """Run fn on the draft as one undoable step. If it raises, the draft is left untouched."""
         with self._exclusive(expected=expected):
-            snapshot = self._history_snapshot()
             before = copy.deepcopy(self.require())
             try:
                 out = fn(self.require())
@@ -700,7 +703,7 @@ class Session:
             except BaseException:
                 self.layout = before
                 raise
-            self._undo.append(snapshot)
+            self._undo.append(self._history_snapshot(before))
             del self._undo[:-MAX_UNDO]
             self._redo.clear()
             return out

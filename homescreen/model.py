@@ -213,10 +213,13 @@ class Layout:
         for node in nodes:
             self._reserve_wire_id(node.id)
 
+    def current_fields(self) -> dict[str, Any]:
+        return {"state": self.to_state(), "library": self.to_library(), "bank": self.to_bank(),
+                "pins": self.pins, "identity": self.identity(), "grid": self.grid.to_dict()}
+
     def current_snapshot(self) -> dict[str, Any]:
         """An undo step owns its editable state and local allocation identities."""
-        return copy.deepcopy({"state": self.to_state(), "library": self.to_library(), "bank": self.to_bank(),
-                              "pins": self.pins, "identity": self.identity(), "grid": self.grid.to_dict()})
+        return copy.deepcopy(self.current_fields())
 
     def baseline(self) -> dict[str, Any]:
         return {"source": self.source, "source_library": self.source_library, "source_pins": self.source_pins,
@@ -676,7 +679,7 @@ class Layout:
 
     # ---- checks -----------------------------------------------------------------
 
-    def validate(self) -> list[str]:
+    def validate(self, original: "Layout | None" = None) -> list[str]:
         """Problems that would make iOS reflow or drop things. Empty list = OK."""
         errs = []
         if self.bank:
@@ -691,7 +694,8 @@ class Layout:
         # of single-cell items) is trusted: iPad widget sizes don't map onto the icon grid the way
         # iPhone ones do, so a widget page can look "too full" here
         shape = lambda p: tuple(n.id if n.kind == "widget" else 1 for n in p)
-        as_read = {shape(p) for p in self.original().pages}
+        src = self.original() if original is None else original
+        as_read = {shape(p) for p in src.pages}
         for i, page in enumerate(self.pages, 1):
             if not page:
                 errs.append(f"page {i} is empty (iOS keeps it as a blank page; use remove_empty)")
@@ -709,7 +713,7 @@ class Layout:
                             errs.append(f"folder {n.name!r} page {j} has {len(fp)} items (max {self.grid.folder})")
                         if any(c.kind in ("folder", "widget") for c in fp):
                             errs.append(f"folder {n.name!r} contains a folder or widget")
-        before = sorted(self.original().leaf_ids())
+        before = sorted(src.leaf_ids())
         after = sorted(self.leaf_ids())
         if before != after:
             lost = sorted(set(before) - set(after))
@@ -803,10 +807,10 @@ class Layout:
             out["App Bank"] = [n.id for n in self.bank]
         return out
 
-    def diff(self) -> dict[str, Any]:
+    def diff(self, original: "Layout | None" = None) -> dict[str, Any]:
         """Items that really moved: changed container, or broke relative order within one.
         Icons that only slid over because a neighbor moved don't count."""
-        src = self.original()
+        src = self.original() if original is None else original
         qualified = self.qualified_folders(src)
         old, new = src.positions(qualified), self.positions(qualified)
         old_c, new_c = src.containers(), self.containers()
@@ -827,7 +831,7 @@ class Layout:
             "gaps_changed": len({k for k in set(self.pins) | set(self.source_pins)
                                  if self.pins.get(k) != self.source_pins.get(k)}),
             "moves": {f"{names[k]} [{k}]": v for k, v in sorted(moved.items(), key=lambda kv: kv[1])},
-            "problems": self.validate(),
+            "problems": self.validate(src),
             "apply_token": self.token(),
         }
 
