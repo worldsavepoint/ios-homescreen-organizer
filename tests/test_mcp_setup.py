@@ -34,7 +34,7 @@ print(String(decoding: data, as: UTF8.self))
 ''')
     binary = folder / "mcp-setup"
     result = subprocess.run(["swiftc", "-module-cache-path", str(folder / "modules"),
-                             str(source), *[str(source.with_name(name)) for name in ("MCPClientManager.swift", "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift")], str(harness), "-o", str(binary)],
+                             str(source), *[str(source.with_name(name)) for name in ("MCPClientManager.swift", "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift", "MCPJSON.swift")], str(harness), "-o", str(binary)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     return binary

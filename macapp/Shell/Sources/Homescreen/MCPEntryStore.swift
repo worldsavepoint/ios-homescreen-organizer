@@ -9,7 +9,28 @@ enum MCPOwnedEntry: Equatable, Codable {
     init(_ object: Any?) throws {
         guard let object else { self = .absent; return }
         guard let dictionary = object as? NSDictionary else { throw MCPClientOperationCode.snapshotReadFailed }
-        self = .present(String(decoding: try JSONSerialization.data(withJSONObject: dictionary, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self))
+        self = .present(try MCPJSON.text(dictionary))
+    }
+
+    private enum CodingKeys: String, CodingKey { case absent, present }
+    private enum ValueKeys: String, CodingKey { case value = "_0" }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.absent) { self = .absent; return }
+        let value = try container.nestedContainer(keyedBy: ValueKeys.self, forKey: .present)
+        let json = try value.decode(String.self, forKey: .value)
+        try self.init(MCPJSON.decode(Data(json.utf8)))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .absent: _ = container.nestedContainer(keyedBy: ValueKeys.self, forKey: .absent)
+        case .present(let json):
+            var value = container.nestedContainer(keyedBy: ValueKeys.self, forKey: .present)
+            try value.encode(json, forKey: .value)
+        }
     }
 
     private static func validateWritable(_ dictionary: NSDictionary) throws {
@@ -32,7 +53,7 @@ enum MCPOwnedEntry: Equatable, Codable {
 
     func dictionary() throws -> NSDictionary? {
         guard case .present(let json) = self else { return nil }
-        guard let dictionary = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? NSDictionary else {
+        guard let dictionary = try MCPJSON.decode(Data(json.utf8)) as? NSDictionary else {
             throw MCPClientOperationCode.snapshotReadFailed
         }
         return dictionary
@@ -163,13 +184,13 @@ struct MCPEntryStore {
             let customOAuth = !(environment["CLAUDE_CODE_CUSTOM_OAUTH_URL"] ?? "").isEmpty
             let url = try exists(legacy) ? legacy : (override ?? home).appendingPathComponent(customOAuth ? ".claude-custom-oauth.json" : ".claude.json")
             guard try exists(url) else { return MCPUserSnapshot(file: url.path, entry: .absent) }
-            guard let root = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] else { throw MCPClientOperationCode.snapshotReadFailed }
+            guard let root = try MCPJSON.decode(Data(contentsOf: url)) as? [String: Any] else { throw MCPClientOperationCode.snapshotReadFailed }
             return try MCPUserSnapshot(file: url.path, entry: .from(root, table: "mcpServers"))
         }
         let result = try await MCPSubprocess.session(executable, ["app-server"], environment, timeout) { io in
             try initialize(&io)
             try io.send(["id": 2, "method": "config/read", "params": ["includeLayers": true, "cwd": effective ? cwd as Any : NSNull()]])
-            return try io.receive(2, mcp: false)
+            return try io.receive(2, mcp: false, preserveNumbers: true)
         }
         guard let layers = result["layers"] as? [[String: Any]] else { throw MCPClientOperationCode.unsupportedClient }
         var user: MCPUserSnapshot?
@@ -280,12 +301,13 @@ struct MCPEntryStore {
         do {
             let edit: [String: Any] = ["keyPath": "mcp_servers." + MCPClientRegistration.serverID,
                                        "mergeStrategy": "replace", "value": try prior.object() as Any? ?? NSNull()]
+            let request = try MCPJSON.text(["id": 2, "method": "config/batchWrite",
+                "params": ["edits": [edit], "expectedVersion": version, "filePath": snapshot.file]])
             reply = try await MCPSubprocess.session(executable, ["app-server"], environment, timeout) { io in
                 try initialize(&io)
                 var started = false
                 do {
-                    try io.send(["id": 2, "method": "config/batchWrite",
-                                 "params": ["edits": [edit], "expectedVersion": version, "filePath": snapshot.file]]) { started = true }
+                    try io.send(Data(request.utf8)) { started = true }
                     return .success(try io.receive(2, mcp: false, codexBatchWrite: true))
                 } catch where started { return .failure(error) }
             }

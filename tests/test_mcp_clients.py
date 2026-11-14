@@ -1,5 +1,6 @@
 """Native client operations and startup checks use isolated executable fixtures."""
 import json
+from decimal import Decimal
 import os
 from pathlib import Path
 import shutil
@@ -33,7 +34,7 @@ def test_subprocess_builds_with_supported_sdks_and_uses_child_directory(tmp_path
 ''')
     binary = tmp_path / "runner"
     modules = [source / name for name in ("MCPClientManager.swift", "MCPServiceCheck.swift",
-               "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift")]
+               "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift", "MCPJSON.swift")]
     build = subprocess.run(["xcrun", "swiftc", "-swift-version", "5", "-parse-as-library",
                             "-target", "arm64-apple-macosx14.0", "-sdk", str(sdk),
                             "-module-cache-path", str(tmp_path / "modules"),
@@ -56,7 +57,7 @@ def native_mcp_binary(tmp_path_factory):
         pytest.skip("Swift compiler unavailable")
     folder = tmp_path_factory.mktemp("native-mcp")
     sources = [ROOT / "macapp/Shell/Sources/Homescreen" / name for name in
-               ("MCPClientManager.swift", "MCPServiceCheck.swift", "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift")]
+               ("MCPClientManager.swift", "MCPServiceCheck.swift", "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift", "MCPJSON.swift")]
     assert all(source.is_file() for source in sources), "Native client and service-check modules are required"
     harness = folder / "Harness.swift"
     harness.write_text('''import Foundation
@@ -187,6 +188,8 @@ if args == ["app-server"]:
     initialized = False
     ready = False
     for line in sys.stdin:
+        if os.getenv("TEST_WIRE"):
+            with open(os.environ["TEST_WIRE"], "a") as wire: wire.write(line)
         request = json.loads(line)
         assert "jsonrpc" not in request
         method, params = request["method"], request["params"]
@@ -324,6 +327,7 @@ if args == ["app-server"]:
                     store.with_suffix(".intended").write_text(json.dumps(value))
                     if cas == "refresh-failed": entries[key] = value
                 elif cas == "owned": entries[key]["advanced"] = [1]
+                elif cas == "numeric": entries[key]["numeric"] = json.loads(os.environ["TEST_CAS_NUMBER"])
                 elif cas == "bounce":
                     entries[key] = {"command":"/external","args":["mcp"],"env":{}}
                     store.with_suffix(".read-stage").write_text("conflict")
@@ -384,7 +388,10 @@ if args == ["app-server"]:
                     print(json.dumps({"id":2,"error":{"code":-32603,"message":"write rejected"}}),flush=True)
                     continue
         else: raise AssertionError(method)
-        print(json.dumps({"id":request["id"], "result":result}), flush=True)
+        wire = json.dumps({"id":request["id"], "result":result})
+        if method == "config/read" and os.getenv("TEST_NUMBER_TOKEN"):
+            wire = wire.replace('"fixture-number-token"', os.environ["TEST_NUMBER_TOKEN"])
+        print(wire, flush=True)
     sys.exit(0)
 def save():
     store.write_text(json.dumps(entries))
@@ -951,6 +958,103 @@ def seed_user(sandbox, **extra):
     store.write_text(json.dumps(entries))
     (Path(sandbox["HOME"])/".claude.json").write_text(json.dumps({"mcpServers":entries}))
     return store,entries
+
+
+def typed_json(text):
+    def real(token):
+        value = Decimal(token)
+        return ("real", value, token.startswith("-") if value == 0 else False)
+    return json.loads(text, parse_float=real, parse_int=lambda token: ("integer", int(token)))
+
+
+@pytest.mark.parametrize("client", ["codex", "claudeCode"])
+def test_passive_json_numeric_kinds_survive_registration_and_wire(native_mcp_binary, sandbox, tmp_path, client):
+    options = {"integer":12, "real":12.0, "boolean":True, "unit":1.0, "negativeZero":-0.0,
+               "positiveZero":0.0, "nested":[1.25, 1e-200, 5e-324, -9223372036854775808, 9007199254740993, 18446744073709551615]}
+    store, prior = seed_user(sandbox, numeric=options, nested={"options":options})
+    cli = fake_client(tmp_path)
+    wire = tmp_path / "wire.jsonl"
+    result = execute(native_mcp_binary, {**sandbox,"TEST_WIRE":str(wire)}, "register", client, cli, "/new")
+    assert result["code"] == "success"
+    expected = typed_json(json.dumps(options))
+    saved = typed_json(store.read_text())[SERVER_ID]
+    assert saved["numeric"] == expected and saved["nested"]["options"] == expected
+    if client == "codex":
+        batches = [typed_json(line)["params"]["edits"][0]["value"] for line in wire.read_text().splitlines()
+                   if json.loads(line)["method"] == "config/batchWrite"]
+        assert batches and all(value["numeric"] == expected for value in batches)
+    else:
+        adds = [json.loads(line) for line in Path(sandbox["TEST_LOG"]).read_text().splitlines()
+                if json.loads(line)[:2] == ["mcp", "add-json"]]
+        assert len(adds) == 1 and typed_json(adds[0][-1])["numeric"] == expected
+    assert typed_json(json.dumps(prior))[SERVER_ID]["numeric"] == expected
+
+
+@pytest.mark.parametrize("client", ["codex", "claudeCode"])
+@pytest.mark.parametrize("initial,outside", [(12.0,12), (1.0,True), (-0.0,0.0), (12.0,12.0), (12,12.0)])
+def test_interrupted_numeric_registration_preserves_outside_kind_and_sign(native_mcp_binary, sandbox, tmp_path, client, initial, outside):
+    store, prior = seed_user(sandbox, numeric=initial)
+    cli = fake_client(tmp_path)
+    proc = subprocess.run([native_mcp_binary,"register",client,cli,"/new"],
+                          env={**sandbox,"TEST_INTERRUPT":"add"},capture_output=True,timeout=10)
+    assert proc.returncode == -9
+    edited = json.loads(store.read_text())
+    edited[SERVER_ID]["numeric"] = outside
+    store.write_text(json.dumps(edited))
+    config = Path(sandbox["HOME"]) / ".claude.json"
+    config.write_text(json.dumps({"mcpServers":edited}))
+    before = store.read_bytes()
+    attempts = mutations(sandbox)
+    matching = typed_json(json.dumps(initial)) == typed_json(json.dumps(outside))
+    journal = journal_file(sandbox).with_name(client + ".json")
+    if type(initial) is int:
+        record = json.loads(journal.read_text())
+        for field in ("prior", "intended", "observed"):
+            if record.get(field, {}).get("present"):
+                envelope = record[field]["present"]
+                envelope["_0"] = json.dumps(json.loads(envelope["_0"]), sort_keys=True, ensure_ascii=True)
+        journal.write_text(json.dumps(record))
+    result = execute(native_mcp_binary,sandbox,"recover",client,cli)
+    assert result["code"] == ("success" if matching else "recoveryConflict")
+    if matching:
+        assert typed_json(store.read_text()) == typed_json(json.dumps(prior)) and not journal.exists()
+    else:
+        assert store.read_bytes() == before and journal.exists() and mutations(sandbox) == attempts
+
+
+@pytest.mark.parametrize("initial,outside", [(12.0,12), (1.0,True), (-0.0,0.0)])
+def test_numeric_only_codex_cas_conflict_preserves_external_value(native_mcp_binary,sandbox,tmp_path,initial,outside):
+    store, _ = seed_user(sandbox, numeric=initial)
+    cli = fake_client(tmp_path)
+    env = {**sandbox,"TEST_CAS":"numeric","TEST_CAS_NUMBER":json.dumps(outside)}
+    result = execute(native_mcp_binary,env,"register","codex",cli,"/new")
+    assert result["code"] == "recoveryConflict"
+    assert typed_json(store.read_text())[SERVER_ID]["numeric"] == typed_json(json.dumps(outside))
+    assert mutations(sandbox) == ["replace"] and journal_file(sandbox).exists()
+
+
+@pytest.mark.parametrize("client", ["codex", "claudeCode"])
+def test_unsupported_real_precision_fails_before_mutation(native_mcp_binary,sandbox,tmp_path,client):
+    store, prior = seed_user(sandbox,numeric="fixture-number-token")
+    cli = fake_client(tmp_path)
+    token = "1.23456789012345678"
+    if client == "claudeCode":
+        config = Path(sandbox["HOME"]) / ".claude.json"
+        config.write_text(config.read_text().replace('"fixture-number-token"', token))
+    before = store.read_bytes()
+    result = execute(native_mcp_binary,{**sandbox,"TEST_NUMBER_TOKEN":token},"register",client,cli,"/new")
+    assert result["code"] == "snapshotReadFailed"
+    assert store.read_bytes() == before and mutations(sandbox) == []
+    assert not journal_file(sandbox).with_name(client + ".json").exists()
+
+
+@pytest.mark.parametrize("token", ["12.000", "1e0", "-0.00e10", "1.2345678901234567"])
+def test_equivalent_real_spellings_keep_kind_and_value(native_mcp_binary,sandbox,tmp_path,token):
+    store, _ = seed_user(sandbox,numeric="fixture-number-token")
+    cli = fake_client(tmp_path)
+    result = execute(native_mcp_binary,{**sandbox,"TEST_NUMBER_TOKEN":token},"register","codex",cli,"/new")
+    assert result["code"] == "success"
+    assert typed_json(store.read_text())[SERVER_ID]["numeric"] == typed_json(token)
 
 
 def test_owned_process_group_prevents_late_apply(native_mcp_binary,sandbox,tmp_path):

@@ -193,7 +193,11 @@ struct MCPChildIO {
     }
 
     func send(_ object: [String: Any], onFirstWrite: (() -> Void)? = nil) throws {
-        var bytes = try JSONSerialization.data(withJSONObject: object)
+        try send(JSONSerialization.data(withJSONObject: object), onFirstWrite: onFirstWrite)
+    }
+
+    func send(_ data: Data, onFirstWrite: (() -> Void)? = nil) throws {
+        var bytes = data
         bytes.append(10)
         guard bytes.count <= Self.limit else { throw MCPClientOperationCode.invalidResponse }
         let fd = input.fileDescriptor
@@ -210,7 +214,7 @@ struct MCPChildIO {
         }
     }
 
-    mutating func receive(_ id: Int, mcp: Bool, codexBatchWrite: Bool = false) throws -> [String: Any] {
+    mutating func receive(_ id: Int, mcp: Bool, codexBatchWrite: Bool = false, preserveNumbers: Bool = false) throws -> [String: Any] {
         while true {
             if let newline = pending.firstIndex(of: 10) {
                 let line = pending.prefix(upTo: newline)
@@ -251,6 +255,11 @@ struct MCPChildIO {
                     throw MCPClientOperationCode.commandFailed
                 }
                 guard let result = message["result"] as? [String: Any] else { throw MCPClientOperationCode.invalidResponse }
+                if preserveNumbers {
+                    guard let typed = try MCPJSON.decode(Data(line), validated: true) as? [String: Any],
+                          let result = typed["result"] as? [String: Any] else { throw MCPClientOperationCode.invalidResponse }
+                    return result
+                }
                 return result
             }
             try wait(output.fileDescriptor, events: Int16(POLLIN))
