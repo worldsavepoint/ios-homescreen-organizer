@@ -553,13 +553,14 @@ async def _connected() -> dict[str, dict[str, Any]]:
     for d in sorted(devs, key=lambda d: d.connection_type != "USB"):  # USB first
         if d.serial in out:
             continue
-        if d.serial not in _names:
+        if not _names.get(d.serial):
             try:
                 v = (await create_using_usbmux(serial=d.serial)).all_values
                 _names[d.serial] = {"name": v.get("DeviceName"), "model": v.get("ProductType"),
                                     "version": v.get("ProductVersion"), "class": v.get("DeviceClass")}
             except Exception:
                 pass  # Discovery still identified the transport when device details are unavailable.
+        _names.setdefault(d.serial, {})
         out[d.serial] = {**_names.get(d.serial, {}), "connection": "USB" if d.connection_type == "USB" else "Wi-Fi"}
     return out
 
@@ -576,10 +577,16 @@ async def get_devices(request: Request) -> Response:
         connected = {}
         discovery = "unavailable"
     known = config.known_devices()
+    remembered = known
+    current = config.current_device()
+    if discovery == "unavailable":
+        remembered = {**_names, **{u: {**_names.get(u, {}), **k} for u, k in known.items()}}
+        if current:
+            remembered.setdefault(current, {})
     devices = [{"udid": u, **known.get(u, {}), **c, "connected": True, "draft": u in known} for u, c in connected.items()]
-    devices += [{"udid": u, **k, "connected": False if discovery == "complete" else None, "draft": True}
-                for u, k in known.items() if u not in connected]
-    return JSONResponse({"switching": True, "current": config.current_device(), "devices": devices, "discovery": discovery})
+    devices += [{"udid": u, **k, "connected": False if discovery == "complete" else None, "draft": u in known}
+                for u, k in remembered.items() if u not in connected]
+    return JSONResponse({"switching": True, "current": current, "devices": devices, "discovery": discovery})
 
 
 async def post_device(request: Request) -> Response:

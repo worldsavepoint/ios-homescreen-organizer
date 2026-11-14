@@ -179,3 +179,38 @@ def test_discovery_failure_retains_known_devices_with_unknown_status(pair, monke
     monkeypatch.setattr(usbmux, "list_devices", empty)
     result = json.loads(asyncio.run(ui.get_devices(request({}))).body)
     assert result["discovery"] == "complete" and all(row["connected"] is False for row in result["devices"])
+
+
+@pytest.mark.parametrize("case", ["discovered", "selected", "no-details"])
+def test_unavailable_discovery_retains_a_previously_seen_device_without_a_draft(pair, monkeypatch, case):
+    from types import SimpleNamespace
+    from pymobiledevice3 import lockdown, usbmux
+    first, _ = pair
+    monkeypatch.setattr(ui, "_names", {})
+    async def found():
+        return [SimpleNamespace(serial="new", connection_type="USB")]
+    async def details(**kwargs):
+        if case == "no-details":
+            raise ConnectionError("details unavailable")
+        return SimpleNamespace(all_values={"DeviceName": "New device"})
+    async def failed():
+        raise ConnectionError("discovery unavailable")
+    monkeypatch.setattr(usbmux, "list_devices", found)
+    monkeypatch.setattr(lockdown, "create_using_usbmux", details)
+    normal = json.loads(asyncio.run(ui.get_devices(request({}))).body)
+    assert any(row["udid"] == "new" and row["connected"] is True and not row["draft"] for row in normal["devices"])
+    if case == "selected":
+        source = MemorySource()
+        source.udid = "new"
+        config._sessions["new"] = Session(source, first.dir, device="new")
+        response = asyncio.run(ui.post_device(request({"binding": first.binding, "udid": "new"})))
+        assert response.status_code == 200
+    monkeypatch.setattr(usbmux, "list_devices", failed)
+    unavailable = json.loads(asyncio.run(ui.get_devices(request({}))).body)
+    assert unavailable["discovery"] == "unavailable"
+    new = next(row for row in unavailable["devices"] if row["udid"] == "new")
+    assert new["connected"] is None and new["draft"] is False
+    assert unavailable["current"] == ("new" if case == "selected" else "first")
+    monkeypatch.setattr(usbmux, "list_devices", found)
+    recovered = json.loads(asyncio.run(ui.get_devices(request({}))).body)
+    assert recovered["discovery"] == "complete" and any(row["udid"] == "new" and row["connected"] is True for row in recovered["devices"])
