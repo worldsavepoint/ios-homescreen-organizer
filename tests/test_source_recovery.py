@@ -166,3 +166,33 @@ def test_readback_requires_the_retained_opaque_page_fields(tmp_path):
     result = asyncio.run(session.apply(session.require().token()))
     assert not result["ok"] and session._pending_path.exists()
     assert result["backup"] in session.backups()
+
+
+def test_legacy_fixture_pending_is_preserved_as_unresolved_evidence(tmp_path, monkeypatch):
+    raw = {"iconLists": [["a", "b"]]}
+    p = tmp_path / "first" / "phone.plist"
+    p.parent.mkdir()
+    p.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(p), tmp_path / "data")
+    marker = session._pending_path
+    old = b'{"device_id":"fixture-phone","backup":"original.plist","status":"pending"}\n'
+    marker.write_bytes(old)
+    with monkeypatch.context() as patch:
+        def full():
+            raise OSError("storage unavailable")
+        patch.setattr(session, "_save_draft", full)
+        with pytest.raises(OSError):
+            asyncio.run(session.read())
+    assert marker.read_bytes() == old
+    asyncio.run(session.read())
+    assert not marker.exists()
+    preserved = list((session.dir / "unresolved-writes").glob("*.json"))
+    assert len(preserved) == 1 and preserved[0].read_bytes() == old
+    assert asyncio.run(session.apply(session.require().token()))["ok"]
+    second = tmp_path / "second" / "phone.plist"
+    second.parent.mkdir()
+    second.write_bytes(plistlib.dumps(raw))
+    other = Session(FileSource(second), session.dir)
+    asyncio.run(other.read())
+    assert other.device_id != session.device_id and not other.backups()
+    assert preserved[0].read_bytes() == old

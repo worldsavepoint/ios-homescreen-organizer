@@ -971,9 +971,15 @@ class Session:
             raise LayoutError("device grid changed during read; no layout was loaded")
         Layout(state, library=library, grid=grid)  # validate the shape before committing identity
         clear_pending = False
+        legacy_pending = None
         if self._pending_path.exists():
-            pending = json.loads(self._pending_path.read_text())
+            pending_bytes = self._pending_path.read_bytes()
+            pending = json.loads(pending_bytes)
             clear_pending = pending.get("device_id") == device_id
+            if (getattr(self.source, "legacy_fixture_id", None) and
+                    pending.get("device_id") == self.source.legacy_fixture_id and pending.get("status") == "pending"
+                    and isinstance(pending.get("backup"), str) and pending["backup"]):
+                legacy_pending = pending_bytes
         previous = (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
                     self._observed_placement, self._page_identity, self._draft_digest, self._placement_revision)
         if self.layout is not None and device_id == self.device_id:
@@ -996,7 +1002,17 @@ class Session:
                 self._observed_placement = copy.deepcopy(getattr(self.source, "pins", None))
                 self._page_identity = copy.deepcopy(getattr(self.source, "page_identity", {}))
                 self._save_draft()
-                if clear_pending:
+                if legacy_pending is not None:
+                    unresolved = self.dir / "unresolved-writes"
+                    unresolved.mkdir(mode=0o700, exist_ok=True)
+                    path = unresolved / (hashlib.sha256(legacy_pending).hexdigest() + ".json")
+                    try:
+                        _publish_exclusive(path, legacy_pending)
+                    except FileExistsError:
+                        if path.is_symlink() or path.read_bytes() != legacy_pending:
+                            raise LayoutError("unresolved write evidence changed; the pending record was retained")
+                    _sync_directory(self.dir)
+                if clear_pending or legacy_pending is not None:
                     self._clear_pending()
             self._undo, self._redo = [], []
             self._history_baseline = None

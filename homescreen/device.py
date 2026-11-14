@@ -683,6 +683,10 @@ class FileSource:
         self.path = Path(path)
         self.name = f"file:{self.path.name}"
 
+    @property
+    def legacy_fixture_id(self) -> str:
+        return f"fixture-{self.path.stem}"
+
     async def info(self) -> dict[str, Any]:
         identity = hashlib.sha256(os.fsencode(self.path.resolve())).hexdigest()
         return {"DeviceName": f"fixture {self.path.name}", "UniqueDeviceID": f"file-v2-{identity}",
