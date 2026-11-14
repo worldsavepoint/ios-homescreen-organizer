@@ -35,9 +35,15 @@ def tracked_blobs(root, commit):
         raise ValueError(error) from exc
     finally:
         if child.poll() is None:
-            child.terminate()
-        child.stdin.close()
-        child.stdout.close()
+            try:
+                child.terminate()
+            except ProcessLookupError:
+                pass
+        for stream in (child.stdin, child.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:

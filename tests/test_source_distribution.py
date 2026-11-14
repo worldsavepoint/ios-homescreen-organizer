@@ -531,6 +531,38 @@ sys.exit(7 if damage == "exit" else 0)
         list(source_checkout.tracked_blobs(tmp_path, commit))
 
 
+def test_git_batch_broken_input_pipe_preserves_error_and_reaps_child(tmp_path, monkeypatch):
+    import subprocess
+    import source_checkout
+    commit, _ = git_blob_tree(tmp_path)
+    original = subprocess.Popen
+    children = []
+    def started(args, *a, **kw):
+        if "cat-file" in args:
+            args = [sys.executable, "-c", 'import os,sys,time; os.close(0); print("closed",flush=True); time.sleep(30)']
+            process = original(args, *a, **kw)
+            assert process.stdout.readline() == b"closed\n"
+            children.append(process)
+            return process
+        return original(args, *a, **kw)
+    monkeypatch.setattr(subprocess, "Popen", started)
+    try:
+        with pytest.raises(ValueError, match="Git blob"):
+            list(source_checkout.tracked_blobs(tmp_path, commit))
+        child, = children
+        assert child.stdin.closed and child.stdout.closed and child.returncode is not None
+    finally:
+        for child in children:
+            for stream in (child.stdin, child.stdout):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            if child.poll() is None:
+                child.terminate()
+            child.wait()
+
+
 def test_wheel_records_retain_original_direct_requirements():
     from wheelhouse import records
     selected = [record for record in records(ROOT / "requirements-build.lock") if record[0].startswith("chardet-")]
