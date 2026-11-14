@@ -444,6 +444,62 @@ def test_replacement_preserves_permissions_and_drops_managed_prior_pair(tmp_path
     assert sorted(p.suffix for p in output.iterdir()) == ["", ".dmg", ".txt", ".zip"]
 
 
+@pytest.mark.parametrize("prior", [None, "1.2.0"])
+@pytest.mark.parametrize("collision", ["directory", "file", "dangling-link"])
+def test_incoming_native_name_must_be_owned_before_replacement(tmp_path, prior, collision):
+    from macapp.release import app_contents, install_generation
+
+    def generation(version, parent):
+        parent.mkdir()
+        rows = []
+        for suffix in ("zip", "dmg"):
+            name = f"home-screen-organizer-{version}-macos-arm64.{suffix}"
+            data = (version + suffix).encode()
+            (parent / name).write_bytes(data)
+            rows.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+        (parent / "SHA256SUMS.txt").write_text("".join(rows))
+        return parent
+
+    output = tmp_path / "published"
+    if prior:
+        install_generation(generation(prior, tmp_path / "previous"), output, "arm64")
+    else:
+        output.mkdir(mode=0o750)
+    (output / "ordinary").write_bytes(b"keep ordinary sibling")
+    occupied = output / "home-screen-organizer-1.3.0-macos-arm64.zip"
+    if collision == "directory":
+        occupied.mkdir(mode=0o750)
+        (occupied / "notes").write_bytes(b"keep recipient notes")
+    elif collision == "file":
+        occupied.write_bytes(b"keep recipient bytes")
+        occupied.chmod(0o640)
+    else:
+        occupied.symlink_to("missing-recipient-notes")
+    before = app_contents(output)
+    staged = generation("1.3.0", tmp_path / "incoming")
+    with pytest.raises(ValueError, match="occupied"):
+        install_generation(staged, output, "arm64")
+    assert app_contents(output) == before
+    assert not (staged / ".generation").exists()
+
+
+def test_owned_native_pair_can_be_refreshed_in_place(tmp_path):
+    from macapp.release import install_generation
+    output = tmp_path / "published"
+    for index in (0, 1):
+        staged = tmp_path / str(index)
+        staged.mkdir()
+        rows = []
+        for suffix in ("zip", "dmg"):
+            name = f"home-screen-organizer-1.3.0-macos-arm64.{suffix}"
+            data = f"generation {index} {suffix}".encode()
+            (staged / name).write_bytes(data)
+            rows.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+        (staged / "SHA256SUMS.txt").write_text("".join(rows))
+        install_generation(staged, output, "arm64")
+    assert (output / "home-screen-organizer-1.3.0-macos-arm64.zip").read_bytes() == b"generation 1 zip"
+
+
 @pytest.mark.parametrize("inherited", [False, True])
 def test_release_descendant_acls(tmp_path, inherited):
     from macapp.release import install_generation

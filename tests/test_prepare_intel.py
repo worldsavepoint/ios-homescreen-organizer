@@ -16,6 +16,41 @@ def command(folder, name, body):
     return path
 
 
+def test_generated_intel_lock_parses_with_the_selected_backend_wheel(tmp_path):
+    import hashlib
+    import sys
+    import zipfile
+    from macapp.wheelhouse import entries
+
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    command(commands, "lipo", "echo x86_64")
+    command(commands, "otool", 'if [[ "$1" == "-l" ]]; then echo "cmd LC_BUILD_VERSION"; echo "minos 14.0"; fi')
+    wheels = tmp_path / "built"
+    wheels.mkdir()
+    name = "cryptography-50.0.2-cp312-abi3-macosx_14_0_x86_64.whl"
+    with zipfile.ZipFile(wheels / name, "w") as archive:
+        archive.writestr("crypto.so", b"fixture")
+        archive.writestr("cryptography-50.0.2.dist-info/METADATA", "Name: cryptography\nVersion: 50.0.2\n")
+    notice = tmp_path / "LICENSE"
+    notice.write_text("fixture")
+    output = tmp_path / "prepared"
+    output_step = SCRIPT.read_text().split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    subprocess.run([sys.executable, "-", wheels, output, ROOT / "requirements-build-x86_64.lock", notice],
+                   input=output_step, text=True, check=True, capture_output=True,
+                   env={**os.environ, "PATH": f"{commands}:{os.environ['PATH']}"})
+    generated = output / "requirements-build.lock"
+    install = tmp_path / "install.lock"
+    subprocess.run([sys.executable, ROOT / "macapp/wheelhouse.py", generated, "--install-lock", install], check=True)
+    expected = [("maturin-1.14.1-py3-none-macosx_10_12_x86_64.whl",
+                 "f3306078070c1508fd715b9116070cbcaff5959024272a9f1e6f5cb29768b86c"),
+                (name, hashlib.sha256((wheels / name).read_bytes()).hexdigest())]
+    for lock in (generated, install):
+        selected = [(wheel, value) for wheel, value in entries(lock)
+                    if wheel.split("-")[0] in ("maturin", "cryptography")]
+        assert selected == expected
+
+
 @pytest.mark.parametrize("system,architecture,translated", [
     ("Darwin", "arm64", "0"),
     ("Linux", "x86_64", "0"),

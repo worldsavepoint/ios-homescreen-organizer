@@ -229,7 +229,14 @@ def install_generation(staged, output, arch):
     try:
         fcntl.flock(parent_fd, fcntl.LOCK_EX)
         assets = list(staged.iterdir())
-        current_names = {asset.name for asset in assets} | previous_assets(output, arch)
+        owned = previous_assets(output, arch)
+        if owned:
+            owned.add("SHA256SUMS.txt")
+        for asset in assets:
+            destination = output / asset.name
+            if asset.name not in owned and os.path.lexists(destination):
+                raise ValueError("An incoming native release name is occupied by an unowned entry")
+        current_names = {asset.name for asset in assets} | owned
         replacement = staged / ".generation"
         libc = ctypes.CDLL(None, use_errno=True)
         existing = output.exists()
