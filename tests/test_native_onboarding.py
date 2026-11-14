@@ -270,6 +270,77 @@ actor Gate {
    let declined = LaunchConsent(); declined.decline()
    declined.observeEnd(CGRect(x: 0,y: 20,width: 20,height: 2), viewport: CGSize(width: 600,height: 300))
    declined.setAgreed(true); assert(!declined.accept())
+  case "consent-view-refresh":
+   NSApplication.shared.setActivationPolicy(.accessory)
+   let preferences = MemoryPreferences()
+   var hostLanguages = ["ja-JP", "de-DE", "fr-FR"]
+   let localization = Localization(catalogDirectory:directory,defaults:preferences,preferredLanguageProvider:{hostLanguages})
+   let consent = LaunchConsent()
+   let view = NSHostingView(rootView:ConsentView(consent:consent,onContinue:{},onDecline:{}).environmentObject(localization))
+   let window = NSWindow(contentRect:NSRect(x:0,y:0,width:900,height:650),styleMask:[.titled],backing:.buffered,defer:false)
+   window.contentView = view
+   window.orderFront(nil)
+   defer { window.orderOut(nil) }
+   let long = CommandLine.arguments[3] == "long"
+   func settle() async throws {
+    view.layoutSubtreeIfNeeded()
+    try await Task.sleep(nanoseconds:150_000_000)
+    view.layoutSubtreeIfNeeded()
+   }
+   func scrollView(_ node: NSView) -> NSScrollView? {
+    if let scroll = node as? NSScrollView { return scroll }
+    return node.subviews.compactMap(scrollView).first
+   }
+   func agree() async throws {
+    if long {
+     let scroll = scrollView(view)!
+     let end = max(0, scroll.documentView!.frame.height - scroll.contentView.bounds.height)
+     assert(end > 100)
+     scroll.contentView.scroll(to:NSPoint(x:0,y:end))
+     scroll.reflectScrolledClipView(scroll.contentView)
+     try await settle()
+     assert(scroll.contentView.bounds.minY > 100)
+     consent.observeEnd(CGRect(x:0,y:20,width:20,height:2),viewport:CGSize(width:600,height:300))
+    } else {
+     assert(consent.hasReadToEnd, "visible short content can complete reading")
+    }
+    consent.setAgreed(true)
+    assert(consent.canContinue)
+   }
+   func resetState(_ label: String) {
+    assert(!consent.agreed && !consent.canContinue, label)
+    if long {
+     assert(!consent.hasReadToEnd, "the replacement long text still needs reading: " + label)
+     assert(abs(scrollView(view)!.contentView.bounds.minY) < 1, "new language starts at the top: " + label)
+    } else {
+     assert(consent.hasReadToEnd, "visible new short text can complete reading: " + label)
+    }
+   }
+   try await settle()
+   assert(localization.preference == "system" && localization.locale == "de")
+   for code in ["fr", "en", "zh-Hans", "zh-Hant", "es", "de", "ru", "pt"] {
+    try await agree()
+    hostLanguages = ["ja-JP", code]
+    NotificationCenter.default.post(name:NSLocale.currentLocaleDidChangeNotification,object:nil)
+    try await settle()
+    assert(localization.locale == code && localization.preference == "system")
+    assert(preferences.string(forKey:"screenOrganizer.language") == "system")
+    resetState("System " + code)
+   }
+   try await agree()
+   localization.setPreference("pt")
+   try await settle()
+   resetState("explicit same locale")
+   try await agree()
+   localization.setPreference("system")
+   try await settle()
+   resetState("System same locale")
+   try await agree()
+   assert(consent.accept())
+   hostLanguages = ["en"]
+   NotificationCenter.default.post(name:NSLocale.currentLocaleDidChangeNotification,object:nil)
+   try await settle()
+   assert(consent.accepted)
   case "bridge":
    let origin = URL(string: "http://127.0.0.1:8765/#token=secret")!
    let message: [String:Any] = ["action":"openMCPSetup"]
@@ -824,6 +895,23 @@ def catalogs(tmp_path):
 @pytest.mark.parametrize("mode", ["localization", "consent", "bridge", "webkit", "exports", "menuExports"])
 def test_native_contracts(native_binary, catalogs, mode):
     result = subprocess.run([str(native_binary), mode, str(catalogs)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("length", ["long", "short"])
+def test_hosted_consent_resets_for_system_locale_and_preference_changes(native_binary, tmp_path, length):
+    catalogs = tmp_path / "consent-catalogs"
+    shutil.copytree(ROOT / "homescreen/web/locales", catalogs)
+    paragraphs = ["affiliation", "trademarks", "deviceInterfaces", "backups", "warranty", "clientData"]
+    for path in catalogs.glob("*.json"):
+        if path.name == "manifest.json":
+            continue
+        catalog = json.loads(path.read_text())
+        for key in paragraphs:
+            catalog["consent." + key] = catalog["consent." + key] * 25 if length == "long" else "Visible text."
+        path.write_text(json.dumps(catalog))
+    result = subprocess.run([str(native_binary), "consent-view-refresh", str(catalogs), length],
+                            capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

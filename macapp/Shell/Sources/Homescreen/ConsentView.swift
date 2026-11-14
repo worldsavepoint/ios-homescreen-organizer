@@ -31,8 +31,13 @@ final class LaunchConsent: ObservableObject {
     }
 }
 
+private struct ConsentLanguage: Hashable {
+    let preference: String
+    let locale: String
+}
+
 private struct ConsentEnd: Equatable {
-    let language: String
+    let language: ConsentLanguage
     let frame: CGRect
 }
 
@@ -48,6 +53,9 @@ struct ConsentView: View {
     var onContinue: () -> Void
     var onDecline: () -> Void
     private let paragraphs = ["affiliation", "trademarks", "deviceInterfaces", "backups", "warranty", "clientData"]
+    private var language: ConsentLanguage {
+        ConsentLanguage(preference: localization.preference, locale: localization.locale)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -71,19 +79,19 @@ struct ConsentView: View {
                         }
                         Color.clear.frame(height: 2).background(GeometryReader { end in
                             Color.clear.preference(key: ConsentEndKey.self,
-                                value: ConsentEnd(language: localization.preference, frame: end.frame(in: .named("consentViewport"))))
+                                value: ConsentEnd(language: language, frame: end.frame(in: .named("consentViewport"))))
                         })
                     }
                     .padding(20)
                 }
-                .id(localization.preference)
+                .id(language)
                 .focusable()
                 .accessibilityLabel(localization.t("consent.disclaimer"))
                 .coordinateSpace(name: "consentViewport")
                 .background(.background, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
                 .onPreferenceChange(ConsentEndKey.self) { end in
-                    guard let end, end.language == localization.preference else { return }
+                    guard let end, end.language == language else { return }
                     consent.observeEnd(end.frame, viewport: viewport.size)
                 }
             }
@@ -104,6 +112,6 @@ struct ConsentView: View {
         }
         .padding(32)
         .frame(maxWidth: 820, maxHeight: 720)
-        .onChange(of: localization.preference) { _, _ in consent.languageChanged() }
+        .onChange(of: language) { _, _ in consent.languageChanged() }
     }
 }
