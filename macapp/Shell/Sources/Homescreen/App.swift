@@ -55,7 +55,7 @@ struct HomeScreenOrganizerApp: App {
                 }.disabled(!consent.accepted)
                 Button(localization.t("mcp.openSetup")) { showSetup = true }.disabled(!consent.accepted)
                 Menu("MCP") {
-                    let exports = MCPSetup(executablePath: Engine.executable.path)
+                    let exports = setup
                     Button(localization.t("mcp.copyLaunch")) { exports.copy(format: "launch") }
                     Button(localization.t("mcp.copyJSON")) { exports.copy(format: "json") }
                     Button(localization.t("mcp.copyCodex")) { exports.copy(format: "toml") }

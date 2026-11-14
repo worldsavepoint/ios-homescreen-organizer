@@ -24,6 +24,20 @@ final class MCPSetupModel: ObservableObject {
         self.enginePath = enginePath
     }
 
+    var exportConfiguration: MCPSetup { MCPSetup(executablePath: enginePath, mode: mode) }
+
+    @discardableResult
+    func copy(format: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        exportConfiguration.copy(format: format, to: pasteboard)
+    }
+
+    func registrationActionKey(for client: MCPClient) -> String {
+        let query = queries[client]
+        let state = query?.scope == .other && query?.userConfiguration != .unknown
+            ? query?.userConfiguration : query?.configuration
+        return state == .configured ? "mcp.update" : "mcp.register"
+    }
+
     struct Feedback {
         let primaryKey: String
         var recoveryKey: String? = nil
@@ -236,7 +250,7 @@ struct MCPSetupView: View {
         .onChange(of: exportText) { _, _ in copied = false }
     }
 
-    private var setup: MCPSetup { MCPSetup(executablePath: model.enginePath, mode: model.mode) }
+    private var setup: MCPSetup { model.exportConfiguration }
     private var exportText: String { setup.text(format: exportFormat) }
 
     @ViewBuilder private func clientCard(_ client: MCPClient) -> some View {
@@ -270,7 +284,7 @@ struct MCPSetupView: View {
                     Link(localization.t("mcp.installGuide"), destination: URL(string: client == .codex ? "https://developers.openai.com/codex/cli/" : "https://code.claude.com/docs/en/setup")!)
                 }
                 HStack {
-                    Button(localization.t(query?.configuration == .configured ? "mcp.update" : "mcp.register")) {
+                    Button(localization.t(model.registrationActionKey(for: client))) {
                         Task { await model.register(client, consent: consent) }
                     }.disabled(model.busy || !consent.accepted || detection?.availability != .available)
                     Button(localization.t("mcp.chooseExecutable")) {

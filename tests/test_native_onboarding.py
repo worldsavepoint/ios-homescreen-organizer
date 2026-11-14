@@ -1,5 +1,6 @@
 """Native launch and bridge behavior using isolated catalogs and synthetic children."""
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +22,37 @@ def native_binary(tmp_path_factory):
     # App.swift supplies AppMark and WebView. Rename only its entry-point annotation.
     app = folder / "App.swift"
     app.write_text((SOURCES / "App.swift").read_text().replace("@main\n", ""))
+    menu = re.search(r'Menu\("MCP"\) \{(.*?)\n\s*\}.disabled', app.read_text(), re.S).group(1)
+    menu_binding = menu.strip().splitlines()[0]
+    menu_actions = re.findall(r'Button\(localization.t\("[^"]+"\)\) \{ (.*?) \}', menu)
+    assert len(menu_actions) == 5
+    menu_cases = []
+    for action in menu_actions:
+        format_name = re.search(r'format: "([^"]+)"', action).group(1)
+        menu_cases.append(f'case "{format_name}": ' + action.replace(f'format: "{format_name}"', f'format: "{format_name}", to: board'))
+    menu_harness = menu_binding + '\nswitch format {\n' + '\n'.join(menu_cases) + '\ndefault: fatalError("format")\n}'
+    panel_source = (SOURCES / "MCPSetupView.swift").read_text()
+    panel_action = re.search(r'Button\(localization.t\(copied.*?\)\) \{\s*(copied = .*?)\n\s*\}', panel_source, re.S).group(1)
+    registration_label = re.search(r'Button\(localization.t\((.*?)\)\) \{\s*Task \{ await model.register', panel_source).group(1)
+    registration_action = re.search(r'Button\(localization.t\(.*?\)\) \{\s*(Task \{ await model.register\(client, consent: consent\) \})', panel_source).group(1)
+    panel = folder / "MCPSetupView.swift"
+    panel.write_text(panel_source + '''
+extension MCPSetupView {
+ @MainActor func fixtureCopy(format: String, board: NSPasteboard) -> Bool {
+  let exportFormat = format
+  var copied = false
+  ''' + panel_action.replace('format: exportFormat', 'format: exportFormat, to: board') + '''
+  return copied
+ }
+ @MainActor func fixtureRegistrationKey(_ client: MCPClient) -> String {
+  let query = model.queries[client]
+  return ''' + registration_label + '''
+ }
+ @MainActor func fixtureRegister(_ client: MCPClient) -> Task<Void,Never> {
+  ''' + registration_action + '''
+ }
+}
+''')
     harness = folder / "Harness.swift"
     harness.write_text(r'''
 import AppKit
@@ -117,6 +149,93 @@ actor Gate {
      assert(tools ? entry["tools"] as? [String] == ["*"] : entry["tools"] == nil)
      let gates = mode == .readOnly ? ["HOMESCREEN_READ_ONLY":"1"] : ["HOMESCREEN_READ_ONLY":"0","HOMESCREEN_ALLOW_APPLY":"1"]
      assert(entry["env"] as? [String:String] == gates)
+    }
+   }
+  case "menuExports":
+   let board = NSPasteboard.withUniqueName()
+   defer { board.releaseGlobally() }
+   let setup = MCPSetupModel()
+   let panel = MCPSetupView(model:setup,consent:LaunchConsent())
+   func menuCopy(_ format: String) {
+    NATIVE_R2_MENU_ACTIONS
+   }
+   for mode in [MCPAccessMode.applyEnabled,.readOnly,.applyEnabled] {
+    setup.mode = mode
+    for format in ["launch","json","toml","vscode","copilot"] {
+     menuCopy(format)
+     let menuBytes = board.string(forType:.string)!
+     assert(panel.fixtureCopy(format:format,board:board))
+     let panelBytes = board.string(forType:.string)!
+     assert(menuBytes.utf8.elementsEqual(panelBytes.utf8), format + " " + mode.rawValue)
+     let apply = mode == .applyEnabled
+     if format == "launch" {
+      assert(menuBytes.contains(apply ? "HOMESCREEN_ALLOW_APPLY=1" : "HOMESCREEN_READ_ONLY=1"))
+     } else if format == "toml" {
+      assert(menuBytes.contains("HOMESCREEN_READ_ONLY = \"" + (apply ? "0" : "1") + "\""))
+      assert(menuBytes.contains("HOMESCREEN_ALLOW_APPLY") == apply)
+     } else {
+      let root = try JSONSerialization.jsonObject(with:Data(menuBytes.utf8)) as! [String:[String:[String:Any]]]
+      let entry = root[format == "vscode" ? "servers" : "mcpServers"]![MCPClientRegistration.serverID]!
+      let gates = apply ? ["HOMESCREEN_READ_ONLY":"0","HOMESCREEN_ALLOW_APPLY":"1"] : ["HOMESCREEN_READ_ONLY":"1"]
+      assert(entry["env"] as? [String:String] == gates)
+     }
+    }
+   }
+  case "registrationLabels":
+   let executable = CommandLine.arguments[3]
+   let c = accepted()
+   for client in MCPClient.allCases {
+    for project in [false,true] {
+     for exists in [false,true] {
+      var user = exists ? try MCPOwnedEntry(["command":"/old","args":["mcp"],"env":["HOMESCREEN_READ_ONLY":"1"]]) : .absent
+      let active = try MCPOwnedEntry(["command":"/project","args":["mcp"],"env":["HOMESCREEN_READ_ONLY":"0","HOMESCREEN_ALLOW_APPLY":"1"]])
+      var commands: [[String]] = []
+      var revision = 0
+      var unreadable = false
+      let manager = MCPClientManager(environment:[:],homeDirectory:directory,executableLocator:{ _ in executable },runner:{ _,args,_,_,_ in
+       commands.append(args)
+       if args[1] == "get" {
+        let effective = project ? active : user
+        guard let object = try? effective.object() else { return MCPCommandResult(exitStatus:1,stdout:"No server named ios-homescreen-mcp") }
+        if args.contains("--json") {
+         let response: [String:Any] = ["name":MCPClientRegistration.serverID,"enabled":true,"transport":object.merging(["type":"stdio"]) { _,new in new }]
+         return MCPCommandResult(exitStatus:0,stdout:String(decoding:try! JSONSerialization.data(withJSONObject:response),as:UTF8.self))
+        }
+        return MCPCommandResult(exitStatus:0,stdout:"ios-homescreen-mcp:\nScope: " + (project ? "Project" : "User") + "\nCommand: " + (object["command"] as! String) + "\nArgs: mcp\nHOMESCREEN_READ_ONLY=1")
+       }
+       assert(args.contains("--scope") && args[args.firstIndex(of:"--scope")!+1] == "user")
+       if args[1] == "remove" { user = .absent }
+       else if args[1] == "add-json" { user = try! MCPOwnedEntry(JSONSerialization.jsonObject(with:Data(args.last!.utf8))) }
+       else { user = try! MCPOwnedEntry(["command":executable,"args":["mcp"],"env":["HOMESCREEN_READ_ONLY":"1"]]) }
+       return MCPCommandResult(exitStatus:0)
+      },storeFactory:{ target,path,env,home,timeout,runner in
+       MCPEntryStore(client:target,executable:path,environment:env,home:home,timeout:timeout,runner:runner,
+        readOverride:{
+         if unreadable { throw MCPClientOperationCode.snapshotReadFailed }
+         return MCPUserSnapshot(file:home.appendingPathComponent("label-fixture").path,entry:user,version:String(revision),scope:project ? .other : .user,effectiveEntry:project ? active : user)
+        },
+        preflightOverride:{},writeOverride:{ snapshot,desired in
+         assert(snapshot.version == String(revision))
+         user = desired; revision += 1; return String(revision)
+        })
+      })
+      let model = MCPSetupModel(manager:manager,enginePath:executable)
+      let panel = MCPSetupView(model:model,consent:c)
+      assert(panel.fixtureRegistrationKey(client) == "mcp.register")
+      await model.refresh(consent:c)
+      assert(panel.fixtureRegistrationKey(client) == (exists ? "mcp.update" : "mcp.register"))
+      unreadable = true
+      await model.refresh(consent:c)
+      assert(panel.fixtureRegistrationKey(client) == (project || exists ? "mcp.update" : "mcp.register"))
+      unreadable = false
+      await model.refresh(consent:c)
+      await panel.fixtureRegister(client).value
+      assert(model.registrations[client]?.code == .success, String(describing:model.registrations[client]))
+      let saved = try user.object()
+      assert(saved?["command"] as? String == executable)
+      if client == .codex { assert(revision == 1) }
+      else { assert(commands.contains { $0.count > 3 && $0[2] == "--scope" && $0[3] == "user" }) }
+     }
     }
    }
   case "fallback":
@@ -601,11 +720,11 @@ actor Gate {
   print("passed")
  }
 }
-''')
+'''.replace("NATIVE_R2_MENU_ACTIONS", menu_harness))
     binary = folder / "native-tests"
     compiled = subprocess.run(["swiftc", "-module-cache-path", str(folder / "modules"),
-                               *[str(p) for p in SOURCES.glob("*.swift") if p.name != "App.swift"],
-                               str(app), str(harness), "-o", str(binary)], capture_output=True, text=True)
+                               *[str(p) for p in SOURCES.glob("*.swift") if p.name not in {"App.swift", "MCPSetupView.swift"}],
+                               str(app), str(panel), str(harness), "-o", str(binary)], capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
     return binary
 
@@ -626,9 +745,14 @@ def catalogs(tmp_path):
     return target
 
 
-@pytest.mark.parametrize("mode", ["localization", "consent", "bridge", "webkit", "exports"])
+@pytest.mark.parametrize("mode", ["localization", "consent", "bridge", "webkit", "exports", "menuExports"])
 def test_native_contracts(native_binary, catalogs, mode):
     result = subprocess.run([str(native_binary), mode, str(catalogs)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_registration_action_uses_user_scope_and_configuration(native_binary,catalogs):
+    result = subprocess.run([str(native_binary),"registrationLabels",str(catalogs),sys.executable],capture_output=True,text=True)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
