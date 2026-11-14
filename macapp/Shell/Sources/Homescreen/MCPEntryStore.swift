@@ -81,6 +81,14 @@ enum MCPOwnedEntry: Equatable, Codable {
     }
 }
 
+func mcpBytesEqual(_ left: String?, _ right: String?) -> Bool {
+    left.map { Data($0.utf8) } == right.map { Data($0.utf8) }
+}
+
+func mcpArgumentsEqual(_ left: [String]?, _ right: [String]?) -> Bool {
+    left.map { $0.map { Data($0.utf8) } } == right.map { $0.map { Data($0.utf8) } }
+}
+
 /// Configuration protocols preserve environment names with distinct UTF-8 spellings.
 func mcpEnvironment(_ object: Any?) throws -> [Data: Data] {
     guard let object, !(object is NSNull) else { return [:] }

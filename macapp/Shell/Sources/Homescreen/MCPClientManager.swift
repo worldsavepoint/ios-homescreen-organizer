@@ -70,7 +70,7 @@ struct MCPClientQuery: Sendable {
     var url: String? = nil
     var enabled: Bool? = nil
     var transportEnvironment: [Data: Data] = [:]
-    var forwardedNames: Set<String> = []
+    var forwardedNames: Set<Data> = []
 }
 
 struct MCPClientRegistrationResult: Sendable {
@@ -205,11 +205,11 @@ struct MCPClientManager {
             guard local ? transport["command"] is String : (["streamable_http", "sse"].contains(kind) && transport["url"] is String) else {
                 return queryFailure(client, .invalidResponse)
             }
-            var forwarded: Set<String> = []
+            var forwarded: Set<Data> = []
             guard let environment = try? mcpEnvironment(transport["env"]) else { return queryFailure(client, .invalidResponse) }
             if let names = transport["env_vars"], !(names is NSNull) {
                 guard let options = try? forwardedOptions(names) else { return queryFailure(client, .invalidResponse) }
-                forwarded = Set(options.map(\.name))
+                forwarded = Set(options.map { Data($0.name.utf8) })
             }
             return MCPClientQuery(client: client, code: .success, configuration: .configured, connection: .unknown,
                 command: transport["command"] as? String, arguments: transport["args"] as? [String], url: transport["url"] as? String, enabled: enabled.boolValue,
@@ -288,9 +288,9 @@ struct MCPClientManager {
         let local = active["url"] == nil
         let activeEnv = try? mcpEnvironment(fields["env"])
         let activeForwarded = (try? forwardedOptions(active["env_vars"] ?? []).map(\.name)) ?? []
-        let agrees = query.enabled == enabled && query.command == active["command"] as? String &&
-            query.arguments == active["args"] as? [String] && query.url == active["url"] as? String &&
-            (!local || (query.transportEnvironment == activeEnv && query.forwardedNames == Set(activeForwarded)))
+        let agrees = query.enabled == enabled && mcpBytesEqual(query.command, active["command"] as? String) &&
+            mcpArgumentsEqual(query.arguments, active["args"] as? [String]) && mcpBytesEqual(query.url, active["url"] as? String) &&
+            (!local || (query.transportEnvironment == activeEnv && query.forwardedNames == Set(activeForwarded.map { Data($0.utf8) })))
         if !agrees {
             query.code = .invalidResponse
             query.configuration = .unknown
@@ -593,8 +593,10 @@ struct MCPClientManager {
                 }
                 record.observed = written.entry
                 try savePhase(.observed, record: &record, journal: journal)
-                guard try matches(written.entry, intended: intended, client: client), let raw = try written.entry.object(), localMode(raw) == mode, raw["command"] as? String == enginePath,
-                      raw["args"] as? [String] == ["mcp"] else { throw MCPClientOperationCode.invalidResponse }
+                guard try matches(written.entry, intended: intended, client: client), let raw = try written.entry.object(), localMode(raw) == mode,
+                      mcpBytesEqual(raw["command"] as? String, enginePath), mcpArgumentsEqual(raw["args"] as? [String], ["mcp"]) else {
+                    throw MCPClientOperationCode.invalidResponse
+                }
                 var verification = await effectiveQuery(store)
                 if client == .codex && verification.code == .success {
                     let context = try await store.read(effective: true)
@@ -604,7 +606,7 @@ struct MCPClientManager {
                 } else { annotate(&verification, snapshot: written) }
                 guard verification.code == .success else { throw verification.code }
                 guard verification.configuration == .configured, verification.scope == .other ||
-                        (verification.localEnabled && verification.command == enginePath && verification.arguments == ["mcp"] &&
+                        (verification.localEnabled && mcpBytesEqual(verification.command, enginePath) && mcpArgumentsEqual(verification.arguments, ["mcp"]) &&
                          verification.mode == mode) else { throw MCPClientOperationCode.invalidResponse }
                 let final = try await store.read()
                 guard final.file == written.file else { throw MCPClientOperationCode.recoveryConflict }

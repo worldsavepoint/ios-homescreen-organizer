@@ -1057,6 +1057,54 @@ def test_equivalent_real_spellings_keep_kind_and_value(native_mcp_binary,sandbox
     assert typed_json(store.read_text())[SERVER_ID]["numeric"] == typed_json(token)
 
 
+@pytest.mark.parametrize("field,saved,reported,agrees", [
+    ("command","/plain","/plain",True),
+    ("command","/cafe\u0301","/cafe\u0301",True),
+    ("command","/caf\u00e9","/cafe\u0301",False),
+    ("args",["mcp","cafe\u0301"],["mcp","cafe\u0301"],True),
+    ("args",["mcp","caf\u00e9"],["mcp","cafe\u0301"],False),
+    ("args",["first","second"],["second","first"],False),
+    ("args",None,[],False),
+    ("url","https://fixture.invalid/cafe\u0301","https://fixture.invalid/cafe\u0301",True),
+    ("url","https://fixture.invalid/caf\u00e9","https://fixture.invalid/cafe\u0301",False),
+    ("env_vars",["FIRST","SECOND"],["SECOND","FIRST"],True),
+    ("env_vars",["cafe\u0301"],["cafe\u0301"],True),
+    ("env_vars",["caf\u00e9"],["cafe\u0301"],False),
+    ("env_vars",["caf\u00e9","cafe\u0301"],["caf\u00e9"],False),
+    ("env_vars",["caf\u00e9","cafe\u0301"],["cafe\u0301","caf\u00e9"],True),
+])
+def test_refresh_compares_transport_fields_by_utf8(native_mcp_binary,sandbox,tmp_path,field,saved,reported,agrees):
+    store, entries = seed_user(sandbox)
+    entry = entries[SERVER_ID]
+    if field == "url":
+        entry.pop("command")
+        entry.pop("args")
+        entry["type"] = "streamable_http"
+    if saved is None:
+        entry.pop(field, None)
+    else:
+        entry[field] = saved
+    store.write_text(json.dumps(entries))
+    cli = fake_client(tmp_path)
+    result = execute(native_mcp_binary,{**sandbox,"TEST_EFFECTIVE":json.dumps({field:reported})},"query","codex",cli)
+    assert result["code"] == ("success" if agrees else "invalidResponse")
+    assert result["configuration"] == ("configured" if agrees else "unknown")
+    assert result["mode"] == ("readOnly" if agrees and field != "url" else None)
+    assert mutations(sandbox) == []
+
+
+@pytest.mark.parametrize("client", ["codex", "claudeCode"])
+def test_registration_postcheck_compares_command_bytes(native_mcp_binary,sandbox,tmp_path,client):
+    store, prior = seed_user(sandbox, ownedOption=True)
+    cli = fake_client(tmp_path)
+    engine = "/caf\u00e9/engine"
+    reported = "/cafe\u0301/engine"
+    result = execute(native_mcp_binary,{**sandbox,"TEST_EFFECTIVE":json.dumps({"command":reported})},
+                     "register",client,cli,engine)
+    assert (result["code"],result["recovery"]) == ("invalidResponse","restored")
+    assert json.loads(store.read_text()) == prior
+
+
 def test_owned_process_group_prevents_late_apply(native_mcp_binary,sandbox,tmp_path):
     client = fake_client(tmp_path)
     result = execute(native_mcp_binary,{**sandbox,"TEST_WORKER":"1","TEST_TIMEOUT":"0.7","TEST_LAYER_OMITTED":"1"},
