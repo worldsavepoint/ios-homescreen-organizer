@@ -225,3 +225,48 @@ def test_publish_checks_mcpb_members_against_signed_native_zips(tmp_path):
     with pytest.raises(ValueError, match="bundle"):
         verify_bundle(bundle, folder, VERSION, "worldsavepoint/ios-homescreen-organizer",
                       (ROOT / "LICENSE").read_bytes(), (ROOT / "macapp/mcp_launcher.sh").read_bytes())
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "missing-row", "tampered"])
+def test_smoke_artifact_selects_only_the_verified_bundle_and_its_checksum(tmp_path, damage):
+    import re
+    import textwrap
+    workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+    assembly = workflow.split("\n  assemble:\n", 1)[1].split("\n  mcp-bundle:\n", 1)[0]
+    match = re.search(r"      - name: Prepare MCP smoke artifact\n(?P<step>.*?)(?=      - |\Z)", assembly, re.S)
+    assert match, "Assembly must prepare a separate verified smoke pair"
+    body = textwrap.dedent(match["step"].split("        run: |\n", 1)[1])
+    assert assembly.index("Validate official MCPB manifest") < match.start()
+    smoke_job = workflow.split("\n  mcp-bundle:\n", 1)[1].split("\n  release:\n", 1)[0]
+    publication = workflow.split("\n  release:\n", 1)[1].split("\n  registry:\n", 1)[0]
+    assert "name: home-screen-organizer-mcp-smoke" in smoke_job
+    assert "name: home-screen-organizer-distribution" not in smoke_job
+    assert "name: home-screen-organizer-distribution" in publication
+    for title in ("Upload complete distribution", "Upload MCP smoke artifact", "Upload installable archives", "Upload matching native source inputs"):
+        section = workflow.split("      - name: " + title + "\n", 1)[1].split("\n      - ", 1)[0].split("\n\n  ", 1)[0]
+        assert "compression-level: 0" in section
+    release = tmp_path / "release"
+    release.mkdir()
+    payloads = {BUNDLE: b"the verified bundle", BUNDLE + ".backup": b"decoy bundle", "corresponding-source.tar.gz": b"large source", "server.json": b"metadata"}
+    for name, data in payloads.items():
+        (release / name).write_bytes(data)
+    manifest = release / "SHA256SUMS.txt"
+    manifest.write_text("".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in payloads.items()
+                                 if damage != "missing-row" or name != BUNDLE))
+    original_manifest = manifest.read_bytes()
+    if damage == "missing":
+        (release / BUNDLE).unlink()
+    elif damage == "tampered":
+        (release / BUNDLE).write_bytes(b"different bytes")
+    temporary = tmp_path / "runner-temp"
+    temporary.mkdir()
+    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=tmp_path,
+                            env={**os.environ, "VERSION": VERSION, "RUNNER_TEMP": str(temporary)}, capture_output=True, text=True)
+    assert (result.returncode == 0) == (damage is None), result.stderr
+    assert manifest.read_bytes() == original_manifest
+    assert (release / "corresponding-source.tar.gz").read_bytes() == b"large source"
+    if damage is None:
+        staged = temporary / "mcp-smoke"
+        assert sorted(p.name for p in staged.iterdir()) == sorted([BUNDLE, "SHA256SUMS.txt"])
+        assert (staged / BUNDLE).read_bytes() == payloads[BUNDLE]
+        assert (staged / "SHA256SUMS.txt").read_text() == f"{hashlib.sha256(payloads[BUNDLE]).hexdigest()}  {BUNDLE}\n"

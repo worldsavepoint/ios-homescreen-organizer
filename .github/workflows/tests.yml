@@ -109,6 +109,7 @@ jobs:
         with:
           name: home-screen-organizer-sources-${{ matrix.arch }}
           path: build/${{ matrix.arch }}/source-inputs.zip
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
       - name: Upload installable archives
@@ -116,6 +117,7 @@ jobs:
         with:
           name: home-screen-organizer-macos-${{ matrix.arch }}
           path: build/release/${{ matrix.arch }}/*
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
@@ -162,6 +164,26 @@ jobs:
         with:
           name: home-screen-organizer-distribution
           path: release/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare MCP smoke artifact
+        env:
+          VERSION: ${{ needs.test.outputs.version }}
+        run: |
+          BUNDLE="home-screen-organizer-$VERSION-macos.mcpb"
+          SMOKE="$RUNNER_TEMP/mcp-smoke"
+          mkdir "$SMOKE"
+          awk -v name="$BUNDLE" '$2 == name && NF == 2 { print; count++ } END { if (count != 1) exit 1 }' release/SHA256SUMS.txt > "$SMOKE/SHA256SUMS.txt"
+          cp "release/$BUNDLE" "$SMOKE/$BUNDLE"
+          cd "$SMOKE"
+          shasum -a 256 --check SHA256SUMS.txt
+      - name: Upload MCP smoke artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: home-screen-organizer-mcp-smoke
+          path: ${{ runner.temp }}/mcp-smoke/*
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
@@ -189,7 +211,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: home-screen-organizer-distribution
+          name: home-screen-organizer-mcp-smoke
           path: release
       - name: Extract and initialize the native bundled engine
         run: |
