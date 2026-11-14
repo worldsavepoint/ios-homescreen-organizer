@@ -196,6 +196,8 @@ def app_contents(app):
 def image_error_note(error, image, mount):
     stderr = error.stderr
     detail = stderr[:4096].decode(errors="replace") if isinstance(stderr, bytes) else (stderr or "")[:4096]
+    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
+    detail = "".join(character if character.isprintable() or character in "\r\n\t" else "?" for character in detail)
     roots = [image, image.parent, mount, mount.parent, ROOT, Path.home(), Path(tempfile.gettempdir())]
     forms = set()
     for root in roots:
@@ -206,9 +208,7 @@ def image_error_note(error, image, mount):
             pass
     for form in sorted(forms, key=len, reverse=True):
         detail = detail.replace(form, "<native-build>")
-    detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
-    detail = "".join(character if character.isprintable() or character in "\r\n\t" else "?" for character in detail)
-    detail = re.sub(r"(?m)(?:[A-Za-z]:[\\/]|(?<![A-Za-z0-9])/) ?[^\r\n]*", "<path>", detail)
+    detail = re.sub(r"(?m)(?:[A-Za-z]:[\\/]|/)[^\r\n]*", "<path>", detail)
     detail = " ".join(detail.split())[:512]
     return "Image attachment failed. hdiutil stderr: " + (detail or "<empty>")
 

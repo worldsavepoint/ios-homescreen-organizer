@@ -834,3 +834,26 @@ def test_release_cli_prints_only_safe_privacy_attribution(tmp_path, monkeypatch,
     assert "path rule: recorded-build-root" in output
     assert "Release payload contains a local build path" in output
     assert str(tmp_path) not in output and "private-marker" not in output
+
+
+@pytest.mark.parametrize("prefix", ["-I", "source"])
+def test_image_error_note_redacts_token_attached_paths(prefix):
+    from macapp.release import image_error_note
+    reason = f"hdiutil: {prefix}/private/other-account/file failed".encode()
+    error = subprocess.CalledProcessError(1, ["hdiutil", "attach"], stderr=reason)
+    note = image_error_note(error, Path("/owned-native-image/release.dmg"), Path("/owned-native-mount/volume"))
+    assert "/private/other-account" not in note and "<path>" in note
+    assert error.stderr is reason
+
+
+def test_image_error_note_normalizes_ansi_before_matching_known_root():
+    from macapp.release import image_error_note
+    image = Path("/private/owned-sensitive-root/release.dmg")
+    reason = b"hdiutil: -I/private/owned-sensitive-\x1b[31mroot/file failed"
+    error = subprocess.CalledProcessError(1, ["hdiutil", "attach"], output=b"native stdout", stderr=reason)
+    note = image_error_note(error, image, Path("/owned-native-mount/volume"))
+    assert "/private/owned-sensitive-root" not in note
+    assert "-I<native-build>" in note
+    assert all(character.isprintable() for character in note) and len(note) <= 560
+    assert error.cmd == ["hdiutil", "attach"] and error.returncode == 1
+    assert error.output == b"native stdout" and error.stderr is reason

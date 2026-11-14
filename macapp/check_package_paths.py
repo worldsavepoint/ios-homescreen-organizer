@@ -108,7 +108,13 @@ def check_archive(path, blocked, *, engine=ENGINE):
                  re.compile(re.escape(root) + rb"(?=$|[/\x00-\x20\x7f\"':,;=])"))
                 for root in sorted(roots, key=lambda root: (-len(root), root))]
     location = "archive bytes"
-    deferred = []
+    deferred = None
+
+    def bounded_location(context):
+        if len(context) <= 896:
+            return context
+        marker = "<truncated>!"
+        return marker + context[-(896 - len(marker)):]
 
     def public_member(name):
         if (not re.fullmatch(r"[A-Za-z0-9_./ +!()-]{1,512}", name) or name.startswith("/")
@@ -118,12 +124,15 @@ def check_archive(path, blocked, *, engine=ENGINE):
         return name
 
     def check(data, *, defer=False):
+        nonlocal deferred
         for rule, pattern in patterns:
             if pattern.search(data):
+                if defer and deferred is not None:
+                    return
                 error = BuildPathError("Release payload contains a local build path")
                 error.add_note("Package location: " + location + "; path rule: " + rule)
                 if defer:
-                    deferred.append(error)
+                    deferred = error
                     return
                 raise error
 
@@ -181,10 +190,10 @@ def check_archive(path, blocked, *, engine=ENGINE):
 
     def check_zip(archive, context="ZIP"):
         nonlocal location
-        location = context + " metadata"
+        location = bounded_location(context + " metadata")
         check(archive.comment)
         for info in archive.infolist():
-            location = context + "!" + public_member(info.filename)
+            location = bounded_location(context + "!" + public_member(info.filename))
             check(info.filename.encode())
             check(info.comment)
             check_extra(info.extra)
@@ -202,11 +211,11 @@ def check_archive(path, blocked, *, engine=ENGINE):
         module = sysconfig._get_sysconfigdata_name()
         found = False
         package = CArchiveReader(str(path))
-        location = "ZIP!" + public_member(engine) + "!CArchive metadata"
+        location = bounded_location("ZIP!" + public_member(engine) + "!CArchive metadata")
         for option in package.options:
             check(option.encode())
         for name, entry in package.toc.items():
-            location = "ZIP!" + public_member(engine) + "!CArchive!" + public_member(name)
+            location = bounded_location("ZIP!" + public_member(engine) + "!CArchive!" + public_member(name))
             check(name.encode())
             data = package.extract(name)
             if entry[-1] == "z":
@@ -218,7 +227,7 @@ def check_archive(path, blocked, *, engine=ENGINE):
             if entry[-1] == "z":
                 pyz = package.open_embedded_archive(name)
                 for member in pyz.toc:
-                    location = "ZIP!" + public_member(engine) + "!PYZ!" + public_member(member)
+                    location = bounded_location("ZIP!" + public_member(engine) + "!PYZ!" + public_member(member))
                     check(member.encode())
                     raw = pyz.extract(member, raw=True) or b""
                     check(raw)
@@ -240,14 +249,14 @@ def check_archive(path, blocked, *, engine=ENGINE):
                 executable = Path(folder) / "engine"
                 executable.write_bytes(archive.read(engine))
                 check_engine(executable)
-        if deferred:
-            raise deferred[0]
+        if deferred is not None:
+            raise deferred from None
     except (BuildPathError, PackageMetadataError):
         raise
     except (Exception, SystemExit):
         # Archive readers include their input filename in parsing errors.
-        if deferred:
-            raise deferred[0]
+        if deferred is not None:
+            raise deferred from None
         raise ValueError("Could not verify the native release archive") from None
 
 

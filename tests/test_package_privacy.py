@@ -400,3 +400,51 @@ def test_privacy_attribution_names_the_rule_without_its_prefix(tmp_path, monkeyp
         check_archive(native_zip(tmp_path, extra=bytes(root)), [root])
     note, = caught.value.__notes__
     assert "path rule: " + rule in note and str(root) not in note
+
+
+def test_deferred_privacy_failure_suppresses_untrusted_zip_parser_context(tmp_path):
+    import traceback
+    from macapp.check_package_paths import BuildPathError, check_archive
+    root = tmp_path / "blocked-root"
+    central = "safe-" + "x" * 59
+    private = "/private/owned-review-account/data".ljust(len(central), "x")
+    path = tmp_path / "malformed.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(central, b"clean")
+    path.write_bytes(path.read_bytes().replace(central.encode(), private.encode(), 1) + bytes(root))
+    with pytest.raises(BuildPathError) as caught:
+        check_archive(path, [root], engine=None)
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert caught.value.__suppress_context__ is True
+    assert private not in rendered and "BadZipFile:" not in rendered
+    assert str(caught.value) == "Release payload contains a local build path"
+    assert caught.value.__notes__ == ["Package location: archive bytes; path rule: recorded-build-root"]
+
+
+def test_nested_privacy_note_is_bounded_keeps_leaf_and_retains_one_fallback(tmp_path, monkeypatch):
+    from macapp import check_package_paths as scanner
+    original = scanner.BuildPathError
+    allocations = []
+    class CountedError(original):
+        def __init__(self, *args):
+            allocations.append(1)
+            super().__init__(*args)
+    monkeypatch.setattr(scanner, "BuildPathError", CountedError)
+    root = tmp_path / "blocked-root"
+    def packed(name, data):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr(name, data)
+        return stream.getvalue()
+    data = packed("useful-leaf.txt", bytes(root) + b"/child\0")
+    for depth in range(12):
+        data = packed(f"level{depth}-" + "a" * 440 + ".zip", data)
+    path = tmp_path / "nested.zip"
+    path.write_bytes(data)
+    with pytest.raises(original) as caught:
+        scanner.check_archive(path, [root], engine=None)
+    note, = caught.value.__notes__
+    assert (len(note) <= 1024, len(allocations)) == (True, 2)
+    assert "<truncated>" in note
+    assert "!useful-leaf.txt; path rule: recorded-build-root" in note
+    assert str(root) not in note and all(character.isprintable() for character in note)
