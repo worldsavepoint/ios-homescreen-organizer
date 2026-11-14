@@ -441,7 +441,8 @@ class Layout:
 
     def find(self, query: str) -> list[Node]:
         q = query.lower()
-        return [n for n in self.nodes.values() if q in n.name.lower() or q in n.id.lower()]
+        return [n for n in self.nodes.values()
+                if q in n.name.lower() or q in n.id.lower() or (n.bundle_id and q in n.bundle_id.lower())]
 
     # ---- edits ------------------------------------------------------------------
 

@@ -200,7 +200,8 @@ function fallback(wrap, name) {
 const D = () => ((V && V.device && V.device.ProductType) || "").startsWith("iPad") ? "iPad" : "iPhone";
 const G = () => (V && V.grid) || { cols: 4, rows: 6, dock: 4, folder: 9 };
 
-const matches = (item) => !query || item.name.toLowerCase().includes(query) || item.id.toLowerCase().includes(query);
+const matches = (item) => !query || item.name.toLowerCase().includes(query) || item.id.toLowerCase().includes(query)
+  || item.bundle_id?.toLowerCase().includes(query);
 
 function findItem(id) {
   if (!V || !V.loaded) return null;
@@ -975,8 +976,7 @@ async function organize(name) {
     return withBusy(() => t("editor.lookingUp"), () => op(name, { keep_first_page: keep }, undefined, binding));
   }
   const label = { sort_color: "editor.sortingColor", optimize_usage: "editor.optimizingUsage" }[name];
-  const args = ["sort_color", "sort_alpha"].includes(name) ? { keep_first_page: keep }
-    : name === "optimize_usage" ? { keep_first_page: false } : {};
+  const args = ["sort_color", "sort_alpha", "optimize_usage"].includes(name) ? { keep_first_page: keep } : {};
   return label ? withBusy(() => t(label), () => op(name, args)) : op(name, args);
 }
 

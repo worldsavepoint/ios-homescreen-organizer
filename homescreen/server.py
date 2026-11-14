@@ -253,7 +253,7 @@ def app_store_categories(
     Sends uncached bundle ids to Apple's public US lookup API and saves results locally.
     Requires user agreement to send bundle ids to Apple."""
     lay = session().require()
-    ids = ids or [n.id for n in lay.nodes.values() if n.kind == "app"]
+    ids = list(dict.fromkeys(ids or [n.bundle_id for n in lay.nodes.values() if n.kind == "app" and n.bundle_id]))
     return organize.fetch_categories(ids, DATA / "categories.json")
 
 
@@ -308,8 +308,13 @@ async def screen_time(
     """Return estimated top-app usage, background apps and phone-versus-draft page swipes.
     Requires a loaded draft and replaces cached usage. Device mode reads memory reports and
     installed apps, saving reports locally; mac mode reads synced macOS Screen Time files."""
+    if source not in ("device", "mac"):
+        return {"ok": False, "error": "usage source must be device or mac"}
     s = session()
-    u = await s.load_device_usage() if source == "device" else s.load_usage(days)
+    try:
+        u = await s.load_device_usage() if source == "device" else s.load_usage(days)
+    except LayoutError as e:
+        return {"ok": False, "error": str(e)}
     if not u.get("ok"):
         return u
     lay = s.require()
@@ -333,8 +338,10 @@ async def optimize_by_usage(
     if s.usage is None:
         try:
             await s.load_device_usage()
+        except LayoutError as e:
+            return {"ok": False, "error": str(e)}
         except Exception:
-            s.usage = None
+            pass
         if not (s.usage or {}).get("ok"):
             s.load_usage()
     if not s.usage.get("ok"):

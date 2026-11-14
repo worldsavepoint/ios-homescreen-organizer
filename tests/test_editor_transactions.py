@@ -104,3 +104,30 @@ def test_suspended_color_operation_rechecks_binding_before_edit(pair):
     response = asyncio.run(ui.post_op(request({"op": "sort_color", "binding": binding, "args": {}})))
     assert response.status_code == 409 and first.history()["undo"] == second.history()["undo"] == 0
     assert first.draft_path.read_bytes() == saved
+
+
+def test_reviewed_read_checks_shared_committed_draft_before_source_access(pair):
+    first, _ = pair
+    binding = view_binding(first)
+    another = Session(first.source, first.dir, device=first.device_id)
+    another.edit(lambda lay: lay.move("b", "dock"))
+    prior, reads = first.draft_path.read_bytes(), first.source.reads
+    result = asyncio.run(ui.post_read(request({"binding": binding})))
+    assert result.status_code == 409
+    assert first.draft_path.read_bytes() == prior and first.source.reads == reads
+
+
+def test_discovery_failure_retains_known_devices_with_unknown_status(pair, monkeypatch):
+    from pymobiledevice3 import usbmux
+    async def failed():
+        raise ConnectionError("discovery unavailable")
+    async def empty():
+        return []
+    monkeypatch.setattr(usbmux, "list_devices", failed)
+    result = json.loads(asyncio.run(ui.get_devices(request({}))).body)
+    assert result.get("discovery") == "unavailable"
+    assert {row["udid"] for row in result["devices"]} == {"first", "second"}
+    assert all(row["connected"] is None for row in result["devices"])
+    monkeypatch.setattr(usbmux, "list_devices", empty)
+    result = json.loads(asyncio.run(ui.get_devices(request({}))).body)
+    assert result["discovery"] == "complete" and all(row["connected"] is False for row in result["devices"])

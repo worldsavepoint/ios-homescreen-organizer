@@ -749,25 +749,33 @@ class Session:
     def redo(self, *, expected: dict | None = None) -> bool:
         return self._step_history(self._redo, self._undo, expected)
 
-    def load_usage(self, days: int = 30) -> dict[str, Any]:
+    def _adopt_usage(self, result: dict, expected: dict, selected: Callable[[], bool] | None) -> dict:
+        with self._exclusive(expected=expected):
+            if selected is not None and not selected():
+                raise ReviewChanged("the reviewed device changed; load usage for the current device")
+            self.usage = result
+        return result
+
+    def load_usage(self, days: int = 30, *, expected: dict | None = None,
+                   selected: Callable[[], bool] | None = None) -> dict[str, Any]:
         from . import usage
+        binding = self.binding if expected is None else expected
         lay = self.require()
         known = {n.bundle_id for n in lay.nodes.values() if n.bundle_id}
-        self.usage = usage.load(known, days)
-        return self.usage
+        return self._adopt_usage(usage.load(known, days), binding, selected)
 
-    async def load_device_usage(self) -> dict[str, Any]:
+    async def load_device_usage(self, *, expected: dict | None = None,
+                                selected: Callable[[], bool] | None = None) -> dict[str, Any]:
         """Usage from the device's own memory reports (no Screen Time sync needed)."""
         from . import usage
+        binding = self.binding if expected is None else expected
         lay = self.require()
         if not hasattr(self.source, "memory_reports"):
-            self.usage = {"ok": False, "error": "This source can't report usage."}
-            return self.usage
+            return self._adopt_usage({"ok": False, "error": "This source can't report usage."}, binding, selected)
         files = await self.source.memory_reports(self._dev_dir("usage"))
         apps = await self.source.installed_apps()
         known = {n.bundle_id for n in lay.nodes.values() if n.bundle_id}
-        self.usage = usage.from_memory_reports(files, apps, known)
-        return self.usage
+        return self._adopt_usage(usage.from_memory_reports(files, apps, known), binding, selected)
 
     def history(self) -> dict[str, int]:
         return {"undo": len(self._undo), "redo": len(self._redo)}
@@ -1023,6 +1031,8 @@ class Session:
                     self._clear_pending()
             self._undo, self._redo = [], []
             self._history_baseline = None
+            if previous[0] != device_id:
+                self.usage = None
         except BaseException:
             (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
              self._observed_placement, self._page_identity, self._draft_digest, self._placement_revision) = previous

@@ -136,24 +136,27 @@ def from_memory_reports(files: list[Path], apps: dict[str, dict[str, Any]], know
 
 # ---- swipes -----------------------------------------------------------------------------
 
-def _app_positions(lay: Layout) -> dict[str, int]:
+def _app_positions(lay: Layout) -> dict[str, tuple[int, Node]]:
     """Swipes to reach each app from page 1: page N costs N-1, a folder's page K adds K-1,
     the dock is free, an App Library-only app costs one swipe past the last page."""
-    cost: dict[str, int] = {}
-    for n in lay.dock:
-        for leaf in _leaves(n):
-            cost[leaf.bundle_id or leaf.id] = 0
-    for i, page in enumerate(lay.pages):
-        for n in page:
-            if n.kind == "folder":
-                for k, fp in enumerate(n.children):
-                    for c in fp:
-                        cost[c.bundle_id or c.id] = i + k
-            elif n.kind in ("app", "webclip"):
-                cost[n.bundle_id or n.id] = i
-    for n in lay.library or []:
-        cost[n.bundle_id or n.id] = len(lay.pages)
-    return cost
+    nearest: dict[str, tuple[int, Node]] = {}
+
+    def record(node: Node, cost: int):
+        if node.kind == "folder":
+            for index, page in enumerate(node.children):
+                for child in page:
+                    record(child, cost + index)
+        elif node.bundle_id and (node.bundle_id not in nearest or cost < nearest[node.bundle_id][0]):
+            nearest[node.bundle_id] = cost, node
+
+    for node in lay.dock:
+        record(node, 0)
+    for index, page in enumerate(lay.pages):
+        for node in page:
+            record(node, index)
+    for node in lay.library or []:
+        record(node, len(lay.pages))
+    return nearest
 
 
 def _leaves(n: Node) -> list[Node]:
@@ -162,14 +165,21 @@ def _leaves(n: Node) -> list[Node]:
 
 def swipes(lay: Layout, opens: dict[str, int]) -> int:
     cost = _app_positions(lay)
-    return sum(opens.get(b, 0) * c for b, c in cost.items())
+    return sum(opens.get(b, 0) * c for b, (c, _) in cost.items())
 
 
 def top_apps(lay: Layout, opens: dict[str, int], n: int = 25, *, locations: bool = True) -> list[dict[str, Any]]:
-    names = {x.bundle_id: x.name for x in lay.nodes.values() if x.bundle_id}
+    nearest = _app_positions(lay)
     pos = lay.positions() if locations else {}
-    ranked = sorted(((b, c) for b, c in opens.items() if b in names), key=lambda kv: -kv[1])[:n]
-    return [{"id": b, "name": names[b], "opens": c, "where": pos.get(b, "")} for b, c in ranked]
+    ranked = sorted(((b, c) for b, c in opens.items() if b in nearest), key=lambda kv: -kv[1])[:n]
+    rows = []
+    for bundle, count in ranked:
+        node = nearest[bundle][1]
+        row = {"id": bundle, "name": node.name, "opens": count, "where": pos.get(node.id, "")}
+        if not locations:
+            row["placement_id"] = node.id
+        rows.append(row)
+    return rows
 
 
 # ---- optimizer --------------------------------------------------------------------------

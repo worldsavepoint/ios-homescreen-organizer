@@ -115,6 +115,7 @@ LOOKUP = "https://itunes.apple.com/lookup?"
 def fetch_categories(bundle_ids: list[str], cache: Path, country: str = "us") -> dict[str, str]:
     """Primary App Store genre per bundle id, via Apple's public lookup API. Only bundle ids are
     sent. Results (and misses, as "") are cached so each id is asked about once."""
+    bundle_ids = list(dict.fromkeys(bundle_ids))
     cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     cache.parent.chmod(0o700)
     try:
@@ -152,8 +153,8 @@ def category_groups(lay: Layout, categories: dict[str, str], keep_first_page: bo
     groups: dict[str, list[str]] = {}
     for p in lay.pages[start:]:
         for n in p:
-            if n.kind == "app" and categories.get(n.id):
-                groups.setdefault(categories[n.id], []).append(n.id)
+            if n.kind == "app" and categories.get(n.bundle_id):
+                groups.setdefault(categories[n.bundle_id], []).append(n.id)
     return groups
 
 

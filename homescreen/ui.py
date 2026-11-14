@@ -48,6 +48,7 @@ def _item(n: Node, lay: Layout) -> dict[str, Any]:
     d: dict[str, Any] = {"id": n.id, "name": n.name, "kind": n.kind}
     if n.bundle_id:
         d["icon"] = n.bundle_id
+        d["bundle_id"] = n.bundle_id
     if n.kind == "widget":
         apps = [b for b in widget_apps(n.raw) if b]
         d["name"] = lay.widget_label(n)
@@ -279,13 +280,7 @@ def view(s=None) -> dict[str, Any]:
                 moved[node.id] = key
     usage_view = _usage_view(lay, s.usage, original)
     top = usage_view.get("top", []) if usage_view else []
-    usage_ids = {}
-    if top:
-        # Resolve each visible bundle to one occurrence for both its name and location.
-        top_bundles = {row["id"] for row in top}
-        for node in lay.nodes.values():
-            if node.bundle_id in top_bundles:
-                usage_ids.setdefault(node.bundle_id, node.id)
+    usage_ids = {row["id"]: row.pop("placement_id") for row in top}
     changed_ids = moved.keys() | placements.keys()
     wanted = changed_ids | {usage_ids[row["id"]] for row in top}
     physical = set(placements)
@@ -466,20 +461,29 @@ async def post_op(request: Request) -> Response:
             _reviewed_session(body).edit(lambda lay: organize.by_color(lay, colors, args.get("keep_first_page", True)),
                                         expected=expected)
         elif name == "load_usage":
-            if args.get("source") == "device":
+            provider = args.get("source", "mac")
+            if provider not in ("device", "mac"):
+                raise LayoutError("usage source must be device or mac")
+            selected = lambda: session() is s
+            if provider == "device":
                 async with _device_lock:
-                    await s.load_device_usage()
+                    _reviewed_session(body)
+                    await s.load_device_usage(expected=expected, selected=selected)
             else:
-                await asyncio.to_thread(s.load_usage, int(args.get("days", 30)))
+                await asyncio.to_thread(s.load_usage, int(args.get("days", 30)), expected=expected, selected=selected)
         elif name == "optimize_usage":
             if s.usage is None:  # the device's own reports first, then Screen Time on this Mac
                 try:
                     async with _device_lock:
-                        await s.load_device_usage()
+                        _reviewed_session(body)
+                        await s.load_device_usage(expected=expected, selected=lambda: session() is s)
+                except LayoutError:
+                    raise
                 except Exception:
-                    s.usage = None
+                    pass
                 if not (s.usage or {}).get("ok"):
-                    await asyncio.to_thread(s.load_usage)
+                    _reviewed_session(body)
+                    await asyncio.to_thread(s.load_usage, expected=expected, selected=lambda: session() is s)
             if not s.usage.get("ok"):
                 raise LayoutError(s.usage.get("error", "no usage data"))
             opens = s.usage["opens"]
@@ -487,7 +491,7 @@ async def post_op(request: Request) -> Response:
                                         expected=expected)
         elif name == "group_categories":
             lay = s.require()
-            ids = [n.id for p in lay.pages for n in p if n.kind == "app"]
+            ids = list(dict.fromkeys(n.bundle_id for p in lay.pages for n in p if n.kind == "app" and n.bundle_id))
             cats = await asyncio.to_thread(organize.fetch_categories, ids, DATA / "categories.json")
             keep = args.get("keep_first_page", True)
             _reviewed_session(body).edit(lambda lay: organize.into_folders(lay, organize.category_groups(lay, cats, keep), keep),
@@ -543,10 +547,7 @@ async def _connected() -> dict[str, dict[str, Any]]:
     from pymobiledevice3 import usbmux
     from pymobiledevice3.lockdown import create_using_usbmux
     out: dict[str, dict[str, Any]] = {}
-    try:
-        devs = await usbmux.list_devices()
-    except Exception:
-        return out
+    devs = await usbmux.list_devices()
     for d in sorted(devs, key=lambda d: d.connection_type != "USB"):  # USB first
         if d.serial in out:
             continue
@@ -556,8 +557,8 @@ async def _connected() -> dict[str, dict[str, Any]]:
                 _names[d.serial] = {"name": v.get("DeviceName"), "model": v.get("ProductType"),
                                     "version": v.get("ProductVersion"), "class": v.get("DeviceClass")}
             except Exception:
-                continue  # locked and never trusted, or gone already
-        out[d.serial] = {**_names[d.serial], "connection": "USB" if d.connection_type == "USB" else "Wi-Fi"}
+                pass  # Discovery still identified the transport when device details are unavailable.
+        out[d.serial] = {**_names.get(d.serial, {}), "connection": "USB" if d.connection_type == "USB" else "Wi-Fi"}
     return out
 
 
@@ -566,11 +567,17 @@ async def get_devices(request: Request) -> Response:
         return bad
     if not config.switching():
         return JSONResponse({"switching": False, "current": None, "devices": []})
-    connected = await _connected()
+    try:
+        connected = await _connected()
+        discovery = "complete"
+    except Exception:
+        connected = {}
+        discovery = "unavailable"
     known = config.known_devices()
     devices = [{"udid": u, **known.get(u, {}), **c, "connected": True, "draft": u in known} for u, c in connected.items()]
-    devices += [{"udid": u, **k, "connected": False, "draft": True} for u, k in known.items() if u not in connected]
-    return JSONResponse({"switching": True, "current": config.current_device(), "devices": devices})
+    devices += [{"udid": u, **k, "connected": False if discovery == "complete" else None, "draft": True}
+                for u, k in known.items() if u not in connected]
+    return JSONResponse({"switching": True, "current": config.current_device(), "devices": devices, "discovery": discovery})
 
 
 async def post_device(request: Request) -> Response:
