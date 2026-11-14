@@ -35,6 +35,10 @@ OPERATION_TIMEOUT = 30.0
 _MISSING = object()  # Older drafts did not record the source's placement observation.
 
 
+class ReviewChanged(LayoutError):
+    """The editor action was prepared against a different device, draft or backup."""
+
+
 def _sync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -528,23 +532,31 @@ class Session:
     # ---- persistence ------------------------------------------------------------
 
     @contextmanager
-    def _exclusive(self, *, refresh: bool = False):
+    def _exclusive(self, *, refresh: bool = False, expected: dict | None = None):
         fd = os.open(self.dir / ".session.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as e:
                 raise LayoutError("another Session operation holds the local data lock; try again after it finishes") from e
-            if not refresh:
+            if expected is not None and expected != self.binding:
+                raise ReviewChanged("the reviewed device or draft changed; review the current layout")
+            if not refresh or expected is not None:
                 try:
                     digest = hashlib.sha256(self.draft_path.read_bytes()).digest()
                 except FileNotFoundError:
                     digest = None
                 if digest != self._draft_digest:
+                    if expected is not None:
+                        raise ReviewChanged("the saved draft changed; reopen the current layout before continuing")
                     raise LayoutError("the saved draft changed in another session; reopen it or read the device again")
             yield
         finally:
             os.close(fd)
+
+    @property
+    def binding(self) -> dict:
+        return {"device": self.device_id, "revision": self._draft_digest.hex() if self._draft_digest else ""}
 
     @property
     def _pending_path(self) -> Path:
@@ -583,7 +595,8 @@ class Session:
 
     def _save_draft(self) -> None:
         assert self.layout is not None
-        blob = {"device": self.device_id, "info": self.info, **self.layout.snapshot()}
+        blob = {"device": self.device_id, "info": self.info, "draft_revision": uuid.uuid4().hex,
+                **self.layout.snapshot()}
         blob["placement_revision"] = self._placement_revision
         if self._page_identity is not _MISSING:
             blob["source_page_identity"] = self._page_identity
@@ -673,9 +686,9 @@ class Session:
             self._history_baseline = copy.deepcopy(baseline)
         return {**lay.current_snapshot(), **self._history_baseline}
 
-    def edit(self, fn: Callable[[Layout], Any]) -> Any:
+    def edit(self, fn: Callable[[Layout], Any], *, expected: dict | None = None) -> Any:
         """Run fn on the draft as one undoable step. If it raises, the draft is left untouched."""
-        with self._exclusive():
+        with self._exclusive(expected=expected):
             snapshot = self._history_snapshot()
             before = copy.deepcopy(self.require())
             try:
@@ -713,8 +726,8 @@ class Session:
                 if folder_seen and node.kind == "widget" and node_structure(node) in leading_widgets:
                     raise LayoutError("iOS 16 keeps these widgets ahead of folders; place the folder after the widgets")
 
-    def _step_history(self, steps: list[dict[str, Any]], reverse: list[dict[str, Any]]) -> bool:
-        with self._exclusive():
+    def _step_history(self, steps: list[dict[str, Any]], reverse: list[dict[str, Any]], expected: dict | None) -> bool:
+        with self._exclusive(expected=expected):
             if not steps:
                 return False
             before = self.require()
@@ -730,11 +743,11 @@ class Session:
             reverse.append(snapshot)
             return True
 
-    def undo(self) -> bool:
-        return self._step_history(self._undo, self._redo)
+    def undo(self, *, expected: dict | None = None) -> bool:
+        return self._step_history(self._undo, self._redo, expected)
 
-    def redo(self) -> bool:
-        return self._step_history(self._redo, self._undo)
+    def redo(self, *, expected: dict | None = None) -> bool:
+        return self._step_history(self._redo, self._undo, expected)
 
     def load_usage(self, days: int = 30) -> dict[str, Any]:
         from . import usage
@@ -947,8 +960,8 @@ class Session:
     def gaps_readable(self) -> bool:
         return getattr(self.source, "pins", None) is not None
 
-    async def read(self) -> dict[str, Any]:
-        with self._exclusive(refresh=True):
+    async def read(self, *, expected: dict | None = None) -> dict[str, Any]:
+        with self._exclusive(refresh=True, expected=expected):
             return await self._read_locked()
 
     async def _read_locked(self) -> dict[str, Any]:
@@ -1018,11 +1031,11 @@ class Session:
         return {"device": {k: v for k, v in info.items() if k != "UniqueDeviceID"},
                 **self.layout.summary()["counts"]}
 
-    def reset(self) -> None:
+    def reset(self, *, expected: dict | None = None) -> None:
         def restore_original(lay: Layout) -> None:
             self.layout = lay.original()
 
-        self.edit(restore_original)
+        self.edit(restore_original, expected=expected)
 
     # ---- icons ------------------------------------------------------------------
 
@@ -1269,9 +1282,9 @@ class Session:
         self._history_baseline = None
         return res
 
-    async def apply(self, token: str) -> dict[str, Any]:
+    async def apply(self, token: str, *, expected: dict | None = None) -> dict[str, Any]:
         require_writable()
-        with self._exclusive():
+        with self._exclusive(expected=expected):
             self._require_known()
             return await self._apply_locked(token)
 
@@ -1291,19 +1304,38 @@ class Session:
     def backups(self) -> list[str]:
         return sorted(p.name for p in self._dev_dir("backups").glob("*.plist"))
 
-    async def restore(self, name: str) -> dict[str, Any]:
+    def _backup_bytes(self, name: str) -> bytes:
+        directory = self._dev_dir("backups")
+        if not name or Path(name).name != name:
+            raise LayoutError("invalid backup filename")
+        try:
+            fd = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as stream:
+                return stream.read()
+        except OSError as e:
+            raise LayoutError(f"no backup named {name!r}") from e
+
+    def _restore_review(self, name: str, data: bytes) -> str:
+        body = [self.device_id, self.binding["revision"], name, hashlib.sha256(data).digest()]
+        return hashlib.sha256(plistlib.dumps(body, fmt=plistlib.FMT_BINARY)).hexdigest()
+
+    def review_backup(self, name: str, expected: dict) -> str:
+        with self._exclusive(expected=expected):
+            self.require()
+            return self._restore_review(name, self._backup_bytes(name))
+
+    async def restore(self, name: str, *, expected: dict | None = None, review: str | None = None) -> dict[str, Any]:
         require_writable()
-        with self._exclusive():
+        with self._exclusive(expected=expected):
             self._require_known()
             if self._draft_error:
                 raise LayoutError(self._draft_error)
-            return await self._restore_locked(name)
+            data = self._backup_bytes(name)
+            if expected is not None and review != self._restore_review(name, data):
+                raise ReviewChanged("the reviewed backup changed; select the backup again")
+            return await self._restore_locked(name, data)
 
-    async def _restore_locked(self, name: str) -> dict[str, Any]:
-        p = self._dev_dir("backups") / name
-        if not p.exists() or p.is_symlink() or p.parent != self._dev_dir("backups"):
-            raise LayoutError(f"no backup named {name!r}")
-        data = p.read_bytes()
+    async def _restore_locked(self, name: str, data: bytes) -> dict[str, Any]:
         try:
             blob = plistlib.loads(data)
             provenance = blob.get("provenance") if isinstance(blob, dict) else None

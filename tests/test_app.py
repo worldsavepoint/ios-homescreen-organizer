@@ -109,15 +109,16 @@ def test_app_api_guards_and_ops(dict_phone, tmp_path, monkeypatch):
     assert c.post("/api/read", json={}).status_code == 401
     assert TestClient(ui.app, base_url="http://evil.example").get("/api/state").status_code == 403
     h = {"X-Token": ui.TOKEN}
-    v = c.post("/api/read", json={}, headers=h).json()
+    v = c.get("/api/state", headers=h).json()
+    v = c.post("/api/read", json={"binding": v["binding"]}, headers=h).json()
     assert v["loaded"] and v["library"] is not None
     app_id = next(x["id"] for x in v["pages"][2] if x["kind"] == "app")
-    v = c.post("/api/op", json={"op": "move", "args": {"id": app_id, "target": "library"}}, headers=h).json()
+    v = c.post("/api/op", json={"binding": v["binding"], "op": "move", "args": {"id": app_id, "target": "library"}}, headers=h).json()
     assert v["diff"]["to_app_library"] == 1 and v["history"]["undo"] == 1
     wid = next(x["id"] for p in v["pages"] for x in p if x["kind"] == "widget")
-    bad = c.post("/api/op", json={"op": "move", "args": {"id": wid, "target": "dock"}}, headers=h)
+    bad = c.post("/api/op", json={"binding": v["binding"], "op": "move", "args": {"id": wid, "target": "dock"}}, headers=h)
     assert bad.status_code == 400 and "dock" in bad.json()["error"]
-    r = c.post("/api/apply", json={"token": v["diff"]["apply_token"]}, headers=h).json()
+    r = c.post("/api/apply", json={"binding": v["binding"], "token": v["diff"]["apply_token"]}, headers=h).json()
     assert r["result"]["ok"]
     assert c.get("/api/backups", headers=h).json()["backups"]
     assert c.get("/icon", params={"id": app_id}, headers=h).status_code == 200

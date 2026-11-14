@@ -123,7 +123,7 @@ let query = "";
 
 // ---- server ----------------------------------------------------------------------------
 
-async function api(path, body) {
+async function api(path, body, binding = V?.binding) {
   await globalThis.ScreenOrganizerOnboarding?.ready;
   const authenticationFailure = await authentication;
   if (authenticationFailure) {
@@ -138,7 +138,7 @@ async function api(path, body) {
   const opts = body === undefined ? {} : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({...body, binding}),
   };
   const r = await fetch(path, { credentials: "same-origin", ...opts });
   let data = {};
@@ -153,9 +153,9 @@ async function api(path, body) {
   return data;
 }
 
-async function op(name, args = {}, onSuccess) {
+async function op(name, args = {}, onSuccess, binding = V?.binding) {
   try {
-    const view = await api("/api/op", { op: name, args });
+    const view = await api("/api/op", { op: name, args }, binding);
     onSuccess?.();
     setView(view);
     return true;
@@ -423,9 +423,10 @@ function renderPages() {
     tb("▶", t("editor.movePageRight"), () => op("move_page", { page: n, to: n + 1 }), n === V.pages.length);
     tb("＋", t("editor.insertPage"), () => op("insert_page", { page: n + 1 }));
     tb("✕", t("editor.deletePageHint"), async () => {
+      const binding = V?.binding;
       if (page.length && !(await confirmBox(() => t("editor.deletePageTitle", {number: number(n)}), () =>
         t("editor.deletePageBody"), () => t("editor.deletePage"), true))) return;
-      op("delete_page", { page: n });
+      op("delete_page", { page: n }, undefined, binding);
     });
     head.appendChild(tools);
     card.appendChild(head);
@@ -706,6 +707,7 @@ async function moveIds(ids, target, before) {
 }
 
 async function dropOnto(item, ids, ctx) {
+  const binding = V?.binding;
   if (item.kind === "folder") {
     if (await op("move_many", { ids, target: item.id }, () => sel.clear())) toast(() => t("editor.movedInto", {name: item.name}));
     return;
@@ -714,7 +716,7 @@ async function dropOnto(item, ids, ctx) {
   if (!name) return;
   const page = ctx.target;
   const siblings = locateIndex(item.id, page);
-  await op("create_folder", { name, ids: [item.id, ...ids], target: page, index: siblings }, () => sel.clear());
+  await op("create_folder", { name, ids: [item.id, ...ids], target: page, index: siblings }, () => sel.clear(), binding);
 }
 
 function locateIndex(id, target) {
@@ -724,6 +726,7 @@ function locateIndex(id, target) {
 }
 
 async function newFolderFromSelection() {
+  const binding = V?.binding;
   const ids = [...sel].filter((i) => { const it = findItem(i); return it && it.kind !== "folder" && it.kind !== "widget"; });
   if (!ids.length) return;
   const name = await promptText(() => t("editor.newFolder"), () => t("editor.folderFromSelection", {count: number(ids.length)}), t("editor.folderDefault"));
@@ -734,7 +737,7 @@ async function newFolderFromSelection() {
     const i = V.pages[p].findIndex((x) => ids.includes(x.id));
     if (i >= 0) { target = `page:${p + 1}`; index = i; break; }
   }
-  await op("create_folder", { name, ids, target, index }, () => sel.clear());
+  await op("create_folder", { name, ids, target, index }, () => sel.clear(), binding);
 }
 
 async function selectionToLibrary() {
@@ -801,11 +804,12 @@ async function selectDevice(udid, quiet) {
 // ---- top-level actions ----------------------------------------------------------------
 
 async function readDevice() {
+  const binding = V?.binding;
   if (V && V.loaded && (V.diff.has_changes || V.history.undo)) {
     if (!(await confirmBox(() => t("editor.readAgainTitle"), () => t("editor.readAgainBody", {device: D()}), () => t("editor.read"), true))) return;
   }
   try {
-    const v = await withBusy(() => t("editor.reading", {device: V && V.loaded ? D() : t("editor.device")}), () => api("/api/read", {}));
+    const v = await withBusy(() => t("editor.reading", {device: V && V.loaded ? D() : t("editor.device")}), () => api("/api/read", {}, binding));
     clearEditor();
     setView(v);
     toast(() => t("editor.readSuccess"), "ok");
@@ -818,6 +822,7 @@ async function review() {
   if (!V?.loaded) return;
   if (V.read_only) { toast(() => t("editor.readOnly"), "error"); return; }
   const d = V.diff;
+  const binding = V.binding;
   if (!d.has_changes || ScreenOrganizerOnboarding.dialog) return;
   const token = d.apply_token;
   if (typeof token !== "string" || !token) return;
@@ -873,7 +878,7 @@ async function review() {
   if (!(await modal({ title: () => d.problems.length ? t("editor.fixFirst") : t("editor.applyTitle", {device: D()}), body, actions }))) return;
   if (!V?.loaded || V.read_only || V.diff.apply_token !== token || !V.diff.has_changes || V.diff.problems.length) return;
   try {
-    const res = await withBusy(() => t("editor.writing", {device: D()}), () => api("/api/apply", { token }));
+    const res = await withBusy(() => t("editor.writing", {device: D()}), () => api("/api/apply", { token }, binding));
     showWriteOutcome(res, () => t("editor.applied", {device: D()}));
   } catch (e) {
     showError(e);
@@ -932,7 +937,12 @@ function backupLabel(name) {
 }
 
 async function showBackups() {
-  const { backups } = await api("/api/backups");
+  const binding = V?.binding;
+  const { backups, binding: listed } = await api("/api/backups");
+  if (binding?.device !== listed?.device || binding?.revision !== listed?.revision) {
+    setView(await api("/api/state"));
+    throw new Error(t("error.staleDraft"));
+  }
   const body = el("div");
   if (!backups.length) body.appendChild(localizedEl("p", null, () => t("editor.noBackups")));
   for (const name of backups) {
@@ -944,14 +954,17 @@ async function showBackups() {
     body.appendChild(row);
   }
   const name = await modal({ title: () => t("editor.backups"), body, actions: [{ label: () => t("common.close") }] });
-  if (!name || !(await confirmBox(() => t("editor.restoreTitle"), () => t("editor.restoreBody", {device: D()}), () => t("editor.restore")))) return;
+  if (!name) return;
+  const { review } = await api("/api/backup-review", { name }, binding);
+  if (!(await confirmBox(() => t("editor.restoreTitle"), () => t("editor.restoreBody", {device: D()}), () => t("editor.restore")))) return;
   try {
-    const res = await withBusy(() => t("editor.restoring"), () => api("/api/restore", { name }));
+    const res = await withBusy(() => t("editor.restoring"), () => api("/api/restore", { name, review }, binding));
     showWriteOutcome(res, () => t("editor.restored"));
   } catch (e) { showError(e); }
 }
 
 async function organize(name) {
+  const binding = V?.binding;
   $("#organize-menu").hidden = true;
   const keep = $("#keep-first").checked;
   if (name === "group_categories") {
@@ -959,7 +972,7 @@ async function organize(name) {
       t("editor.groupBody"), () =>
       t("editor.lookupGroup"));
     if (!ok) return;
-    return withBusy(() => t("editor.lookingUp"), () => op(name, { keep_first_page: keep }));
+    return withBusy(() => t("editor.lookingUp"), () => op(name, { keep_first_page: keep }, undefined, binding));
   }
   const label = { sort_color: "editor.sortingColor", optimize_usage: "editor.optimizingUsage" }[name];
   const args = ["sort_color", "sort_alpha"].includes(name) ? { keep_first_page: keep }
@@ -1007,7 +1020,8 @@ $("#read-empty").onclick = readDevice;
 $("#undo").onclick = () => op("undo");
 $("#redo").onclick = () => op("redo");
 $("#reset").onclick = async () => {
-  if (await confirmBox(() => t("editor.resetTitle"), () => t("editor.resetBody", {device: D()}), () => t("editor.reset"), true)) op("reset");
+  const binding = V?.binding;
+  if (await confirmBox(() => t("editor.resetTitle"), () => t("editor.resetBody", {device: D()}), () => t("editor.reset"), true)) op("reset", {}, undefined, binding);
 };
 $("#review").onclick = review;
 $("#backups-btn").onclick = () => showBackups().catch((e) => showError(e));
@@ -1039,8 +1053,9 @@ $("#folder-add-page").onclick = () => {
 };
 $("#folder-dissolve").onclick = async () => {
   const f = findItem(openFolder);
+  const binding = V?.binding;
   if (f && await confirmBox(() => t("editor.removeFolderTitle", {name: f.name}), () => t("editor.removeFolderBody"), () => t("editor.removeFolder"), true)) {
-    op("dissolve_folder", { id: f.id }, () => { openFolder = null; });
+    op("dissolve_folder", { id: f.id }, () => { openFolder = null; }, binding);
   }
 };
 $("#board").addEventListener("click", (e) => {

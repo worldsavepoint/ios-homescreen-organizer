@@ -30,6 +30,7 @@ from . import organize, usage
 from . import config
 from .config import DATA, session
 from .model import Layout, LayoutError, Node, widget_apps
+from .session import ReviewChanged
 
 WEB = Path(__file__).parent / "web"
 TOKEN = os.environ.get("HOMESCREEN_UI_TOKEN") or secrets.token_urlsafe(32)
@@ -248,8 +249,8 @@ def view(s=None) -> dict[str, Any]:
     s = session() if s is None else s
     if s.layout is None:
         result = {"loaded": False, "source": s.source.name, "device_id": config.current_device(),
-                  "read_only": _read_only()}
-        if s._draft_error:
+                  "read_only": _read_only(), "binding": getattr(s, "binding", None)}
+        if getattr(s, "_draft_error", None):
             result["draft_error"] = s._draft_error
         return result
     lay = s.layout
@@ -303,6 +304,7 @@ def view(s=None) -> dict[str, Any]:
         change["to"] = new[nid][1] if nid in new else None
     return {
         "loaded": True,
+        "binding": getattr(s, "binding", None),
         "read_only": _read_only(),
         "source": s.source.name,
         "device_id": s.device_id,
@@ -418,7 +420,16 @@ async def get_health(request: Request) -> Response:
 
 
 def _err(e: Exception, status: int = 400, s=None) -> JSONResponse:
+    if isinstance(e, ReviewChanged):
+        status = 409
     return JSONResponse({"error": str(e), "view": view(s)}, status_code=status)
+
+
+def _reviewed_session(body: dict):
+    selected = session()
+    if body.get("binding") != selected.binding:
+        raise ReviewChanged("the reviewed device or draft changed; review the current layout")
+    return selected
 
 
 async def index(request: Request) -> Response:
@@ -441,17 +452,19 @@ async def post_op(request: Request) -> Response:
         return bad
     body = await _json(request)
     name, args = body.get("op"), body.get("args") or {}
-    s = session()
     try:
+        s = _reviewed_session(body)
+        expected = body["binding"]
         if name == "undo":
-            s.undo()
+            s.undo(expected=expected)
         elif name == "redo":
-            s.redo()
+            s.redo(expected=expected)
         elif name == "reset":
-            s.reset()
+            s.reset(expected=expected)
         elif name == "sort_color":
             colors = await s.icon_colors()
-            s.edit(lambda lay: organize.by_color(lay, colors, args.get("keep_first_page", True)))
+            _reviewed_session(body).edit(lambda lay: organize.by_color(lay, colors, args.get("keep_first_page", True)),
+                                        expected=expected)
         elif name == "load_usage":
             if args.get("source") == "device":
                 async with _device_lock:
@@ -470,32 +483,37 @@ async def post_op(request: Request) -> Response:
             if not s.usage.get("ok"):
                 raise LayoutError(s.usage.get("error", "no usage data"))
             opens = s.usage["opens"]
-            s.edit(lambda lay: usage.optimize(lay, opens, args.get("keep_first_page", False)))
+            _reviewed_session(body).edit(lambda lay: usage.optimize(lay, opens, args.get("keep_first_page", False)),
+                                        expected=expected)
         elif name == "group_categories":
             lay = s.require()
             ids = [n.id for p in lay.pages for n in p if n.kind == "app"]
             cats = await asyncio.to_thread(organize.fetch_categories, ids, DATA / "categories.json")
             keep = args.get("keep_first_page", True)
-            s.edit(lambda lay: organize.into_folders(lay, organize.category_groups(lay, cats, keep), keep))
+            _reviewed_session(body).edit(lambda lay: organize.into_folders(lay, organize.category_groups(lay, cats, keep), keep),
+                                        expected=expected)
         else:
             factory = _ops().get(name)
             if factory is None:
                 raise LayoutError(f"unknown operation {name!r}")
-            s.edit(factory(**args))
+            s.edit(factory(**args), expected=expected)
     except (LayoutError, TypeError, ValueError, KeyError) as e:
         return _err(e)
     except OSError as e:
         return _err(e, 502)
-    return JSONResponse(view())
+    return JSONResponse(view(s))
 
 
 async def post_read(request: Request) -> Response:
     if (bad := _guard(request)):
         return bad
+    body = await _json(request)
     async with _device_lock:
-        s = session()
         try:
-            await s.read()
+            s = _reviewed_session(body)
+            await s.read(expected=body["binding"])
+        except ReviewChanged as e:
+            return _err(e)
         except Exception as e:
             return _err(RuntimeError(f"couldn't read the device: {e}"), 502, s)
     return JSONResponse(view(s))
@@ -509,12 +527,13 @@ async def post_apply(request: Request) -> Response:
     body = await _json(request)
     async with _device_lock:
         try:
-            result = await session().apply(str(body.get("token", "")))
+            s = _reviewed_session(body)
+            result = await s.apply(str(body.get("token", "")), expected=body["binding"])
         except LayoutError as e:
             return _err(e)
         except Exception as e:
             return _err(RuntimeError(f"apply failed: {e}"), 502)
-    return JSONResponse({"result": result, "view": view()})
+    return JSONResponse({"result": result, "view": view(s)})
 
 
 _names: dict[str, dict[str, Any]] = {}  # udid -> name/model/version, looked up once per launch
@@ -557,11 +576,17 @@ async def get_devices(request: Request) -> Response:
 async def post_device(request: Request) -> Response:
     if (bad := _guard(request)):
         return bad
-    udid = str((await _json(request)).get("udid", ""))
+    body = await _json(request)
+    udid = str(body.get("udid", ""))
     if not udid:
         return _err(LayoutError("no device given"))
     async with _device_lock:
-        config.select_device(udid)
+        try:
+            s = _reviewed_session(body)
+            with s._exclusive(expected=body["binding"]):
+                config.select_device(udid)
+        except LayoutError as e:
+            return _err(e)
     return JSONResponse(view())
 
 
@@ -569,7 +594,19 @@ async def get_backups(request: Request) -> Response:
     if (bad := _guard(request)):
         return bad
     s = session()
-    return JSONResponse({"backups": list(reversed(s.backups())) if s.device_id else []})
+    return JSONResponse({"backups": list(reversed(s.backups())) if s.device_id else [], "binding": s.binding})
+
+
+async def post_backup_review(request: Request) -> Response:
+    if bad := _guard(request):
+        return bad
+    body = await _json(request)
+    try:
+        s = _reviewed_session(body)
+        review = s.review_backup(str(body.get("name", "")), body["binding"])
+    except LayoutError as e:
+        return _err(e)
+    return JSONResponse({"review": review})
 
 
 async def post_restore(request: Request) -> Response:
@@ -580,12 +617,13 @@ async def post_restore(request: Request) -> Response:
     body = await _json(request)
     async with _device_lock:
         try:
-            result = await session().restore(str(body.get("name", "")))
+            s = _reviewed_session(body)
+            result = await s.restore(str(body.get("name", "")), expected=body["binding"], review=body.get("review"))
         except LayoutError as e:
             return _err(e)
         except Exception as e:
             return _err(RuntimeError(f"restore failed: {e}"), 502)
-    return JSONResponse({"result": result, "view": view()})
+    return JSONResponse({"result": result, "view": view(s)})
 
 
 async def get_icon(request: Request) -> Response:
@@ -625,6 +663,7 @@ app = Starlette(routes=[
     Route("/api/devices", get_devices),
     Route("/api/device", post_device, methods=["POST"]),
     Route("/api/backups", get_backups),
+    Route("/api/backup-review", post_backup_review, methods=["POST"]),
     Route("/api/restore", post_restore, methods=["POST"]),
     Route("/icon", get_icon),
     Mount("/static", StaticFiles(directory=WEB), name="static"),

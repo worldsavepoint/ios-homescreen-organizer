@@ -55,7 +55,7 @@ def test_bootstrap_creates_private_cookie_and_health_requires_header(web):
     assert client.get("/api/state").status_code == 200
     assert client.get("/v1/health").status_code == 401  # cookies cannot impersonate readiness
     assert client.get("/v1/health", headers=h).json() == {"app": "homescreen", "ready": True}
-    assert client.post("/api/read", headers={"Origin": "http://127.0.0.1:8765"}).json()["loaded"]
+    assert client.post("/api/read", json={"binding": ui.session().binding}, headers={"Origin": "http://127.0.0.1:8765"}).json()["loaded"]
     assert client.post("/api/read").status_code == 403  # cookie writes require same-origin proof
 
 
@@ -100,7 +100,7 @@ def test_icons_are_limited_to_loaded_layout_including_widgets(web, monkeypatch):
     monkeypatch.setattr(ui.session(), "icon", icon)
     assert client.get("/icon?id=com.unknown.app", headers=h).status_code == 404
     assert calls == []
-    client.post("/api/read", headers=h)
+    client.post("/api/read", headers=h, json={"binding": ui.session().binding})
     lay = ui.session().require()
     widget = next(n for n in lay.nodes.values() if n.kind == "widget")
     widget.raw["elements"][0]["containerBundleIdentifier"] = "com.widget.actual-container"
@@ -116,7 +116,7 @@ def test_readonly_is_visible_and_write_routes_reject_before_session(web, monkeyp
     monkeypatch.setenv("HOMESCREEN_READ_ONLY", "1")
     h = {"X-Token": ui.TOKEN}
     assert client.get("/api/state", headers=h).json()["read_only"] is True
-    assert client.post("/api/read", headers=h).json()["read_only"] is True
+    assert client.post("/api/read", headers=h, json={"binding": ui.session().binding}).json()["read_only"] is True
     async def forbidden(*args):
         pytest.fail("read-only request reached a device write method")
     monkeypatch.setattr(ui.session(), "apply", forbidden)
@@ -129,7 +129,7 @@ def test_readonly_is_visible_and_write_routes_reject_before_session(web, monkeyp
 def test_preview_widget_size_cannot_inject_attributes(web, tmp_path):
     from homescreen import preview
     ui, client = web
-    client.post("/api/read", headers={"X-Token": ui.TOKEN})
+    client.post("/api/read", headers={"X-Token": ui.TOKEN}, json={"binding": ui.session().binding})
     lay = ui.session().require()
     widget = next(n for n in lay.nodes.values() if n.kind == "widget")
     widget.raw["gridSize"] = 'small" onclick="alert(1)'

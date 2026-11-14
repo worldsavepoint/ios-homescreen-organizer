@@ -77,7 +77,7 @@ document.documentElement=nodes.find(n=>n.tagName==='html');document.body=nodes.f
 const calls=[], stored=new Map(), bridge=[], copied=[], unhandled=[];
 process.on('unhandledRejection',error=>unhandled.push(error.message));
 const item={id:'synthetic.app',kind:'app',name:'Synthetic Notes',slots:1};
-const fixture={loaded:true,read_only:true,source:'phone',device:{DeviceName:'Synthetic iPhone',ProductVersion:'18.0',ProductType:'iPhone'},
+const fixture={loaded:true,read_only:true,binding:{device:'synthetic',revision:'current'},source:'phone',device:{DeviceName:'Synthetic iPhone',ProductVersion:'18.0',ProductType:'iPhone'},
  dock:[],pages:[[{id:'synthetic.folder',kind:'folder',name:'My Folder',pos:[0,0,1,1],pages:[[item]]}]],library:[],bank:[],moved:['synthetic.app'],history:{undo:true,redo:false},
  grid:{cols:4,rows:6,dock:4,folder:9},slots:{page:24},diff:{has_changes:true,apply_token:"reviewed",placement_changes:[],items_moved:1,pages_before:1,pages_after:1,gaps_changed:0,to_app_library:0,problems:[]},moves:{},usage:null};
 const context={document,console,URL,URLSearchParams,Intl,Date,Set,Map,Promise,setTimeout:()=>0,clearTimeout(){},requestAnimationFrame:f=>f(),
@@ -345,7 +345,7 @@ assert.equal(calls.filter(p=>p.startsWith('/api/')).length,0);
 def test_backup_dates_follow_locale_without_loading_a_new_view():
     browser('''
 const originalFetch=context.fetch;
-context.fetch=async path=>path==='/api/backups'?{ok:true,json:async()=>({backups:['20261113-162400-before-apply-00000000000000000000000000000000.plist','20261113-162400-synthetic-phone.plist']})}:originalFetch(path);
+context.fetch=async path=>path==='/api/backups'?{ok:true,json:async()=>({binding:fixture.binding,backups:['20261113-162400-before-apply-00000000000000000000000000000000.plist','20261113-162400-synthetic-phone.plist']})}:originalFetch(path);
 $('#backups-btn').click();await tick();await tick();
 assert.ok($('#modal-body').textContent.includes('13.11.2026'));
 assert.ok($('#modal-body').textContent.includes('20261113-162400-synthetic-phone.plist'));
@@ -854,8 +854,11 @@ def test_verified_write_warning_keeps_status_and_recovery_details(operation):
     browser('''
 fixture.read_only=false;vm.runInContext('render()',context);const raw='Write returned synthetic. Readback result: matched.';
 const name='recovery.plist';context.fetch=async(path,opts)=>{
- if(path==='/api/backups'&&!opts.method)return {ok:true,json:async()=>({backups:[name]})};
+ if(path==='/api/backups'&&!opts.method)return {ok:true,json:async()=>({binding:fixture.binding,backups:[name]})};
+ if(path==='/api/backup-review'&&opts.method==='POST')return {ok:true,json:async()=>({review:'chosen'})};
  assert.equal(path,'/api/'+OP);assert.equal(opts.method,'POST');
+ assert.equal(JSON.parse(opts.body).binding.revision,'current');
+ if(OP==='restore')assert.equal(JSON.parse(opts.body).review,'chosen');
  return {ok:true,json:async()=>({view:fixture,result:{ok:true,status:'verified',error:raw,backup:name}})};};
 if(OP==='restore'){$('#backups-btn').click();await tick();$('#modal-body button').click();await tick();}
 else $('#review').click();
