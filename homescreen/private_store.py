@@ -4,7 +4,9 @@ import ctypes
 import errno
 import os
 import pathlib
+import stat
 import sys
+from contextlib import contextmanager
 from functools import lru_cache
 
 
@@ -95,3 +97,61 @@ def ensure_private_directory(path: pathlib.Path):
         os.fchmod(fd, 0o700)
     finally:
         os.close(fd)
+
+
+def _check_private_directory(fd, *, root=False):
+    info = os.fstat(fd)
+    if info.st_uid != os.geteuid() or info.st_mode & (0o077 if root else 0o022):
+        raise PermissionError("the Session data directory must be owned and private")
+    if sys.platform == "darwin":
+        _check_darwin_acl(fd)
+
+
+@contextmanager
+def open_private_directory(root, directory=None):
+    """Keep each private component open through its caller's filesystem operation."""
+    root = pathlib.Path(root).absolute()
+    directory = pathlib.Path(directory).absolute() if directory is not None else root
+    parts = directory.relative_to(root).parts
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("use a path inside the Session data directory")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _check_private_directory(fd, root=True)
+        for name in parts:
+            created = False
+            # Validated parents have no allow ACL for descendants to inherit.
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=fd)
+                created = True
+            except FileExistsError:
+                pass
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                if created:
+                    os.fsync(fd)
+                _check_private_directory(child)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def open_private_file(root, path, flags=os.O_RDONLY):
+    path = pathlib.Path(path)
+    with open_private_directory(root, path.parent) as directory:
+        fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PermissionError("the Session data file must be a regular owned file")
+        if sys.platform == "darwin":
+            _check_darwin_acl(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise

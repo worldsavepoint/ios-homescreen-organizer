@@ -211,6 +211,41 @@ def test_dangling_or_cyclic_symlink_fails_before_output(tmp_path, target):
     assert not output.exists()
 
 
+@pytest.mark.parametrize("target", [b"missing/../engine", b"engine/../engine"])
+def test_link_intermediate_components_require_directories(tmp_path, target):
+    folder = assets(tmp_path, lambda archive, arch: member(
+        archive, RESOURCES + "engine/invalid", target, stat.S_IFLNK | 0o777))
+    output = tmp_path / "distribution"
+    assert assemble(folder, output).returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("canonical,alias", [("X/Y", "x/y"), ("Caf\u00e9/Y", "Cafe\u0301/Y")])
+def test_link_alias_cannot_retarget_the_sibling_architecture(tmp_path, canonical, alias):
+    def graph(archive, arch):
+        prefix = RESOURCES + "engine/"
+        member(archive, prefix + "safe/z/", b"", stat.S_IFDIR | 0o755)
+        member(archive, prefix + canonical, b"../safe", stat.S_IFLNK | 0o777)
+        member(archive, prefix + "x86_64/engine", b"in-tree decoy")
+        member(archive, prefix + "escape", (alias + "/z/../../../x86_64/engine").encode(), stat.S_IFLNK | 0o777)
+    folder = assets(tmp_path, graph)
+    output = tmp_path / "distribution"
+    assert assemble(folder, output).returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("other", ["name", "NaMe", "Cafe\u0301"])
+def test_archive_alias_collisions_fail_before_output(tmp_path, other):
+    first = "Caf\u00e9" if other.startswith("Cafe") else "Name"
+    def collision(archive, arch):
+        member(archive, RESOURCES + "engine/" + first, b"first")
+        member(archive, RESOURCES + "engine/" + other, b"second")
+    folder = assets(tmp_path, collision)
+    output = tmp_path / "distribution"
+    assert assemble(folder, output).returncode != 0
+    assert not output.exists()
+
+
 def test_publish_checks_mcpb_members_against_signed_native_zips(tmp_path):
     sys.path.insert(0, str(ROOT / "macapp"))
     from mcp_bundle import verify_bundle

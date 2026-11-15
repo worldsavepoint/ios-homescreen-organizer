@@ -343,7 +343,10 @@ enum MCPProcessRunner {
                     if ready < 0 && errno == EINTR { continue }
                     guard ready > 0 else { throw ready == 0 ? MCPClientOperationCode.timedOut : .commandFailed }
                     if descriptors[3].revents != 0 { throw MCPClientOperationCode.cancelled }
-                    if descriptors[2].revents != 0 { descriptors[2].fd = -1 }
+                    if descriptors[2].revents != 0 {
+                        kill(-pid, SIGKILL)
+                        descriptors[2].fd = -1
+                    }
                     for i in 0..<2 where descriptors[i].revents != 0 {
                         var bytes = [UInt8](repeating: 0, count: 65536)
                         let count = read(descriptors[i].fd, &bytes, bytes.count)

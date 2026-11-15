@@ -410,6 +410,13 @@ def save():
     if not os.environ.get("TEST_NO_SNAPSHOT"):
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(json.dumps({"mcpServers": entries, "unrelatedSetting": True}))
+def foreign_postimage(stage):
+    marker = store.with_suffix(".foreign-once")
+    if os.getenv("TEST_POSTIMAGE_STAGE") != stage or marker.exists(): return
+    marker.touch()
+    entries[key] = json.loads(os.environ["TEST_POSTIMAGE_ENTRY"])
+    save()
+    if os.getenv("TEST_POSTIMAGE_OUTCOME") == "timeout": time.sleep(60)
 action = args[1]
 def interrupt_after(name):
     if os.getenv("TEST_INTERRUPT") == name:
@@ -444,10 +451,17 @@ if action == "get":
             color, reset = chr(27) + "[36m", chr(27) + "[0m"
             output = color + output.replace("\\n", reset + "\\n" + color) + reset
         print(output)
+        if os.getenv("TEST_RETAINED_PIPE"):
+            sys.stdout.flush()
+            if os.fork() == 0:
+                time.sleep(60)
+                os._exit(0)
+            Path(os.environ["TEST_PID"]).write_text("retained")
 elif action == "remove":
     assert args == ["mcp", "remove", "--scope", "user", "ios-homescreen-mcp"]
     entries.pop("ios-homescreen-mcp", None)
     save()
+    foreign_postimage("remove")
     interrupt_after("remove")
 elif action == "add-json":
     assert args[:5] == ["mcp", "add-json", "--scope", "user", "ios-homescreen-mcp"]
@@ -464,6 +478,7 @@ elif action == "add-json":
         if os.getenv("TEST_WRONG_ADD"): value["command"] = "/unexpected-engine"
     entries[key] = value
     save()
+    if value["command"].startswith("/new"): foreign_postimage("add")
     interrupt_after("restore" if value["command"].startswith("/old") else "add")
     if os.getenv("TEST_PARTIAL_ADD") and value["command"].startswith("/new"): sys.exit(7)
 elif action == "add":
@@ -492,6 +507,7 @@ elif action == "add":
         if "--scope" not in args:
             entries[key]["env"] = {"HOMESCREEN_READ_ONLY":"0","HOMESCREEN_ALLOW_APPLY":"1"}
     save()
+    foreign_postimage("add")
     interrupt_after("add" if "--scope" in args else "bootstrap")
     if os.environ.get("TEST_PARTIAL_ADD"):
         sys.exit(7)
@@ -669,16 +685,20 @@ def test_claude_partial_failed_add_restores_previous_entry(native_mcp_binary, sa
 
 
 @pytest.mark.parametrize("behavior", ["TEST_SKIP_ADD", "TEST_WRONG_ADD"])
-def test_claude_unverified_success_restores_previous_entry(native_mcp_binary, sandbox, tmp_path, behavior):
+def test_claude_unverified_success_preserves_postimage_ownership(native_mcp_binary, sandbox, tmp_path, behavior):
     client = fake_client(tmp_path)
     execute(native_mcp_binary, sandbox, "register", "claudeCode", client, "/old-engine")
     previous = json.loads(Path(sandbox["TEST_STORE"]).read_text())
     sandbox[behavior] = "1"
     result = execute(native_mcp_binary, sandbox, "register", "claudeCode", client, "/new-engine")
-    assert result["code"] == "invalidResponse"
-    assert result["recovery"] == "restored"
+    assert result["code"] == ("invalidResponse" if behavior == "TEST_SKIP_ADD" else "recoveryConflict")
+    assert result["recovery"] == ("restored" if behavior == "TEST_SKIP_ADD" else "failed")
     assert result["query"]["configuration"] == "configured"
-    assert json.loads(Path(sandbox["TEST_STORE"]).read_text()) == previous
+    current = json.loads(Path(sandbox["TEST_STORE"]).read_text())
+    if behavior == "TEST_SKIP_ADD":
+        assert current == previous
+    else:
+        assert current["ios-homescreen-mcp"]["command"] == "/unexpected-engine"
 
 
 def test_claude_unreadable_snapshot_does_not_remove_registration(native_mcp_binary, sandbox, tmp_path):
@@ -786,6 +806,11 @@ def test_registration_reconciles_exact_prior_entry(native_mcp_binary, sandbox, t
     (Path(sandbox["HOME"]) / ".claude.json").write_text(json.dumps({"mcpServers": entries}))
     sandbox[fault] = "1"
     result = execute(native_mcp_binary, sandbox, "register", client, executable, "/new")
+    if client == "claudeCode" and fault == "TEST_WRONG_ADD":
+        assert result["code"] == "recoveryConflict" and result["recovery"] == "failed"
+        assert json.loads(store.read_text())["ios-homescreen-mcp"]["command"] == "/unexpected-engine"
+        assert (Path(sandbox["HOME"]) / "Library/Application Support/homescreen-mcp/registration/claudeCode.json").exists()
+        return
     expected = "commandFailed" if fault == "TEST_PARTIAL_ADD" else "invalidResponse"
     assert result["code"] == expected
     assert json.dumps(json.loads(store.read_text()), sort_keys=True) == json.dumps(entries, sort_keys=True)
@@ -1115,15 +1140,54 @@ def test_refresh_compares_transport_fields_by_utf8(native_mcp_binary,sandbox,tmp
 
 
 @pytest.mark.parametrize("client", ["codex", "claudeCode"])
-def test_registration_postcheck_compares_command_bytes(native_mcp_binary,sandbox,tmp_path,client):
+def test_registration_postcheck_uses_authoritative_command_bytes(native_mcp_binary,sandbox,tmp_path,client):
     store, prior = seed_user(sandbox, ownedOption=True)
     cli = fake_client(tmp_path)
     engine = "/caf\u00e9/engine"
     reported = "/cafe\u0301/engine"
     result = execute(native_mcp_binary,{**sandbox,"TEST_EFFECTIVE":json.dumps({"command":reported})},
                      "register",client,cli,engine)
-    assert (result["code"],result["recovery"]) == ("invalidResponse","restored")
-    assert json.loads(store.read_text()) == prior
+    if client == "codex":
+        assert (result["code"],result["recovery"]) == ("invalidResponse","restored")
+        assert json.loads(store.read_text()) == prior
+    else:
+        assert result["code"] == "success"
+        assert json.loads(store.read_text())["ios-homescreen-mcp"]["command"].encode() == engine.encode()
+
+
+@pytest.mark.parametrize("separator", [" ", "\u2028", "\u2029", "\n", "\r"])
+@pytest.mark.parametrize("client", ["codex", "claudeCode"])
+def test_registration_keeps_complete_engine_path(native_mcp_binary, sandbox, tmp_path, client, separator):
+    engine = "/Applications/Personal" + separator + "Apps/Screen Organizer.app/Contents/Resources/engine/engine"
+    result = execute(native_mcp_binary, sandbox, "register", client, fake_client(tmp_path), engine)
+    assert result["code"] == "success"
+    assert json.loads(Path(sandbox["TEST_STORE"]).read_text())["ios-homescreen-mcp"]["command"] == engine
+
+
+@pytest.mark.parametrize("stage,outcome", [("remove", "timeout"), ("add", "timeout"), ("add", "success")])
+def test_claude_foreign_postimage_keeps_user_entry_and_journal(native_mcp_binary, sandbox, tmp_path, stage, outcome):
+    seed_user(sandbox, custom={"prior": True})
+    foreign = {"command": "/foreign", "args": ["user-argument"], "env": {}, "custom": {"concurrent": True}}
+    env = {**sandbox, "TEST_POSTIMAGE_STAGE": stage, "TEST_POSTIMAGE_OUTCOME": outcome,
+           "TEST_POSTIMAGE_ENTRY": json.dumps(foreign), "TEST_TIMEOUT": "1"}
+    result = execute(native_mcp_binary, env, "register", "claudeCode", fake_client(tmp_path), "/new")
+    assert json.loads(Path(sandbox["TEST_STORE"]).read_text())["ios-homescreen-mcp"] == foreign, result
+    assert result["recovery"] == "failed"
+    journal = Path(sandbox["HOME"]) / "Library/Application Support/homescreen-mcp/registration/claudeCode.json"
+    assert journal.exists()
+    assert [args[1] for args in commands(sandbox)].count("remove") == 1
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_query_finishes_when_leader_exits_with_idle_pipe_descendant(native_mcp_binary, sandbox, tmp_path, retained):
+    seed_user(sandbox)
+    env = {**sandbox, "TEST_TIMEOUT": "0.6"}
+    if retained:
+        env["TEST_RETAINED_PIPE"] = "1"
+    started = time.monotonic()
+    result = execute(native_mcp_binary, env, "query", "claudeCode", fake_client(tmp_path))
+    assert result == {"code": "success", "configuration": "configured", "connection": "connected", "mode": "readOnly"}
+    assert time.monotonic() - started < 1
 
 
 @pytest.mark.parametrize("sizes,fragmented", [([16 * 1024],False), ([4 * 1024 * 1024],True),

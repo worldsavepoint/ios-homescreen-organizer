@@ -30,13 +30,10 @@ def pack(lay: Layout, items: list[Node], start_page: int = 0) -> None:
     lay.unpin_pages(start_page)
     kept = lay.pages[:start_page]
     pages: list[list[Node]] = [[]]
-    used = 0
     for n in items:
-        if used + n.slots > lay.page_slots and pages[-1]:
+        if pages[-1] and lay.place([*pages[-1], n])[1]:
             pages.append([])
-            used = 0
         pages[-1].append(n)
-        used += n.slots
     lay.repack_pages(kept + [p for p in pages if p])
 
 
@@ -98,7 +95,8 @@ def into_folders(lay: Layout, groups: dict[str, list[str]], keep_first_page: boo
             existing[name.lower()] = folder
         else:
             lay.move_many(ids, folder.id)
-        filed[folder.name] = [lay.nodes[i].name for i in ids]
+        filed.setdefault(folder.name, []).extend(lay.nodes[i].name for i in ids)
+        allowed.difference_update(ids)
     lay.remove_empty_pages()
     if not lay.pages:
         lay.insert_page(1)

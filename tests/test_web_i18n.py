@@ -319,6 +319,96 @@ assert.ok($('#folder-pages').querySelector('[data-id="synthetic.app"]').classLis
 ''')
 
 
+def test_widget_keyboard_dialog_cancels_moves_and_pins_without_app_actions():
+    browser('''
+const widget={id:'synthetic.widget',kind:'widget',name:'Weather {name}',size:'small',slots:4,pos:[1,0,2,2]};
+fixture.pages[0].push(widget);context.setView(fixture);
+const originalFetch=context.fetch,operations=[];
+context.fetch=async(path,opts)=>{
+ if(path!='/api/op')return originalFetch(path,opts);
+ const data=JSON.parse(opts.body);operations.push(data);
+ assert.deepEqual(data.binding,fixture.binding);
+ if(data.op==='move'){fixture.pages[0]=fixture.pages[0].filter(it=>it.id!==widget.id);fixture.bank=[widget];}
+ else if(data.op==='pin'){fixture.bank=[];fixture.pages[0].push(widget);widget.pos=[2,1,2,2];}
+ else throw Error('Unexpected widget operation '+data.op);
+ return {ok:true,json:async()=>fixture};
+};
+let control=$('#pages').querySelector('[data-id="synthetic.widget"]');
+assert.equal(control.getAttribute('tabindex'),'0');assert.equal(control.getAttribute('role'),'button');
+assert.ok(control.getAttribute('aria-label').includes('Weather {name}'));
+control.focus();control.dispatchEvent({type:'keydown',key:'Enter'});await tick();
+assert.equal($('#modal').hidden,false);assert.equal(document.activeElement,$('#modal-actions').firstChild);
+document.dispatchEvent({type:'keydown',key:'Escape',target:document.activeElement});await tick();
+assert.equal(operations.length,0);assert.equal(document.activeElement.dataset.id,widget.id);
+control.dispatchEvent({type:'keydown',key:' '});await tick();
+assert.deepEqual($('#widget-target').children.map(n=>n.value),['bank','page:1']);
+$('#widget-target').value='bank';$('#widget-target').dispatchEvent({type:'change'});
+assert.equal($('#modal-actions').lastChild.disabled,true);
+await i18n.setLocale('fr');await tick();
+assert.equal($('#widget-target').value,'bank');assert.equal($('#widget-row').disabled,true);
+assert.equal($('#modal-title').textContent,i18n.t('editor.editWidget',{name:widget.name}));
+$('#modal-actions').children[1].click();await tick();await tick();
+assert.equal(operations[0].op,'move');assert.deepEqual(operations[0].args,{id:widget.id,target:'bank'});
+control=$('#bank').querySelector('[data-id="synthetic.widget"]');control.focus();control.dispatchEvent({type:'keydown',key:'Enter'});await tick();
+$('#widget-target').value='page:1';$('#widget-target').dispatchEvent({type:'change'});
+$('#widget-row').value='2';$('#widget-column').value='1';$('#modal-actions').lastChild.click();await tick();await tick();
+assert.equal(operations[1].op,'pin');assert.deepEqual(operations[1].args,{id:widget.id,page:1,cell:9});
+assert.equal(document.activeElement.dataset.id,widget.id);assert.equal($('#selection-bar').hidden,true);
+''', native=True)
+
+
+@pytest.mark.parametrize("action,destination", [("right", 2), ("insert", 2), ("delete", 1)])
+def test_page_toolbar_restores_focus_to_the_resulting_page(action, destination):
+    browser('''
+fixture.pages.push([]);context.setView(fixture);
+context.fetch=async(path,opts)=>{
+ assert.equal(path,'/api/op');const data=JSON.parse(opts.body),next=JSON.parse(JSON.stringify(fixture));
+ if(data.op==='move_page'){const [page]=next.pages.splice(data.args.page-1,1);next.pages.splice(data.args.to-1,0,page);}
+ else if(data.op==='insert_page')next.pages.splice(data.args.page-1,0,[]);
+ else if(data.op==='delete_page')next.pages.splice(data.args.page-1,1);
+ else throw Error(data.op);
+ return {ok:true,json:async()=>next};
+};
+const buttons=$('#pages').querySelector('.tools').children;
+const action=ACTION,index={right:1,insert:2,delete:3}[action];buttons[index].focus();buttons[index].click();await tick();
+if(action==='delete'){$('#modal-actions').lastChild.click();await tick();}
+await tick();await tick();
+assert.ok(document.activeElement.dataset.focusContext.startsWith('page:'+DESTINATION+':'));
+assert.ok(!document.activeElement.disabled);assert.ok(document.activeElement.closest('.page'));
+'''.replace("ACTION", json.dumps(action)).replace("DESTINATION", str(destination)), native=True)
+
+
+@pytest.mark.parametrize("menu,opener", [("organize-menu", "organize-btn"), ("device-menu", "device-btn")])
+def test_popup_escape_preserves_selection_and_returns_to_its_opener(menu, opener):
+    browser('''
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+$('#folder-pages').querySelector('[data-id="synthetic.app"]').click();
+if(MENU==='device-menu'){
+ const fetch=context.fetch;context.fetch=async(path,opts)=>path==='/api/devices'?{ok:true,json:async()=>({switching:true,current:'synthetic',discovery:'complete',devices:[{udid:'synthetic',connected:true}]})}:fetch(path,opts);
+ await context.loadDevices();
+}
+const opener=$('#'+OPENER);opener.disabled=false;opener.click();
+const menu=$('#'+MENU);assert.equal(menu.hidden,false);
+document.dispatchEvent({type:'keydown',key:'Escape',target:MENU==='organize-menu'?$('#keep-first'):menu});
+assert.equal(menu.hidden,true);assert.equal(document.activeElement,opener);
+assert.equal($('#drawer').hidden,false);assert.ok($('#folder-pages').querySelector('[data-id="synthetic.app"]').classList.contains('selected'));
+'''.replace("OPENER", json.dumps(opener)).replace("MENU", json.dumps(menu)), native=True)
+
+
+def test_moved_highlights_refresh_without_per_item_array_scans():
+    browser('''
+fixture.moved=['synthetic.app'];fixture.moved.includes=()=>{throw Error('per-item moved array scan');};
+context.setView(fixture);assert.ok($('#folder-pages').children.length===0);
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+assert.ok($('#folder-pages').querySelector('[data-id="synthetic.app"]').classList.contains('moved'));
+fixture.moved=[];context.setView(fixture);
+assert.ok(!$('#folder-pages').querySelector('[data-id="synthetic.app"]').classList.contains('moved'));
+context.setView({loaded:false});fixture.moved=['synthetic.app'];context.setView(fixture);
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+assert.ok($('#folder-pages').querySelector('[data-id="synthetic.app"]').classList.contains('moved'));
+''', native=True)
+
+
 def test_widget_size_and_usage_recovery_instructions_use_selected_language():
     browser('''
 fixture.pages[0].push({id:'synthetic.widget',kind:'widget',name:'My medium Widget',size:'medium',slots:8});

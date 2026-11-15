@@ -17,6 +17,8 @@ import json
 import os
 import uuid
 import plistlib
+import stat
+import tempfile
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from collections import Counter
@@ -28,7 +30,7 @@ from xml.parsers.expat import ExpatError
 from . import colors
 from .device import DISK_MARK, NAME_MARK, ObservedPins, Source, archive_page_order, disk_pins, disk_to_model, page_fields, require_writable
 from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, widget_configuration
-from .private_store import ensure_private_directory
+from .private_store import ensure_private_directory, open_private_directory, open_private_file
 
 KEEP_READS = 10
 MAX_UNDO = 200
@@ -40,72 +42,94 @@ class ReviewChanged(LayoutError):
     """The editor action was prepared against a different device, draft or backup."""
 
 
-def _sync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
+@contextmanager
+def _local_directory(path: Path, root: Path | None = None, directory_fd: int | None = None):
+    if directory_fd is not None:
+        yield directory_fd
+    else:
+        with open_private_directory(root or path, path) as fd:
+            yield fd
+
+
+def _sync_directory(path: Path, *, root: Path | None = None, directory_fd: int | None = None) -> None:
+    with _local_directory(path, root, directory_fd) as fd:
         os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
-def _exclusive_file(path: Path, data: bytes) -> None:
+def _exclusive_file(path: Path, data: bytes, *, root: Path | None = None, directory_fd: int | None = None) -> None:
     """Create a private file without overwriting another operation's recovery data."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        if stream.write(data) != len(data):
-            raise OSError("incomplete local file write")
-        stream.flush()
-        os.fsync(stream.fileno())
-    _sync_directory(path.parent)
+    with _local_directory(path.parent, root, directory_fd) as directory:
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(fd, "wb") as stream:
+            if stream.write(data) != len(data):
+                raise OSError("incomplete local file write")
+            stream.flush()
+            os.fsync(stream.fileno())
+        _sync_directory(path.parent, directory_fd=directory)
 
 
-def _publish_exclusive(path: Path, data: bytes) -> None:
+def _publish_exclusive(path: Path, data: bytes, *, root: Path | None = None) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        _exclusive_file(temporary, data)
-        os.link(temporary, path)
-        _sync_directory(path.parent)
-    finally:
-        with suppress(OSError):
-            temporary.unlink(missing_ok=True)
+    with _local_directory(path.parent, root) as directory:
+        try:
+            _exclusive_file(temporary, data, directory_fd=directory)
+            os.link(temporary.name, path.name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            _sync_directory(path.parent, directory_fd=directory)
+        finally:
+            with suppress(OSError):
+                _unlink_file(temporary, directory_fd=directory, missing_ok=True)
 
 
 @contextmanager
-def _previous_file(path: Path):
+def _previous_file(path: Path, *, root: Path | None = None, directory_fd: int | None = None):
     """Keep the old inode until all updates in the transaction succeed."""
     previous = path.with_name(f".{path.name}.{uuid.uuid4().hex}.previous")
-    linked = False
-    try:
-        os.link(path, previous, follow_symlinks=False)
-        linked = True
-    except FileNotFoundError:
-        pass
-    try:
-        yield
-    except BaseException:
-        if linked:
-            os.replace(previous, path)
-        else:
-            path.unlink(missing_ok=True)
-        _sync_directory(path.parent)
-        raise
-    finally:
-        if linked:
-            # Removing a private rollback link is housekeeping after the commit.
-            with suppress(OSError):
-                previous.unlink(missing_ok=True)
+    with _local_directory(path.parent, root, directory_fd) as directory:
+        linked = False
+        try:
+            info = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise PermissionError("the Session data file must be a regular owned file")
+            os.link(path.name, previous.name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            linked = True
+        except FileNotFoundError:
+            pass
+        try:
+            yield directory
+        except BaseException:
+            if linked:
+                os.replace(previous.name, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            else:
+                _unlink_file(path, directory_fd=directory, missing_ok=True)
+            _sync_directory(path.parent, directory_fd=directory)
+            raise
+        finally:
+            if linked:
+                # Removing a private rollback link is housekeeping after the commit.
+                with suppress(OSError):
+                    _unlink_file(previous, directory_fd=directory, missing_ok=True)
 
 
-def _private_replace(path: Path, data: bytes) -> None:
+def _unlink_file(path: Path, *, root: Path | None = None, directory_fd: int | None = None, missing_ok=False):
+    with _local_directory(path.parent, root, directory_fd) as directory:
+        try:
+            os.unlink(path.name, dir_fd=directory)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
+
+def _private_replace(path: Path, data: bytes, *, root: Path | None = None) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        _exclusive_file(temporary, data)
-        with _previous_file(path):
-            os.replace(temporary, path)
-            _sync_directory(path.parent)
-    finally:
-        with suppress(OSError):
-            temporary.unlink(missing_ok=True)
+    with _local_directory(path.parent, root) as directory:
+        try:
+            _exclusive_file(temporary, data, directory_fd=directory)
+            with _previous_file(path, directory_fd=directory):
+                os.replace(temporary.name, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+                _sync_directory(path.parent, directory_fd=directory)
+        finally:
+            with suppress(OSError):
+                _unlink_file(temporary, directory_fd=directory, missing_ok=True)
 
 
 def _stamp() -> str:
@@ -551,9 +575,26 @@ class Session:
 
     # ---- persistence ------------------------------------------------------------
 
+    def _read_local(self, path: Path) -> bytes:
+        with os.fdopen(open_private_file(self.dir, path), "rb") as stream:
+            return stream.read()
+
+    def _exists_local(self, path: Path) -> bool:
+        try:
+            fd = open_private_file(self.dir, path)
+        except FileNotFoundError:
+            return False
+        os.close(fd)
+        return True
+
+    def _local_files(self, directory: Path, suffix: str) -> list[Path]:
+        with open_private_directory(self.dir, directory) as fd:
+            return [directory / name for name in os.listdir(fd) if name.endswith(suffix)
+                    and stat.S_ISREG(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)]
+
     @contextmanager
     def _exclusive(self, *, refresh: bool = False, expected: dict | None = None):
-        fd = os.open(self.dir / ".session.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = open_private_file(self.dir, self.dir / ".session.lock", os.O_RDWR | os.O_CREAT)
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -563,7 +604,7 @@ class Session:
                 raise ReviewChanged("the reviewed device or draft changed; review the current layout")
             if not refresh or expected is not None:
                 try:
-                    digest = hashlib.sha256(self.draft_path.read_bytes()).digest()
+                    digest = hashlib.sha256(self._read_local(self.draft_path)).digest()
                 except FileNotFoundError:
                     digest = None
                 if digest != self._draft_digest:
@@ -583,7 +624,7 @@ class Session:
         """Present a saved draft and its binding under the same local lock."""
         with self._exclusive(refresh=True):
             try:
-                digest = hashlib.sha256(self.draft_path.read_bytes()).digest()
+                digest = hashlib.sha256(self._read_local(self.draft_path)).digest()
             except FileNotFoundError:
                 digest = None
             if digest != self._draft_digest:
@@ -602,14 +643,14 @@ class Session:
         return self.dir / ".pending-write.json"
 
     def _require_known(self) -> None:
-        if self._pending_path.exists():
+        if self._exists_local(self._pending_path):
             raise LayoutError("a pending write has an unknown outcome; perform an explicit read before any further write")
 
     def _clear_pending(self) -> None:
-        if self._pending_path.exists():
-            with _previous_file(self._pending_path):
-                self._pending_path.unlink()
-                _sync_directory(self.dir)
+        if self._exists_local(self._pending_path):
+            with _previous_file(self._pending_path, root=self.dir) as directory:
+                _unlink_file(self._pending_path, directory_fd=directory)
+                _sync_directory(self.dir, directory_fd=directory)
 
     async def _assert_identity(self) -> dict[str, Any]:
         info = await asyncio.wait_for(self.source.info(), OPERATION_TIMEOUT)
@@ -623,13 +664,15 @@ class Session:
     @property
     def draft_path(self) -> Path:
         if self._draft_key:
-            (self.dir / "drafts").mkdir(exist_ok=True)
+            with open_private_directory(self.dir, self.dir / "drafts"):
+                pass
             return self.dir / "drafts" / f"{_safe(self._draft_key)}.plist"
         return self.dir / "draft.plist"
 
     def _dev_dir(self, kind: str) -> Path:
         p = self.dir / kind / _safe(self.device_id or "unknown")
-        p.mkdir(parents=True, exist_ok=True)
+        with open_private_directory(self.dir, p):
+            pass
         return p
 
     def _save_draft(self) -> None:
@@ -649,12 +692,12 @@ class Session:
                 blob["source_pin_map"] = self._observed_placement
         blob = {k: v for k, v in blob.items() if v is not None}  # plists have no null
         data = plistlib.dumps(blob, fmt=plistlib.FMT_BINARY)
-        _private_replace(self.draft_path, data)
+        _private_replace(self.draft_path, data, root=self.dir)
         self._draft_digest = hashlib.sha256(data).digest()
 
     def _load_draft(self) -> None:
-        if self.draft_path.exists():
-            data = self.draft_path.read_bytes()
+        if self._exists_local(self.draft_path):
+            data = self._read_local(self.draft_path)
             self._draft_digest = hashlib.sha256(data).digest()
             try:
                 blob = plistlib.loads(data)
@@ -842,11 +885,18 @@ class Session:
         await self._assert_usage_identity(binding, selected)
         with self._usage_review(binding, selected):
             directory = self._dev_dir("usage")
-        files = await self.source.memory_reports(directory)
-        await self._assert_usage_identity(binding, selected)
-        apps = await self.source.installed_apps()
-        await self._assert_usage_identity(binding, selected)
-        return self._adopt_usage(usage.from_memory_reports(files, apps, known), binding, selected)
+        with tempfile.TemporaryDirectory(prefix="homescreen-usage-") as temporary:
+            staging = Path(temporary)
+            ensure_private_directory(staging)
+            files = await self.source.memory_reports(staging)
+            await self._assert_usage_identity(binding, selected)
+            apps = await self.source.installed_apps()
+            await self._assert_usage_identity(binding, selected)
+            for path in files:
+                with os.fdopen(open_private_file(staging, path), "rb") as stream:
+                    _private_replace(directory / path.relative_to(staging), stream.read(), root=self.dir)
+            result = usage.from_memory_reports(files, apps, known)
+        return self._adopt_usage(result, binding, selected)
 
     def history(self) -> dict[str, int]:
         return {"undo": len(self._undo), "redo": len(self._redo)}
@@ -867,8 +917,8 @@ class Session:
 
     def _widget_memory(self) -> tuple[dict[str, str | None], dict[str, str | None]]:
         path = self._widget_ids_path
-        if path.exists():
-            stored = json.loads(path.read_text())
+        if self._exists_local(path):
+            stored = json.loads(self._read_local(path))
             if isinstance(stored, dict) and isinstance(stored.get("instances"), dict):
                 if stored.get("version") == 3 and isinstance(stored.get("owners"), dict):
                     return stored["instances"], stored["owners"]
@@ -905,7 +955,7 @@ class Session:
                     known[key] = element if known.get(key, element) == element else None
         if known or owners:
             _private_replace(self._widget_ids_path, json.dumps(
-                {"version": 3, "instances": known, "owners": owners}).encode())
+                {"version": 3, "instances": known, "owners": owners}).encode(), root=self.dir)
 
     def _recover_widget_ids(self, widgets: list[dict[str, Any]]) -> None:
         known, owners = self._widget_memory()
@@ -961,10 +1011,10 @@ class Session:
 
     def _known_webclips(self) -> dict[str, dict[str, Any]]:
         path = self._webclips_path
-        if path.exists():
-            return plistlib.loads(path.read_bytes())
+        if self._exists_local(path):
+            return plistlib.loads(self._read_local(path))
         legacy = path.with_suffix(".json")
-        return json.loads(legacy.read_text()) if legacy.exists() else {}
+        return json.loads(self._read_local(legacy)) if self._exists_local(legacy) else {}
 
     def _remember_webclips(self, state: list[Any], library: list[Any] | None) -> None:
         known = self._known_webclips()
@@ -975,7 +1025,7 @@ class Session:
         if updated:
             result = plistlib.dumps(updated, fmt=plistlib.FMT_BINARY)
             if result != plistlib.dumps(known, fmt=plistlib.FMT_BINARY):
-                _private_replace(self._webclips_path, result)
+                _private_replace(self._webclips_path, result, root=self.dir)
 
     def _with_webclips(self, state: list[Any], library: list[Any] | None) -> list[Any] | None:
         """library plus every remembered web clip that isn't on the Home Screen."""
@@ -1010,15 +1060,15 @@ class Session:
 
     def _saved_placement_revision(self) -> str:
         try:
-            return self._placement_revision_path.read_text()
+            return self._read_local(self._placement_revision_path).decode()
         except FileNotFoundError:
             return ""
 
     def _gap_memory(self) -> dict[str, Any]:
-        if not self._gaps_path.exists():
+        if not self._exists_local(self._gaps_path):
             return {}
         try:
-            memory = json.loads(self._gaps_path.read_bytes())
+            memory = json.loads(self._read_local(self._gaps_path))
             if not isinstance(memory, dict):
                 raise ValueError("invalid gap memory")
             return memory
@@ -1026,7 +1076,7 @@ class Session:
             raise LayoutError("invalid saved pin memory; read again") from e
 
     def _remember_gaps(self, lay: Layout, previous: dict[str, Any] | None = None) -> None:
-        _private_replace(self._gaps_path, json.dumps(memory_pins(lay, previous), indent=1, sort_keys=True).encode())
+        _private_replace(self._gaps_path, json.dumps(memory_pins(lay, previous), indent=1, sort_keys=True).encode(), root=self.dir)
 
     def _layout_from(self, state: list[Any], library: list[Any] | None, *, recover_memory: bool = False) -> Layout:
         """A Layout with gaps: from the source when it can report them, else from memory."""
@@ -1034,7 +1084,7 @@ class Session:
         reported = getattr(self.source, "pins", None)
         if reported is not None:
             node_pins(lay, reported)
-        if self._gaps_path.exists() and (reported is None or recover_memory):
+        if self._exists_local(self._gaps_path) and (reported is None or recover_memory):
             memory_layout = lay if reported is None else Layout(state, library=library, grid=self.grid)
             try:
                 node_pins(memory_layout, self._gap_memory(), by_memory=True)
@@ -1070,8 +1120,8 @@ class Session:
         reported_clips = _clip_inventory(raw) if getattr(self.source, "source_archive", None) is not None else None
         clear_pending = False
         legacy_pending = None
-        if self._pending_path.exists():
-            pending_bytes = self._pending_path.read_bytes()
+        if self._exists_local(self._pending_path):
+            pending_bytes = self._read_local(self._pending_path)
             pending = json.loads(pending_bytes, object_pairs_hook=_pending_object)
             clear_pending = pending.get("device_id") == device_id
             name = pending.get("backup")
@@ -1094,14 +1144,14 @@ class Session:
             snapshot = reads / f"{_stamp()}.plist"
             with ExitStack() as transaction:
                 for path in (self._widget_ids_path, self._webclips_path, snapshot, self._gaps_path, self.draft_path):
-                    transaction.enter_context(_previous_file(path))
+                    transaction.enter_context(_previous_file(path, root=self.dir))
                 self._remember_widget_ids(state)
                 self._remember_webclips(state, library)
                 library = self._with_webclips(state, library)
-                _private_replace(snapshot, _pack(state, library))
-                for old in sorted(reads.glob("*.plist"))[:-KEEP_READS]:
-                    transaction.enter_context(_previous_file(old))
-                    old.unlink()
+                _private_replace(snapshot, _pack(state, library), root=self.dir)
+                for old in sorted(self._local_files(reads, ".plist"))[:-KEEP_READS]:
+                    directory = transaction.enter_context(_previous_file(old, root=self.dir))
+                    _unlink_file(old, directory_fd=directory)
                 self.layout = self._layout_from(state, library, recover_memory=True)
                 self.layout.approval_device = device_id
                 self._placement_revision = self._saved_placement_revision()
@@ -1111,15 +1161,16 @@ class Session:
                 self._save_draft()
                 if legacy_pending is not None:
                     unresolved = self.dir / "unresolved-writes"
-                    unresolved.mkdir(mode=0o700, exist_ok=True)
+                    with open_private_directory(self.dir, unresolved):
+                        pass
                     path = unresolved / (hashlib.sha256(legacy_pending).hexdigest() + ".json")
-                    transaction.enter_context(_previous_file(path))
+                    transaction.enter_context(_previous_file(path, root=self.dir))
                     try:
-                        _publish_exclusive(path, legacy_pending)
+                        _publish_exclusive(path, legacy_pending, root=self.dir)
                     except FileExistsError:
-                        if path.is_symlink() or path.read_bytes() != legacy_pending:
+                        if self._read_local(path) != legacy_pending:
                             raise LayoutError("unresolved write evidence changed; the pending record was retained")
-                    _sync_directory(self.dir)
+                    _sync_directory(self.dir, root=self.dir)
                 if clear_pending or legacy_pending is not None:
                     self._clear_pending()
             self._undo, self._redo = [], []
@@ -1145,11 +1196,11 @@ class Session:
 
     async def icon(self, bundle_id: str) -> bytes | None:
         cache = self._dev_dir("icons") / f"{_safe(bundle_id)}.png"
-        if cache.exists():
-            return cache.read_bytes()
+        if self._exists_local(cache):
+            return self._read_local(cache)
         png = await self.source.icon_png(bundle_id)
         if png:
-            cache.write_bytes(png)
+            _private_replace(cache, png, root=self.dir)
         return png
 
     async def icon_colors(self, ids: list[str] | None = None) -> dict[str, Any]:
@@ -1197,14 +1248,14 @@ class Session:
             provenance["source_shape"] = _source_shape_receipt(blob, self.device_id, self.grid, pages)
         blob["provenance"] = provenance
         data = plistlib.dumps(blob, fmt=plistlib.FMT_BINARY)
-        _publish_exclusive(p, data)
+        _publish_exclusive(p, data, root=self.dir)
         if pages:
             receipt_dir = self._dev_dir("observed-backups")
-            _publish_exclusive(receipt_dir / p.name, hashlib.sha256(data).digest())
-            _sync_directory(receipt_dir.parent)
+            _publish_exclusive(receipt_dir / p.name, hashlib.sha256(data).digest(), root=self.dir)
+            _sync_directory(receipt_dir.parent, root=self.dir)
         # The device and backups directories may have been created by this call.
-        _sync_directory(p.parent.parent)
-        _sync_directory(self.dir)
+        _sync_directory(p.parent.parent, root=self.dir)
+        _sync_directory(self.dir, root=self.dir)
         return p
 
     async def _write_verified(self, target: list[Any], target_lib: list[Any] | None,
@@ -1295,7 +1346,7 @@ class Session:
         backup = self._backup(saved.to_state(), saved.to_library(), label, saved_pins, observed=saved, archive=final.archive)
         lib_known = target_lib is not None
         _publish_exclusive(self._pending_path, json.dumps({"device_id": self.device_id,
-                           "backup": backup.name, "status": "pending"}).encode())
+                           "backup": backup.name, "status": "pending"}).encode(), root=self.dir)
         write_error = None
         try:
             operation = (prepared_write() if prepared_write is not None
@@ -1386,10 +1437,10 @@ class Session:
         previous = (self.layout, self._observed_placement, self._page_identity,
                     self._reported_clips, self._draft_digest, self._placement_revision)
         try:
-            with (_previous_file(self._gaps_path), _previous_file(self.draft_path),
-                  _previous_file(self._placement_revision_path)):
+            with (_previous_file(self._gaps_path, root=self.dir), _previous_file(self.draft_path, root=self.dir),
+                  _previous_file(self._placement_revision_path, root=self.dir)):
                 self._placement_revision = uuid.uuid4().hex
-                _private_replace(self._placement_revision_path, self._placement_revision.encode())
+                _private_replace(self._placement_revision_path, self._placement_revision.encode(), root=self.dir)
                 self._remember_gaps(written, requested_memory)
                 self.layout = adopted
                 self._observed_placement = copy.deepcopy(getattr(self.source, "pins", None))
@@ -1430,16 +1481,14 @@ class Session:
                                           self._observed_placement, prepared)
 
     def backups(self) -> list[str]:
-        return sorted(p.name for p in self._dev_dir("backups").glob("*.plist"))
+        return sorted(p.name for p in self._local_files(self._dev_dir("backups"), ".plist"))
 
     def _backup_bytes(self, name: str) -> bytes:
         directory = self._dev_dir("backups")
         if not name or Path(name).name != name:
             raise LayoutError("invalid backup filename")
         try:
-            fd = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, "rb") as stream:
-                return stream.read()
+            return self._read_local(directory / name)
         except OSError as e:
             raise LayoutError(f"no backup named {name!r}") from e
 
@@ -1559,8 +1608,8 @@ class Session:
                 body = {k: v for k, v in blob.items() if k != "provenance"}
                 record = self._dev_dir("observed-backups") / name
                 if (receipt == _source_shape_receipt(body, self.device_id, self.grid, pages)
-                        and record.is_file() and not record.is_symlink()
-                        and record.read_bytes() == hashlib.sha256(data).digest()):
+                        and self._exists_local(record)
+                        and self._read_local(record) == hashlib.sha256(data).digest()):
                     observed_pages = pages
             for index, page in enumerate(restored.pages):
                 if index not in observed_pages:

@@ -117,6 +117,7 @@ function showError(error) {
 }
 
 let V = null;               // current view from the server
+let movedIds = new Set();
 const sel = new Set();      // selected item ids
 let openFolder = null;      // id of the folder shown in the drawer
 let folderOpener = null;
@@ -344,6 +345,7 @@ function setView(v) {
   const deviceChanged = V && V.device_id !== v.device_id;
   if (!v.loaded || deviceChanged) clearEditor();
   V = v;
+  movedIds = new Set(v.loaded ? v.moved || [] : []);
   for (const id of [...sel]) if (!findItem(id)) sel.delete(id);
   if (openFolder && !findItem(openFolder)) openFolder = null;
   render(!deviceChanged);
@@ -351,9 +353,10 @@ function setView(v) {
 
 function focusItem(item) {
   if (!item) return;
-  const controls = [...document.querySelectorAll("[data-focus-context]")];
+  const controls = [...document.querySelectorAll("[data-focus-context]")].filter(node => !node.disabled);
   const node = controls.find(node => node.dataset.id === item.id && node.dataset.focusContext === item.context)
-    || controls.find(node => item.id && node.dataset.id === item.id);
+    || controls.find(node => item.id && node.dataset.id === item.id)
+    || controls.find(node => item.page && node.dataset.focusContext.startsWith(`page:${item.page}:`));
   node?.focus({preventScroll: true});
 }
 
@@ -396,8 +399,9 @@ function render(restoreFocus = true) {
 function itemControl(node, item, context) {
   node.setAttribute("role", "button");
   node.setAttribute("tabindex", "0");
-  node.setAttribute("aria-label", item.name);
-  node.setAttribute("aria-pressed", String(sel.has(item.id)));
+  node.setAttribute("aria-label", item.kind === "widget" ? node.title : item.name);
+  if (item.kind === "widget") node.setAttribute("aria-haspopup", "dialog");
+  else node.setAttribute("aria-pressed", String(sel.has(item.id)));
   node.dataset.focusContext = context;
   if (item.kind === "folder") {
     node.setAttribute("aria-expanded", String(openFolder === item.id));
@@ -412,13 +416,14 @@ function itemControl(node, item, context) {
 }
 
 function renderItem(item, container) {
-  const moved = V.moved.includes(item.id);
+  const moved = movedIds.has(item.id);
   if (item.kind === "widget") {
     const w = el("div", `widget w-${item.size}`);
     w.dataset.id = item.id;
     const ic = iconImg(item, "wicon");
     w.append(ic, el("div", "wname", item.name), el("div", "wkind", `${item.stack ? t("editor.smartStack") : t("editor.widget")} · ${widgetSize(item.size)}`));
     w.title = t("editor.widgetTitle", {name: item.name, kind: t(item.stack ? "editor.smartStack" : "editor.widget"), size: widgetSize(item.size)});
+    itemControl(w, item, container.target);
     wireDrag(w, item, container);
     return w;
   }
@@ -464,22 +469,28 @@ function renderPages() {
     if (trusted) slots.title = t("editor.widgetGridHint");
     head.appendChild(slots);
     const tools = el("div", "tools");
-    const tb = (label, title, fn, disabled) => {
+    const action = async (name, args, page, control, binding = V?.binding) => {
+      if (!await op(name, args, undefined, binding)) return;
+      const target = Math.min(page, V.pages.length);
+      focusItem(target ? {context: `page:${target}:${control}`, page: target} : {context: "add-page"});
+    };
+    const tb = (control, label, title, fn, disabled) => {
       const b = el("button", null, label);
       b.title = title;
       b.setAttribute("aria-label", title);
       b.disabled = !!disabled;
+      b.dataset.focusContext = `page:${n}:${control}`;
       b.onclick = fn;
       tools.appendChild(b);
     };
-    tb("◀", t("editor.movePageLeft"), () => op("move_page", { page: n, to: n - 1 }), n === 1);
-    tb("▶", t("editor.movePageRight"), () => op("move_page", { page: n, to: n + 1 }), n === V.pages.length);
-    tb("＋", t("editor.insertPage"), () => op("insert_page", { page: n + 1 }));
-    tb("✕", t("editor.deletePageHint"), async () => {
+    tb("left", "◀", t("editor.movePageLeft"), () => action("move_page", { page: n, to: n - 1 }, n - 1, "left"), n === 1);
+    tb("right", "▶", t("editor.movePageRight"), () => action("move_page", { page: n, to: n + 1 }, n + 1, "right"), n === V.pages.length);
+    tb("insert", "＋", t("editor.insertPage"), () => action("insert_page", { page: n + 1 }, n + 1, "insert"));
+    tb("delete", "✕", t("editor.deletePageHint"), async () => {
       const binding = V?.binding;
       if (page.length && !(await confirmBox(() => t("editor.deletePageTitle", {number: number(n)}), () =>
         t("editor.deletePageBody"), () => t("editor.deletePage"), true))) return;
-      op("delete_page", { page: n }, undefined, binding);
+      action("delete_page", { page: n }, n, "delete", binding);
     });
     head.appendChild(tools);
     card.appendChild(head);
@@ -543,7 +554,7 @@ function renderLibrary() {
     row.append(iconImg(it), el("span", "n", it.name));
     row.title = it.id;
     if (sel.has(it.id)) row.classList.add("selected");
-    if (V.moved.includes(it.id)) row.classList.add("moved");
+    if (movedIds.has(it.id)) row.classList.add("moved");
     itemControl(row, it, "library");
     wireDrag(row, it, { target: "library" });
     list.appendChild(row);
@@ -658,8 +669,11 @@ function renderFooter() {
 
 function onItemClick(e, item, context) {
   e.stopPropagation();
+  if (item.kind === "widget") {
+    if (!e.metaKey && !e.ctrlKey && !e.shiftKey) editWidget(item, context);
+    return;
+  }
   if (e.metaKey || e.ctrlKey || e.shiftKey) {
-    if (item.kind === "widget") return;
     sel.has(item.id) ? sel.delete(item.id) : sel.add(item.id);
     render();
     return;
@@ -675,6 +689,48 @@ function onItemClick(e, item, context) {
   if (sel.size && !sel.has(item.id)) sel.clear();
   sel.has(item.id) ? sel.delete(item.id) : sel.add(item.id);
   render();
+}
+
+async function editWidget(item, context) {
+  if (ScreenOrganizerOnboarding.dialog) return;
+  const binding = V?.binding, grid = G();
+  const body = el("div", "widget-fields");
+  const field = (id, key, options, value) => {
+    const label = el("label");
+    label.appendChild(localizedEl("span", null, () => t(key)));
+    const select = el("select");
+    select.id = id;
+    for (const [value, text] of options) {
+      const option = localizedEl("option", null, text);
+      option.value = value;
+      select.appendChild(option);
+    }
+    select.value = value;
+    label.appendChild(select);
+    body.appendChild(label);
+    return select;
+  };
+  const target = field("widget-target", "editor.destination", [["bank", () => t("editor.bank")],
+    ...V.pages.map((_, i) => [`page:${i + 1}`, () => t("editor.page", {number: number(i + 1)})])], context);
+  const row = field("widget-row", "editor.row", Array.from({length: grid.rows}, (_, i) => [String(i), () => number(i + 1)]), String(item.pos?.[0] || 0));
+  const column = field("widget-column", "editor.column", Array.from({length: grid.cols}, (_, i) => [String(i), () => number(i + 1)]), String(item.pos?.[1] || 0));
+  const choice = modal({title: () => t("editor.editWidget", {name: item.name}), body, actions: [
+    {label: () => t("common.cancel"), value: () => null},
+    {label: () => t("editor.moveWidget"), primary: true, value: () => "move"},
+    {label: () => t("editor.placeWidget"), value: () => "pin"},
+  ]});
+  const update = () => {
+    row.disabled = column.disabled = $("#modal-actions").lastChild.disabled = target.value === "bank";
+  };
+  target.onchange = update;
+  update();
+  const operation = await choice;
+  if (operation) {
+    const args = operation === "pin" ? {id: item.id, page: Number(target.value.slice(5)), cell: Number(row.value) * grid.cols + Number(column.value)}
+      : {id: item.id, target: target.value};
+    await op(operation, args, undefined, binding);
+  }
+  focusItem({id: item.id, context: target.value || context});
 }
 
 function clearMarks() {
@@ -1154,7 +1210,17 @@ $("#board").addEventListener("click", (e) => {
   if (!e.target.closest(".item, .widget, button") && sel.size) { sel.clear(); render(); }
 });
 document.addEventListener("keydown", (e) => {
-  if (e.defaultPrevented || !ScreenOrganizerOnboarding.accepted || ScreenOrganizerOnboarding.dialog || e.target.matches("input,select,textarea")) return;
+  if (e.defaultPrevented || !ScreenOrganizerOnboarding.accepted || ScreenOrganizerOnboarding.dialog) return;
+  if (e.key === "Escape") {
+    const popup = [["organize-menu", "organize-btn"], ["device-menu", "device-btn"]].find(([menu]) => !$("#" + menu).hidden);
+    if (popup) {
+      e.preventDefault();
+      $("#" + popup[0]).hidden = true;
+      $("#" + popup[1]).focus();
+      return;
+    }
+  }
+  if (e.target.matches("input,select,textarea")) return;
   const mod = e.metaKey || e.ctrlKey;
   if (mod && e.key.toLowerCase() === "z") { e.preventDefault(); op(e.shiftKey ? "redo" : "undo"); }
   else if (e.key === "Escape") { sel.clear(); closeFolder(); }

@@ -785,6 +785,45 @@ def test_native_workflow_returns_to_success_gated_package_builds():
     assert "    needs: test\n" in workflow.split("\n  assemble:\n", 1)[1]
 
 
+def test_build_recipe_changes_are_recorded_without_git(tmp_path, monkeypatch):
+    import importlib.util
+    import frozen_sources
+    project = tmp_path / "project"
+    swift = project / "macapp/Shell/Sources/Homescreen"
+    swift.mkdir(parents=True)
+    (project / "macapp/Shell/Package.swift").write_text("// package\n")
+    (swift / "App.swift").write_text("// launcher\n")
+    recipe = project / "macapp/make_icon.py"
+    recipe.write_bytes((ROOT / "macapp/make_icon.py").read_bytes())
+    build = project / "macapp/build.sh"
+    build.write_text("# original recipe\n")
+    baseline = {"project/" + p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in project.rglob("*") if p.is_file()}
+    manifest = tmp_path / "MANIFEST.json"
+    manifest.write_text(json.dumps({"files": baseline}))
+    record = tmp_path / "LOCAL-BUILD.json"
+    monkeypatch.setattr(frozen_sources, "launcher_digest", lambda executable: "f" * 64)
+    def capture():
+        record.write_text(json.dumps({"projectFiles": {}, "engine": "e" * 64}))
+        frozen_sources.finalize_local_record(project, manifest, record, tmp_path / "launcher")
+        return json.loads(record.read_bytes())
+    def icon_bytes():
+        spec = importlib.util.spec_from_file_location("local_icon_recipe", recipe)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.draw(32).tobytes()
+    assert capture()["projectChanges"] == {"modified": {}, "added": {}, "removed": []}
+    original_icon = icon_bytes()
+    recipe.write_text(recipe.read_text().replace("(255, 159, 10)", "(0, 0, 0)"))
+    build.write_text("# modified recipe\n")
+    assert icon_bytes() != original_icon
+    changed = capture()
+    assert changed["projectChanges"]["modified"] == {
+        "macapp/build.sh": hashlib.sha256(build.read_bytes()).hexdigest(),
+        "macapp/make_icon.py": hashlib.sha256(recipe.read_bytes()).hexdigest()}
+    assert changed["engine"] == "e" * 64
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Uses the native Swift compiler and Mach-O signer")
 def test_swift_only_changes_and_canonical_launcher_are_sealed_into_local_record(tmp_path):
     import plistlib

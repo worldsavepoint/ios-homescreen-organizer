@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import stat
+import unicodedata
 import zipfile
 
 from release import ARCHITECTURES, ROOT, project_version
@@ -58,14 +59,28 @@ def engine_entries(archive, arch, version):
         if kind not in (0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK):
             raise ValueError(f"Unsupported ZIP file type: {name}")
         entries[name] = info
+    paths = set(entries)
+    directories = {name for name, info in entries.items() if info.is_dir() or stat.S_ISDIR(info.external_attr >> 16)}
+    for name in entries:
+        parents = {str(parent) for parent in PurePosixPath(name).parents if str(parent) != "."}
+        paths.update(parents)
+        directories.update(parents)
+    identities = {}
+    for name in paths:
+        identity = unicodedata.normalize("NFD", name).casefold()
+        if identity in identities and identities[identity] != name:
+            raise ValueError(f"Ambiguous ZIP path: {name}")
+        identities[identity] = name
     links = {name for name, info in entries.items() if stat.S_ISLNK(info.external_attr >> 16)}
     for name in entries:
-        if any(str(parent) in links for parent in PurePosixPath(name).parents):
-            raise ValueError(f"ZIP member descends through symlink: {name}")
+        if any(str(parent) in entries and not (entries[str(parent)].is_dir() or
+                   stat.S_ISDIR(entries[str(parent)].external_attr >> 16))
+               for parent in PurePosixPath(name).parents):
+            raise ValueError(f"ZIP member descends through symlink or file: {name}")
+    # An explicit file cannot also supply an implicit parent directory.
+    directories.difference_update(name for name, info in entries.items()
+                                  if not info.is_dir() and not stat.S_ISDIR(info.external_attr >> 16))
     targets = {}
-    paths = set(entries)
-    for name in entries:
-        paths.update(str(parent) for parent in PurePosixPath(name).parents)
     for name in links:
         target = archive.read(entries[name]).decode("utf-8")
         if (not name.startswith(ENGINE) or not target or target.startswith("/")
@@ -87,12 +102,17 @@ def engine_entries(archive, arch, version):
                 continue
             resolved.append(part)
             prefix = "/".join(resolved)
+            canonical = identities.get(unicodedata.normalize("NFD", prefix).casefold())
+            if canonical != prefix:
+                raise ValueError(f"Missing or aliased engine link component: {name}")
             if prefix in targets:
                 hops += 1
                 if hops > 40:
                     raise ValueError(f"Cyclic engine symlink: {name}")
                 resolved.pop()
                 pending = targets[prefix].split("/") + pending
+            elif pending and prefix not in directories:
+                raise ValueError(f"Engine link traverses a non-directory: {name}")
         target_path = "/".join(resolved)
         if not target_path.startswith(ENGINE) or target_path not in paths:
             raise ValueError(f"Dangling engine symlink: {name}")

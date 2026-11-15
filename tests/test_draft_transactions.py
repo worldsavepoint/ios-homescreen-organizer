@@ -110,11 +110,11 @@ def test_short_gap_memory_write_preserves_previous_bytes_and_recovery(tmp_path, 
     before, memory = reviewed(session), session._gaps_path
     exclusive, write_text = session_module._exclusive_file, Path.write_text
 
-    def short_file(path, data):
+    def short_file(path, data, **kwargs):
         if path.parent == memory.parent:
             path.write_bytes(b"{")
             raise fault()
-        return exclusive(path, data)
+        return exclusive(path, data, **kwargs)
 
     def short_text(path, data, *args, **kwargs):
         if path == memory:
@@ -154,12 +154,12 @@ def test_failed_directory_sync_cannot_split_draft_from_history(tmp_path, monkeyp
     sync = session_module._sync_directory
     calls = 0
 
-    def isolated_failure(path):
+    def isolated_failure(path, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise fault()
-        return sync(path)
+        return sync(path, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(session_module, "_sync_directory", isolated_failure)
@@ -201,20 +201,20 @@ def test_failed_recovery_preserves_legacy_draft_and_pending_bytes(tmp_path, monk
     marker = session._pending_path
     pending = b'{"device_id": "synthetic", "status": "pending"}\n'
     marker.write_bytes(pending)
-    unlink, sync = Path.unlink, session_module._sync_directory
+    unlink, sync = session_module._unlink_file, session_module._sync_directory
 
     def fail_unlink(path, *args, **kwargs):
         if path == marker and failure == "unlink":
             raise fault()
         return unlink(path, *args, **kwargs)
 
-    def fail_sync(path):
+    def fail_sync(path, **kwargs):
         if path == marker.parent and not marker.exists() and failure == "directory-sync":
             raise fault()
-        return sync(path)
+        return sync(path, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(Path, "unlink", fail_unlink)
+        patch.setattr(session_module, "_unlink_file", fail_unlink)
         patch.setattr(session_module, "_sync_directory", fail_sync)
         with pytest.raises(OSError):
             run(session.read())
@@ -237,7 +237,7 @@ def test_committed_history_survives_previous_link_cleanup_failure(tmp_path, monk
     session.edit(lambda lay: lay.pin("example.a", 1, 1))
     session.edit(lambda lay: lay.pin("example.a", 1, 2))
     session.undo()
-    unlink = Path.unlink
+    unlink = session_module._unlink_file
     failed = []
 
     def fail(path, *args, **kwargs):
@@ -247,7 +247,7 @@ def test_committed_history_survives_previous_link_cleanup_failure(tmp_path, monk
         return unlink(path, *args, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(Path, "unlink", fail)
+        patch.setattr(session_module, "_unlink_file", fail)
         if action == "edit":
             session.edit(lambda lay: lay.pin("example.a", 1, 9))
         else:

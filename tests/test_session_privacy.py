@@ -1,4 +1,7 @@
 import asyncio
+import copy
+import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -60,3 +63,128 @@ def test_deny_only_acl_remains_usable_and_unchanged(tmp_path):
     session = Session(MemorySource(), root)
     asyncio.run(session.read())
     assert " deny delete" in subprocess.check_output(["/bin/ls", "-lde", root], text=True)
+
+
+@pytest.mark.parametrize("level", ["kind", "device"])
+def test_backup_descendant_links_cannot_redirect_publication(tmp_path, level):
+    session = Session(MemorySource(), tmp_path / "data")
+    asyncio.run(session.read())
+    outside = tmp_path / "outside"
+    shared_parent(outside)
+    foreign = outside / "user-file"
+    foreign.write_bytes(b"user data")
+    original = foreign.stat()
+    link = session.dir / "backups"
+    if level == "device":
+        link.mkdir(mode=0o700)
+        link /= session.device_id
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises((PermissionError, OSError)):
+        session._backup(session.require().to_state(), None, "capture")
+    assert sorted(path.name for path in outside.iterdir()) == ["user-file"]
+    assert foreign.read_bytes() == b"user data" and foreign.stat().st_mode == original.st_mode
+    assert link.is_symlink() and grants(outside)
+
+
+def test_shared_backup_descendant_is_rejected_without_repair(tmp_path):
+    session = Session(MemorySource(), tmp_path / "data")
+    asyncio.run(session.read())
+    backups = session.dir / "backups"
+    shared_parent(backups)
+    before = subprocess.check_output(["/bin/ls", "-lde", backups])
+    with pytest.raises(PermissionError):
+        session._backup(session.require().to_state(), None, "capture")
+    assert subprocess.check_output(["/bin/ls", "-lde", backups]) == before
+    assert list(backups.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["drafts", "reads", "unresolved-writes"])
+def test_private_descendant_links_are_rejected_before_data_access(tmp_path, kind):
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / kind).symlink_to(outside, target_is_directory=True)
+    if kind == "drafts":
+        with pytest.raises((PermissionError, OSError)):
+            Session(MemorySource(), root, device="synthetic-device-a")
+    elif kind == "reads":
+        with pytest.raises((PermissionError, OSError)):
+            asyncio.run(Session(MemorySource(), root).read())
+    else:
+        session = Session(MemorySource(), root)
+        with pytest.raises((PermissionError, OSError)):
+            session._dev_dir(kind)
+    assert list(outside.iterdir()) == []
+
+
+def test_backup_publication_stays_on_opened_directory_after_rename(tmp_path, monkeypatch):
+    session = Session(MemorySource(), tmp_path / "data")
+    asyncio.run(session.read())
+    backups = session._dev_dir("backups").parent
+    moved = session.dir / "saved-backups"
+    outside = tmp_path / "outside"
+    shared_parent(outside)
+    original = os.open
+    swapped = False
+    def swap(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and "capture" in Path(os.fsdecode(path)).name and flags & os.O_EXCL:
+            swapped = True
+            backups.rename(moved)
+            backups.symlink_to(outside, target_is_directory=True)
+        return original(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", swap)
+    try:
+        session._backup(session.require().to_state(), None, "capture")
+    except OSError:
+        pass
+    assert swapped and list(outside.iterdir()) == []
+    assert len(list(moved.rglob("*capture*.plist"))) == 1
+
+
+def test_legacy_owned_descendants_preserve_modes_and_recovery(tmp_path):
+    source = MemorySource()
+    original_state = copy.deepcopy(source.state)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda lay: lay.move("a", "dock"))
+    result = asyncio.run(session.apply(session.require().token()))
+    assert result["ok"]
+    backup = result["backup"]
+    directories = [path for path in session.dir.rglob("*") if path.is_dir()]
+    for path in directories:
+        path.chmod(0o755)
+    reopened = Session(source, session.dir)
+    assert reopened.require().dock[0].id == "a"
+    asyncio.run(reopened.read())
+    reopened.edit(lambda lay: lay.move("a", "page:1"))
+    assert asyncio.run(reopened.apply(reopened.require().token()))["ok"]
+    assert asyncio.run(reopened.restore(backup))["ok"]
+    assert source.state == original_state
+    assert all(path.stat().st_mode & 0o777 == 0o755 for path in directories)
+    assert session.dir.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("kind", ["writable", "foreign"])
+def test_existing_unowned_or_writable_descendant_is_preserved(tmp_path, monkeypatch, kind):
+    session = Session(MemorySource(), tmp_path / "data")
+    asyncio.run(session.read())
+    backups = session._dev_dir("backups")
+    original = backups.stat()
+    if kind == "writable":
+        backups.chmod(0o777)
+    else:
+        fstat = os.fstat
+        def foreign(fd):
+            value = fstat(fd)
+            if value.st_dev == original.st_dev and value.st_ino == original.st_ino:
+                fields = list(value)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return value
+        monkeypatch.setattr(os, "fstat", foreign)
+    with pytest.raises(PermissionError):
+        session._backup(session.require().to_state(), None, "capture")
+    assert list(backups.iterdir()) == []
+    assert backups.stat().st_mode & 0o777 == (0o777 if kind == "writable" else 0o700)

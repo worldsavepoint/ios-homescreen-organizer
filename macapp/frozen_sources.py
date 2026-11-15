@@ -260,20 +260,35 @@ def launcher_digest(executable):
 def finalize_local_record(project, manifest, record, executable):
     public = json.loads(record.read_bytes())
     baseline = json.loads(manifest.read_bytes())["files"]
-    package = project / "macapp/Shell/Package.swift"
-    target = project / "macapp/Shell/Sources"
-    paths = [package, *sorted(target.rglob("*"))]
+    roots = ("homescreen/", "macapp/", "tools/")
+    root_files = {"pyproject.toml", "LICENSE", "requirements-build.lock", "requirements-cryptography-x86_64.lock"}
+    relevant = {name.removeprefix("project/") for name in baseline if name.startswith("project/")
+                and (name.removeprefix("project/").startswith(roots) or name.removeprefix("project/") in root_files)}
+    paths = {project / name for name in relevant if (project / name).exists() or (project / name).is_symlink()}
+    generated = {"__pycache__", ".build", ".swiftpm", "build", "dist", ".venv"}
+    def collect(directory):
+        if not directory.exists():
+            return
+        for path in directory.iterdir():
+            if path.name in generated or path.name.endswith(".egg-info"):
+                continue
+            mode = path.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                collect(path)
+            else:
+                paths.add(path)
+    for name in roots:
+        collect(project / name)
+    paths.update(project / name for name in root_files if (project / name).exists())
     inputs = {}
-    for path in paths:
+    for path in sorted(paths):
         mode = path.lstat().st_mode
         if stat.S_ISDIR(mode):
             continue
         if not stat.S_ISREG(mode):
-            raise ValueError("Use regular local Swift source inputs")
+            raise ValueError("Use regular local project inputs")
         inputs[path.relative_to(project).as_posix()] = sha256(path)
     public["projectFiles"].update(inputs)
-    relevant = {name.removeprefix("project/") for name in baseline
-                if name == "project/macapp/Shell/Package.swift" or name.startswith("project/macapp/Shell/Sources/")}
     current = public["projectFiles"]
     public["projectChanges"] = {
         "modified": {name: value for name, value in current.items()

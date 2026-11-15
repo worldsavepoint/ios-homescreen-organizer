@@ -8,8 +8,8 @@ import subprocess
 from pathlib import Path
 
 from .device import FileSource, PhoneSource, SimSource, Source
-from .session import Session
-from .private_store import ensure_private_directory
+from .session import Session, _publish_exclusive, _private_replace
+from .private_store import ensure_private_directory, open_private_directory, open_private_file
 
 DATA = Path(os.environ.get("HOMESCREEN_DATA") or Path.home() / "Library/Application Support/homescreen-mcp")
 
@@ -43,6 +43,11 @@ _current: str | None = None
 LAST_DEVICE = DATA / "last-device.txt"
 
 
+def _read_private(path):
+    with os.fdopen(open_private_file(DATA, path), "rb") as stream:
+        return stream.read()
+
+
 def enable_device_switching() -> None:
     global _switching, _current
     if os.environ.get("HOMESCREEN_FIXTURE") or os.environ.get("HOMESCREEN_SIM") or os.environ.get("HOMESCREEN_UDID"):
@@ -50,24 +55,27 @@ def enable_device_switching() -> None:
     ensure_private_directory(DATA)
     _switching = True
     _adopt_shared_draft()
-    if LAST_DEVICE.exists():
-        _current = LAST_DEVICE.read_text().strip() or None
+    try:
+        _current = _read_private(LAST_DEVICE).decode().strip() or None
+    except FileNotFoundError:
+        pass
 
 
 def _adopt_shared_draft() -> None:
     """Carry the single shared draft (CLI / older versions) over as its device's own draft."""
     import plistlib
-    import shutil
     shared = DATA / "draft.plist"
     try:
-        dev = plistlib.loads(shared.read_bytes()).get("device") if shared.exists() else None
+        data = _read_private(shared)
+        dev = plistlib.loads(data).get("device")
     except Exception:
         return
     if dev and dev != "unselected":
         target = DATA / "drafts" / f"{''.join(c if c.isalnum() or c in '-._' else '_' for c in dev)}.plist"
-        if not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(shared, target)
+        try:
+            _publish_exclusive(target, data, root=DATA)
+        except FileExistsError:
+            pass
 
 
 def switching() -> bool:
@@ -82,7 +90,7 @@ def select_device(udid: str) -> Session:
     global _current
     ensure_private_directory(DATA)
     _current = udid
-    LAST_DEVICE.write_text(udid)
+    _private_replace(LAST_DEVICE, udid.encode(), root=DATA)
     return session()
 
 
@@ -91,9 +99,12 @@ def known_devices() -> dict[str, dict]:
     import plistlib
     ensure_private_directory(DATA)
     out = {}
-    for f in sorted((DATA / "drafts").glob("*.plist")) if (DATA / "drafts").exists() else []:
+    with open_private_directory(DATA, DATA / "drafts") as directory:
+        names = sorted(name for name in os.listdir(directory) if name.endswith(".plist"))
+    for name in names:
+        f = DATA / "drafts" / name
         try:
-            blob = plistlib.loads(f.read_bytes())
+            blob = plistlib.loads(_read_private(f))
         except Exception:
             continue
         info = blob.get("info", {})

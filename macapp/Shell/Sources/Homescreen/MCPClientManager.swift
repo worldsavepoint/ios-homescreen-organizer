@@ -280,6 +280,19 @@ struct MCPClientManager {
         let object = try? snapshot.entry.object()
         query.userConfiguration = object == nil ? .notConfigured : .configured
         query.userMode = object.flatMap(localMode)
+        if query.client == .claudeCode, query.scope == .user, query.configuration == .configured {
+            guard let object else {
+                query.code = .invalidResponse; query.configuration = .unknown; query.localEnabled = false; query.mode = nil
+                return
+            }
+            query.command = object["command"] as? String
+            query.arguments = object["args"] as? [String]
+            query.url = object["url"] as? String
+            query.localEnabled = query.command != nil && query.url == nil &&
+                (object["type"] == nil || object["type"] as? String == "stdio") &&
+                (object["enabled"] == nil || object["enabled"] as? Bool == true)
+            query.mode = query.localEnabled ? localMode(object) : nil
+        }
         guard query.client == .codex, let observed = snapshot.effectiveEntry else { return }
         guard let fields = try? observed.dictionary(), let active = fields as? [String: Any] else {
             query.localEnabled = false; query.mode = nil; return
@@ -351,6 +364,11 @@ struct MCPClientManager {
         guard client == .claudeCode, var value = try intended.object(), value["type"] == nil else { return false }
         value["type"] = "stdio"
         return try current == MCPOwnedEntry(value)
+    }
+
+    private func ownsClaudePostimage(_ entry: MCPOwnedEntry, record: MCPRegistrationRecord) throws -> Bool {
+        if record.phase == .removing { return entry == .absent }
+        return try record.phase == .adding && (entry == .absent || matches(entry, intended: record.intended, client: .claudeCode))
     }
 
     private func matchesBootstrap(_ entry: MCPOwnedEntry, record: MCPRegistrationRecord) throws -> Bool {
@@ -591,6 +609,9 @@ struct MCPClientManager {
                 if let acknowledged, written.version != acknowledged, written.entry != intended {
                     try changedEntry(written.entry, record: &record, journal: journal)
                 }
+                if client == .claudeCode, try !ownsClaudePostimage(written.entry, record: record) {
+                    try markConflict(&record, journal: journal)
+                }
                 record.observed = written.entry
                 try savePhase(.observed, record: &record, journal: journal)
                 guard try matches(written.entry, intended: intended, client: client), let raw = try written.entry.object(), localMode(raw) == mode,
@@ -626,6 +647,9 @@ struct MCPClientManager {
                     if awaitingPostimage, failure != .recoveryConflict {
                         let post = try await store.read()
                         guard post.file == record.file else { throw MCPClientOperationCode.recoveryConflict }
+                        guard try ownsClaudePostimage(post.entry, record: record) else {
+                            throw MCPClientOperationCode.recoveryConflict
+                        }
                         record.observed = post.entry
                         try savePhase(.observed, record: &record, journal: journal)
                     }
