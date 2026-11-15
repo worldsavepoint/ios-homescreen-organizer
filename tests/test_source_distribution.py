@@ -992,7 +992,7 @@ def test_trusted_recursive_patterns_keep_component_and_hidden_rules(pattern, exp
     assert project_root_inputs(files, files.__getitem__) == expected | {"pyproject.toml"}
 
 
-@pytest.mark.parametrize("pattern", ["grants/**/*", "grants/**", "**/**", "grants/**/**"])
+@pytest.mark.parametrize("pattern", ["grants/**/*", "grants/**", "**/**", "grants/**/**", "grants/*/**"])
 def test_terminal_recursive_discovery_records_backend_additions_and_deletions(tmp_path, monkeypatch, pattern):
     import contextlib
     import io
@@ -1002,7 +1002,8 @@ def test_terminal_recursive_discovery_records_backend_additions_and_deletions(tm
     project.mkdir()
     config = ('[project]\nname="example"\nversion="1.0"\nlicense="MIT"\nlicense-files=["' + pattern + '"]\n'
               '[tool.setuptools]\npy-modules=["example"]\n').encode()
-    files = {"pyproject.toml": config, "example.py": b"value=1\n", "grants/old.txt": b"original grant\n"}
+    files = {"pyproject.toml": config, "example.py": b"value=1\n", "grants/old.txt": b"direct grant\n",
+             "grants/deep/old.txt": b"nested grant\n"}
     for name, data in files.items():
         path = project / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1021,16 +1022,20 @@ def test_terminal_recursive_discovery_records_backend_additions_and_deletions(tm
         dist = build_meta.prepare_metadata_for_build_wheel(str(output))
     licenses = output / dist / "licenses"
     actual = {path.relative_to(licenses).as_posix(): path.read_bytes() for path in licenses.rglob("*") if path.is_file()}
-    expected = files if pattern == "**/**" else {name: data for name, data in files.items() if name.startswith("grants/")}
+    prefix = {"**/**": "", "grants/*/**": "grants/deep/"}.get(pattern, "grants/")
+    expected = {name: data for name, data in files.items() if name.startswith(prefix)}
     assert actual == expected
     selected = set(expected) | {"pyproject.toml"}
     assert local_root_inputs(project) == selected
     assert project_root_inputs(files, files.__getitem__) == selected
     record = local_input_record(project, tmp_path, monkeypatch, baseline)
-    assert record["projectChanges"]["added"] == {name: hashlib.sha256(data).hexdigest() for name, data in added.items()}
-    (project / "grants/old.txt").unlink()
+    assert record["projectChanges"]["added"] == {name: hashlib.sha256(data).hexdigest()
+                                               for name, data in added.items() if name in expected}
+    removed = ["grants/deep/old.txt", "grants/old.txt"]
+    for name in removed:
+        (project / name).unlink()
     record = local_input_record(project, tmp_path, monkeypatch, baseline)
-    assert record["projectChanges"]["removed"] == ["grants/old.txt"]
+    assert record["projectChanges"]["removed"] == [name for name in removed if name in expected]
 
 
 def test_current_and_trusted_discovery_match_standard_recursive_globs(tmp_path, monkeypatch):
@@ -1046,7 +1051,8 @@ def test_current_and_trusted_discovery_match_standard_recursive_globs(tmp_path, 
     monkeypatch.chdir(tmp_path)
     for pattern in ["**", "**/**", "grants/**", "*/*.txt", "grants/[!a]*.txt", "grants/*/n?sted.[t]xt",
                     "grants/**/literal[[]a].txt", ".root/**/*.txt", "grants/**/.*", "grants/.*/**/*.txt",
-                    "grants/**/[.]dot.txt", "**/deep/**/n*.txt", "**/**/direct.txt"]:
+                    "grants/**/[.]dot.txt", "**/deep/**/n*.txt", "**/**/direct.txt", "grants/*/**",
+                    "grants/direct.txt/**"]:
         config = ('[project]\nlicense-files=["' + pattern + '"]\n').encode()
         (tmp_path / "pyproject.toml").write_bytes(config)
         files = {name: (tmp_path / name).read_bytes() for name in names}
@@ -1057,7 +1063,7 @@ def test_current_and_trusted_discovery_match_standard_recursive_globs(tmp_path, 
         assert local_root_inputs(tmp_path) == expected, pattern
 
 
-@pytest.mark.parametrize("pattern", ["grants/*.txt", "grants/**/*.txt", "grants/**", "**/**"])
+@pytest.mark.parametrize("pattern", ["grants/*.txt", "grants/**/*.txt", "grants/**", "**/**", "grants/*/**"])
 def test_source_verifier_accepts_real_recursive_capture(tmp_path, monkeypatch, pattern):
     import io
     import subprocess
@@ -1119,6 +1125,58 @@ def test_terminal_metadata_discovery_keeps_local_regular_input_requirement(tmp_p
     (project / "grants/linked").symlink_to(outside, target_is_directory=directory)
     with pytest.raises(ValueError, match="regular local project inputs"):
         local_input_record(project, tmp_path, monkeypatch, {})
+
+
+@pytest.mark.parametrize("pattern,cycle", [
+    ("grants/**", True), ("grants/**", False), ("grants/link/*.txt", False), ("grants/*/*.txt", False),
+])
+def test_metadata_discovery_refuses_directory_links_before_listing(tmp_path, monkeypatch, pattern, cycle):
+    import os
+    project = tmp_path / "project"
+    grants = project / "grants"
+    grants.mkdir(parents=True)
+    (project / "pyproject.toml").write_text('[project]\nlicense-files=["' + pattern + '"]\n')
+    (grants / "direct.txt").write_bytes(b"direct grant")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "other.txt").write_bytes(b"other grant")
+    (grants / "link").symlink_to("." if cycle else outside, target_is_directory=True)
+    grant_dir, outside_dir = grants.stat(), outside.stat()
+    listed_grants = False
+
+    def checked(list_directory):
+        def list_local(path="."):
+            nonlocal listed_grants
+            info = os.stat(path)
+            assert not os.path.samestat(info, outside_dir), "Discovery listed the linked directory"
+            if os.path.samestat(info, grant_dir):
+                assert not listed_grants, "Discovery reentered the grants directory"
+                listed_grants = True
+            return list_directory(path)
+        return list_local
+
+    monkeypatch.setattr(os, "scandir", checked(os.scandir))
+    monkeypatch.setattr(os, "listdir", checked(os.listdir))
+    with pytest.raises(ValueError, match="regular local project inputs"):
+        local_input_record(project, tmp_path, monkeypatch, {})
+
+
+def test_metadata_discovery_keeps_links_outside_declared_inputs(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / "grants/nested").mkdir(parents=True)
+    (project / "flat").mkdir()
+    (project / "pyproject.toml").write_text('[project]\nlicense-files=["ROOT-*","grants/**/*.txt","flat/*.txt"]\n')
+    selected = {"ROOT-GRANT", "grants/direct.txt", "grants/nested/extra.txt", "flat/credit.txt"}
+    for name in selected:
+        (project / name).write_bytes(b"selected grant")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "other.txt").write_bytes(b"other grant")
+    for name in ("unrelated", "grants/.hidden", "flat/subdir"):
+        (project / name).symlink_to(outside, target_is_directory=True)
+    (project / "grants/draft.bin").symlink_to(outside / "other.txt")
+    record = local_input_record(project, tmp_path, monkeypatch, {})
+    assert set(record["projectFiles"]) == selected | {"pyproject.toml"}
 
 
 def test_default_license_inputs_ignore_directories_and_editor_backups(tmp_path):

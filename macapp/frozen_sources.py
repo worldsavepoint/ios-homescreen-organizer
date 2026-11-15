@@ -1,13 +1,14 @@
 """Identify and preserve editable inputs of a completed PyInstaller freeze."""
 from collections import defaultdict
 from fnmatch import fnmatchcase
-from glob import iglob
 from hashlib import sha256 as digest
 from importlib.metadata import distributions, version as package_version
+from itertools import chain
 from pathlib import Path
 import argparse
 import configparser
 import json
+import os
 import re
 import shutil
 import stat
@@ -330,7 +331,9 @@ def project_root_inputs(names, read, expand=lambda pattern: ()):
         patterns = [*patterns, legacy]
     for pattern in patterns:
         relative_name(pattern)
-        selected.update(relative_name(name) for name in names.union(expand(pattern))
+        if pattern.rsplit("/", 1)[-1] == "**":
+            pattern += "/*"  # A file needs a basename beneath the directory matched by **.
+        selected.update(relative_name(name) for name in chain(names, expand(pattern))
                         if not name.endswith("~") and source_glob_matches(name, pattern))
     return selected
 
@@ -346,11 +349,34 @@ def local_project_input(project, name):
     return path.read_bytes()
 
 
+def local_glob_candidates(project, pattern):
+    parts = pattern.split("/")
+    parents = ["/".join(parts[:end]) for end in range(1, len(parts))]
+    if not parents:
+        return  # The root listing already supplies these candidates.
+    for directory, dirs, files, fd in os.fwalk(project, follow_symlinks=False):
+        parent = Path(directory).relative_to(project)
+        children = []
+        for leaf in dirs:
+            name = (parent / leaf).as_posix()
+            descend = any(source_glob_matches(name, prefix) for prefix in parents)
+            if stat.S_ISLNK(os.lstat(leaf, dir_fd=fd).st_mode):
+                if descend:
+                    raise ValueError("Use regular local project inputs")
+                yield name
+            elif descend:
+                children.append(leaf)
+        dirs[:] = children
+        for leaf in files:
+            mode = os.lstat(leaf, dir_fd=fd).st_mode
+            if stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                yield (parent / leaf).as_posix()
+
+
 def local_root_inputs(project, baseline=()):
     names = {*baseline, *(path.name for path in project.iterdir() if path.is_file() or path.is_symlink())}
     return project_root_inputs(names, lambda name: local_project_input(project, name),
-                               lambda pattern: (name for name in iglob(pattern, root_dir=project, recursive=True)
-                                                if (project / name).is_file() or (project / name).is_symlink()))
+                               lambda pattern: local_glob_candidates(project, pattern))
 
 
 def captured_root_inputs(manifest, baseline, public):
