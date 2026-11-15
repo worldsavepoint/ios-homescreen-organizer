@@ -214,7 +214,8 @@ struct MCPSetupView: View {
                             Picker(localization.t("mcp.mode"), selection: $model.mode) {
                                 Text(localization.t("mcp.readOnlyMode")).tag(MCPAccessMode.readOnly)
                                 Text(localization.t("mcp.applyMode")).tag(MCPAccessMode.applyEnabled)
-                            }.disabled(model.busy)
+                            }.accessibilityLabel(Text(localization.t("mcp.mode")))
+                                .disabled(model.busy)
                             Text(localization.t("mcp.modeHint")).font(.callout).foregroundStyle(.secondary)
                             LabeledContent(localization.t("mcp.executable")) { Text(model.enginePath).textSelection(.enabled) }
                             LabeledContent(localization.t("mcp.transport"), value: "stdio")
@@ -224,7 +225,7 @@ struct MCPSetupView: View {
                                 Text(localization.t("mcp.copyVSCode")).tag("vscode")
                                 Text(localization.t("mcp.copyCopilot")).tag("copilot")
                                 Text(localization.t("mcp.copyLaunch")).tag("launch")
-                            }
+                            }.accessibilityLabel(Text(localization.t("mcp.configuration")))
                             ScrollView(.horizontal) {
                                 Text(exportText).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading).padding(12)
@@ -286,13 +287,16 @@ struct MCPSetupView: View {
                 HStack {
                     Button(localization.t(model.registrationActionKey(for: client))) {
                         Task { await model.register(client, consent: consent) }
-                    }.disabled(model.busy || !consent.accepted || detection?.availability != .available)
+                    }.accessibilityLabel(Text(localization.t(model.registrationActionKey(for: client) + "Client",
+                                                            ["client": name])))
+                        .disabled(model.busy || !consent.accepted || detection?.availability != .available)
                     Button(localization.t("mcp.chooseExecutable")) {
                         let panel = NSOpenPanel()
                         panel.canChooseDirectories = false
                         panel.allowsMultipleSelection = false
                         if panel.runModal() == .OK, let url = panel.url { Task { await model.choose(url.path, for: client, consent: consent) } }
-                    }.disabled(model.busy || !consent.accepted)
+                    }.accessibilityLabel(Text(localization.t("mcp.chooseExecutableForClient", ["client": name])))
+                        .disabled(model.busy || !consent.accepted)
                 }
                 if let feedback {
                     Text(localization.t(feedback.primaryKey, ["client": name]))

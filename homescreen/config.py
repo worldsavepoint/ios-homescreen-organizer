@@ -89,9 +89,10 @@ def current_device() -> str | None:
 def select_device(udid: str) -> Session:
     global _current
     ensure_private_directory(DATA)
-    _current = udid
+    selected = _device_session(udid) if _switching else session()
     _private_replace(LAST_DEVICE, udid.encode(), root=DATA)
-    return session()
+    _current = udid
+    return selected
 
 
 def known_devices() -> dict[str, dict]:
@@ -114,13 +115,17 @@ def known_devices() -> dict[str, dict]:
     return out
 
 
+def _device_session(device: str | None) -> Session:
+    key = device or ""
+    if key not in _sessions:
+        _sessions[key] = Session(PhoneSource(device), DATA, device=device or "unselected")
+    return _sessions[key]
+
+
 def session() -> Session:
     global _session
     if _switching:
-        key = _current or ""
-        if key not in _sessions:
-            _sessions[key] = Session(PhoneSource(_current), DATA, device=_current or "unselected")
-        return _sessions[key]
+        return _device_session(_current)
     if _session is None:
         _session = Session(make_source(), DATA)
     return _session

@@ -126,11 +126,17 @@ def test_prerelease_keeps_tag_version_with_numeric_bundle_version(tmp_path):
     script.parent.mkdir(parents=True)
     for name in ("release.py", "check_package_paths.py", "build_paths.py"):
         (script.parent / name).write_bytes((SCRIPT.parent / name).read_bytes())
+    package = project / "homescreen"
+    package.mkdir()
+    for name in ("__init__.py", "private_store.py"):
+        (package / name).write_bytes((ROOT / "homescreen" / name).read_bytes())
     (project / "pyproject.toml").write_text('[project]\nversion = "1.2.0-beta.1"\n')
     output = tmp_path / "prerelease"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(project) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     result = subprocess.run([sys.executable, str(script), "package", "--build-dir", str(build),
                              "--output-dir", str(output), "--tag", "v1.2.0-beta.1", "--arch", "arm64"],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr
     assert (output / "home-screen-organizer-1.2.0-beta.1-macos-arm64.dmg").read_bytes() == (build / f"home-screen-organizer-{version}.dmg").read_bytes()
     assert (output / "home-screen-organizer-1.2.0-beta.1-macos-arm64.zip").is_file()
@@ -664,6 +670,9 @@ def test_public_package_preserves_successful_saves_during_retirement(tmp_path, m
         def __getattr__(self, name):
             if name == "renameatx_np":
                 def rename(*arguments):
+                    if save_at == "parking_move_failure" and arguments[3:] == (b"previous", 4):
+                        ctypes.set_errno(5)
+                        return -1
                     if arguments[-1] == 2 and save_at == "pre_exchange_failure":
                         ctypes.set_errno(5)
                         return -1
@@ -698,13 +707,6 @@ def test_public_package_preserves_successful_saves_during_retirement(tmp_path, m
                 raise OSError("private parking unavailable")
             return transaction(parent)
         monkeypatch.setattr(publisher, "private_transaction", private_transaction)
-    if save_at == "parking_move_failure":
-        rename = os.rename
-        def move(source, destination, **kwargs):
-            if destination == "previous":
-                raise OSError("private parking move unavailable")
-            return rename(source, destination, **kwargs)
-        monkeypatch.setattr(publisher.os, "rename", move)
     try:
         if save_at == "pre_exchange_failure":
             with pytest.raises(OSError, match="Could not install"):
@@ -1050,6 +1052,492 @@ def test_native_retirement_envelope_clears_inherited_acl(tmp_path):
         assert not list(folder.iterdir())
     finally:
         subprocess.run(["chmod", "-N", parent], check=True)
+
+
+def test_private_release_envelope_permissions_at_creation(tmp_path, monkeypatch):
+    import tempfile
+    from homescreen import private_store
+    from macapp.release import private_transaction
+
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    subprocess.run(["chmod", "+a", "everyone allow list,search,directory_inherit", parent], check=True)
+    created = []
+
+    def sample(path):
+        created.append((path.stat().st_mode & 0o777,
+                        subprocess.check_output(["ls", "-lde", path], text=True).splitlines()[1:],
+                        list(path.iterdir())))
+
+    mkdtemp = tempfile.mkdtemp
+    def temporary(*args, **kwargs):
+        name = mkdtemp(*args, **kwargs)
+        sample(Path(name))
+        return name
+
+    system = private_store._libsystem()
+    class Creation:
+        def __getattr__(self, name):
+            return getattr(system, name)
+        def mkdirx_np(self, path, security):
+            status = system.mkdirx_np(path, security)
+            if status == 0:
+                sample(Path(os.fsdecode(path)))
+            return status
+
+    monkeypatch.setattr(tempfile, "mkdtemp", temporary)
+    monkeypatch.setattr(private_store, "_libsystem", lambda: Creation())
+    folder = private_transaction(parent)
+    assert folder.parent == parent and created == [(0o700, [], [])]
+
+
+def test_private_release_retries_exclusive_name(tmp_path, monkeypatch):
+    import uuid
+    from macapp.release import private_transaction
+
+    first, second = uuid.UUID(int=1), uuid.UUID(int=2)
+    occupied = tmp_path / (".native-release-" + first.hex)
+    occupied.mkdir(mode=0o755)
+    note = occupied / "note"
+    note.write_bytes(b"existing")
+    ids = iter([first, second])
+    monkeypatch.setattr(uuid, "uuid4", lambda: next(ids))
+    created = private_transaction(tmp_path)
+    assert created.name == ".native-release-" + second.hex and not list(created.iterdir())
+    assert created.stat().st_mode & 0o777 == 0o700
+    assert occupied.stat().st_mode & 0o777 == 0o755 and note.read_bytes() == b"existing"
+
+
+@pytest.mark.parametrize("relative", [".", "notes"])
+@pytest.mark.parametrize("permission", ["mode", "acl", "remove-grant", "inheritance"])
+@pytest.mark.parametrize("when", ["before-copy", "after-copy", "after-exchange"])
+def test_release_keeps_directory_permission_changes(tmp_path, monkeypatch, relative, permission, when):
+    import ctypes
+    from macapp import release
+
+    output, stage = tmp_path / "published", tmp_path / "stage"
+    (output / "notes").mkdir(parents=True)
+    stage.mkdir()
+    (stage / "asset.zip").write_bytes(b"new release")
+    note = output / "notes" / "record"
+    note.write_bytes(b"user notes")
+    external = tmp_path / "other-name"
+    external.hardlink_to(note)
+    (output / "shortcut").symlink_to("notes/record")
+    selected = output / relative
+    selected.chmod(0o755)
+    if permission in ("remove-grant", "inheritance"):
+        subprocess.run(["chmod", "+a", "everyone allow readattr,file_inherit,only_inherit", selected], check=True)
+    identity = selected.stat().st_ino
+    expected = []
+
+    def permissions(directory):
+        return (directory.stat().st_mode & 0o777,
+                subprocess.check_output(["ls", "-lde", directory], text=True).splitlines()[1:])
+
+    def change(directory):
+        if permission == "mode":
+            directory.chmod(0o700)
+        elif permission in ("remove-grant", "inheritance"):
+            subprocess.run(["chmod", "-N", directory], check=True)
+            if permission == "inheritance":
+                subprocess.run(["chmod", "+a", "everyone allow readattr,directory_inherit,only_inherit", directory],
+                               check=True)
+        else:
+            subprocess.run(["chmod", "+a", "everyone deny execute,file_inherit,only_inherit", directory], check=True)
+        expected.append(permissions(directory))
+
+    system = ctypes.CDLL(None, use_errno=True)
+    class DuringInstall:
+        def __getattr__(self, name):
+            return getattr(system, name)
+        def fcopyfile(self, source, destination, state, flags):
+            result = system.fcopyfile(source, destination, state, flags)
+            if result == 0 and when == "after-copy" and not expected and os.fstat(source).st_ino == identity:
+                change(selected)
+            return result
+        def renameatx_np(self, *args):
+            result = system.renameatx_np(*args)
+            if result == 0 and args[-1] == 2 and when == "after-exchange":
+                change(stage / ".generation" / relative)
+            return result
+
+    if when == "before-copy":
+        change(selected)
+    monkeypatch.setattr(release.ctypes, "CDLL", lambda *args, **kwargs: DuringInstall())
+    publication = {}
+    if when == "after-copy":
+        with pytest.raises(OSError, match="changed"):
+            release.install_generation(stage, output, "arm64", publication=publication)
+        assert not publication["installed"] and not (output / "asset.zip").exists()
+    else:
+        release.install_generation(stage, output, "arm64", publication=publication)
+        assert publication["installed"] and (output / "asset.zip").is_file()
+    assert expected == [permissions(selected)]
+    assert note.samefile(external) and (output / "shortcut").read_bytes() == b"user notes"
+    if when == "after-exchange":
+        previous = publication["retained"] / "previous"
+        assert permissions(previous / relative) == expected[0]
+        assert (previous / "notes/record").samefile(external)
+
+
+@pytest.mark.parametrize("identity", ["owner", "group"])
+def test_retained_directory_checks_both_ownership_fields(tmp_path, monkeypatch, identity):
+    import ctypes
+    from macapp import release
+
+    source, staged = tmp_path / "published", tmp_path / "stage"
+    source.mkdir()
+    staged.mkdir()
+    (staged / "new").write_bytes(b"release")
+    inode = source.stat().st_ino
+    fstat = os.fstat
+    copied = False
+    def metadata(fd):
+        info = fstat(fd)
+        if copied and info.st_ino == inode:
+            fields = list(info)
+            fields[4 if identity == "owner" else 5] += 1
+            return os.stat_result(fields)
+        return info
+    system = ctypes.CDLL(None, use_errno=True)
+    class Copy:
+        def __getattr__(self, name):
+            return getattr(system, name)
+        def fcopyfile(self, *args):
+            nonlocal copied
+            result = system.fcopyfile(*args)
+            copied = True
+            return result
+    monkeypatch.setattr(release.ctypes, "CDLL", lambda *args, **kwargs: Copy())
+    monkeypatch.setattr(release.os, "fstat", metadata)
+    with pytest.raises(OSError, match="permissions changed"):
+        release.install_generation(staged, source, "arm64")
+    assert copied and not (source / "new").exists()
+
+
+@pytest.mark.parametrize("relative", [".", "notes"])
+@pytest.mark.parametrize("edit", ["mode", "acl", "independent", "replacement"])
+def test_final_directory_removal_saves_exact_permissions(tmp_path, monkeypatch, relative, edit):
+    import base64
+    import ctypes
+    from macapp import release
+
+    output, stage = tmp_path / "public", tmp_path / "incoming"
+    notes = output / "notes"
+    notes.mkdir(parents=True)
+    note = notes / "user-note"
+    note.write_bytes(b"private note")
+    external = tmp_path / "other-name"
+    external.hardlink_to(note)
+    stage.mkdir()
+    (stage / "new.zip").write_bytes(b"fixture")
+    selected = output / relative
+    moved = tmp_path / "owner-moved-generation"
+    selected.chmod(0o700)
+    original = os.open(selected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    identity = os.fstat(original)
+    native = ctypes.CDLL(None, use_errno=True)
+    monkeypatch.setattr(release.ctypes, "CDLL", lambda *args, **kwargs: native)
+    rmdir = os.rmdir
+    requested_time = 1650000000
+    expected = []
+    def remove(name, *, dir_fd=None):
+        if dir_fd is not None and os.path.samestat(os.stat(name, dir_fd=dir_fd), identity):
+            old = stage / ".generation"
+            if relative != ".":
+                old /= os.fsdecode(name)
+            assert os.path.samestat(old.stat(), identity)
+            if edit in ("acl", "independent"):
+                subprocess.run(["chmod", "+a", "everyone allow readattr,directory_inherit,only_inherit", old], check=True)
+            else:
+                os.fchmod(original, 0o1700)
+            if edit == "independent":
+                selected.chmod(0o710)
+            elif edit == "replacement":
+                selected.rename(moved)
+                selected.mkdir(mode=0o750)
+                (selected / "owner-entry").write_bytes(b"independent")
+            os.utime(selected, (requested_time, requested_time))
+            expected.append(release.directory_permissions(original, native))
+        return rmdir(name, dir_fd=dir_fd)
+    monkeypatch.setattr(os, "rmdir", remove)
+    state = {}
+    try:
+        release.install_generation(stage, output, "arm64", publication=state)
+        saved = state["permissions_record"]
+        assert saved.is_file() and saved.stat().st_mode & 0o777 == 0o600 and saved.parent.stat().st_mode & 0o777 == 0o700
+        record = json.loads(saved.read_bytes())
+        permissions = (record["mode"], record["uid"], record["gid"], base64.b64decode(record["aclBase64"], validate=True))
+        assert expected == [permissions] and record["directory"] == relative
+        assert (record["device"], record["inode"]) == (identity.st_dev, identity.st_ino)
+        assert state["installed"] and bool(state["retained"]) == (relative != ".")
+        live = os.open(selected, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = release.directory_permissions(live, native)
+            if edit == "independent":
+                assert current[0] == 0o710 and current[3] != permissions[3]
+            elif edit == "replacement":
+                assert current[0] == 0o750 and (selected / "owner-entry").read_bytes() == b"independent"
+            else:
+                assert current == permissions
+        finally:
+            os.close(live)
+        assert int(selected.stat().st_mtime) == requested_time
+        assets = moved if edit == "replacement" and relative == "." else output
+        kept_note = moved / note.relative_to(selected) if edit == "replacement" else note
+        assert (assets / "new.zip").exists() and kept_note.samefile(external) and kept_note.read_bytes() == b"private note"
+    finally:
+        os.close(original)
+
+
+@pytest.mark.parametrize("failure", ["read", "save"])
+def test_publication_reports_failure_to_recover_removed_permissions(tmp_path, monkeypatch, failure):
+    from macapp import release
+
+    output, stage = tmp_path / "release", tmp_path / "incoming"
+    output.mkdir(mode=0o700)
+    stage.mkdir()
+    (stage / "new").write_bytes(b"release")
+    identity = output.stat()
+    rmdir, permissions = os.rmdir, release.directory_permissions
+    removed = False
+    def remove(name, *, dir_fd=None):
+        nonlocal removed
+        if dir_fd is not None and os.path.samestat(os.stat(name, dir_fd=dir_fd), identity):
+            os.chmod(name, 0o1700, dir_fd=dir_fd)
+            rmdir(name, dir_fd=dir_fd)
+            removed = True
+        else:
+            rmdir(name, dir_fd=dir_fd)
+    def sample(fd, libc):
+        if failure == "read" and removed and os.path.samestat(os.fstat(fd), identity):
+            raise OSError("fixture descriptor failure")
+        return permissions(fd, libc)
+    def write_failure(change, record):
+        raise OSError("fixture write failure")
+    monkeypatch.setattr(os, "rmdir", remove)
+    monkeypatch.setattr(release, "directory_permissions", sample)
+    if failure == "save":
+        monkeypatch.setattr(release._RemovedDirectoryChanged, "save", write_failure)
+    state = {}
+    with pytest.raises(OSError, match=f"Release installed. Could not {failure}"):
+        release.install_generation(stage, output, "arm64", publication=state)
+    assert state["installed"] and (output / "new").is_file()
+    assert not state.get("permissions_record") and not list(tmp_path.glob(".native-release-*"))
+
+
+@pytest.mark.parametrize("reservation", ["ordinary", "occupied", "stable", "unnamed", "changed-after-save",
+                                         "changed-before-report"])
+def test_package_reports_only_owned_recovery_names(tmp_path, monkeypatch, capsys, reservation):
+    import build_paths
+    import check_package_paths
+    from macapp import release
+
+    output, build = tmp_path / "published", tmp_path / "build"
+    output.mkdir(mode=0o700)
+    identity = output.stat()
+    note = output / "note"
+    note.write_bytes(b"kept")
+    outside = tmp_path / "outside-link"
+    outside.hardlink_to(note)
+    app = build / "Screen Organizer.app/Contents"
+    app.mkdir(parents=True)
+    (app / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": VERSION,
+                                                     "HomeScreenOrganizerArchitecture": "arm64"}))
+    (build / f"home-screen-organizer-{VERSION}.dmg").write_bytes(b"owned unmounted fixture")
+    monkeypatch.setattr(build_paths, "read_roots", lambda _: [])
+    monkeypatch.setattr(build_paths, "runner_roots", lambda: [])
+    monkeypatch.setattr(check_package_paths, "check_archive", lambda *args: None)
+    monkeypatch.setattr(release, "clean_copy", shutil.copytree)
+    monkeypatch.setattr(release, "verify_image", lambda *args: None)
+
+    # Prepare the possible reservations as ordinary, independent fixture entries.
+    staging, protected = (release.private_transaction(tmp_path) for _ in range(2))
+    containers = iter((staging, protected))
+    monkeypatch.setattr(release, "private_transaction", lambda _: next(containers))
+    name = "directory-permissions.json"
+    marker = tmp_path / "marker"
+    marker.write_bytes(b"fixture marker")
+    if reservation == "occupied":
+        (protected / name).hardlink_to(marker)
+    if reservation == "unnamed":
+        reserve = release._reserve_permissions_record
+        def provide_stream(directory, chosen, stack):
+            return reserve(directory, "unnamed-fixture" if chosen == name else chosen, stack)
+        monkeypatch.setattr(release, "_reserve_permissions_record", provide_stream)
+    def edit_saved_record():
+        with (protected / name).open("r+b") as other:
+            assert other.read(1) == b"{"
+            other.seek(0)
+            other.write(b"!")
+    if reservation == "changed-after-save":
+        save = release._RemovedDirectoryChanged.save
+        def save_then_edit(change, stream):
+            save(change, stream)
+            edit_saved_record()
+        monkeypatch.setattr(release._RemovedDirectoryChanged, "save", save_then_edit)
+    if reservation == "changed-before-report":
+        cleanup = shutil.rmtree
+        def cleanup_then_edit(folder):
+            cleanup(folder)
+            edit_saved_record()
+        monkeypatch.setattr(shutil, "rmtree", cleanup_then_edit)
+    inspect = release._DirectoryCopy.check_removed
+    def inspect_removed(directory, libc):
+        if reservation not in ("ordinary", "occupied") and directory.parent is None:
+            os.fchmod(directory.source, 0o1700)
+        inspect(directory, libc)
+    monkeypatch.setattr(release._DirectoryCopy, "check_removed", inspect_removed)
+    monkeypatch.setattr(sys, "argv", ["release.py", "package", "--arch", "arm64", "--build-dir", str(build),
+                                     "--output-dir", str(output)])
+    if reservation.startswith("changed-"):
+        with pytest.raises(SystemExit) as status:
+            release.main()
+        result = capsys.readouterr()
+        assert status.value.code == 1 and not result.out
+        assert "Release installed." in result.err and "Could not verify the saved directory permissions." in result.err
+        assert "permissions were saved in" not in result.err and (protected / name).read_bytes().startswith(b"!")
+        assert (output / f"home-screen-organizer-{VERSION}-macos-arm64.zip").is_file() and note.samefile(outside)
+        return
+    release.main()
+    result = capsys.readouterr()
+    assert result.out.strip() == VERSION and note.samefile(outside) and note.read_bytes() == b"kept"
+    if reservation == "ordinary":
+        assert not protected.exists() and not result.err
+    elif reservation == "occupied":
+        assert (protected / name).samefile(marker) and marker.stat().st_nlink == 2
+        assert os.path.samestat((protected / "previous").stat(), identity) and str(protected) in result.err
+        assert "permissions were saved" not in result.err
+    else:
+        saved = Path(result.err.partition("Previous directory permissions were saved in ")[2].rstrip(".\n"))
+        record = json.loads(saved.read_bytes())
+        assert saved.parent == protected and saved.stat().st_mode & 0o777 == 0o600
+        assert protected.stat().st_mode & 0o777 == 0o700 and record["mode"] == 0o1700
+        assert (record["device"], record["inode"]) == (identity.st_dev, identity.st_ino)
+        if reservation == "unnamed":
+            assert saved.name != name and (protected / "unnamed-fixture").read_bytes() == b""
+
+
+@pytest.mark.parametrize("final_mode, owner_change, private_record, accepted", [
+    (0o700, 0, True, True),
+    (0o500, 0, True, False),
+    (0o700, 1, True, False),
+    (0o500, 1, False, True),
+], ids=["stable-private", "mode-changed", "owner-changed", "nonprivate"])
+def test_recovery_checks_final_parent_permissions(tmp_path, monkeypatch, final_mode, owner_change,
+                                                 private_record, accepted):
+    import stat
+    from macapp import release
+
+    parent = tmp_path / "recovery"
+    parent.mkdir(mode=0o700)
+    record = parent / "record"
+    payload = b"saved permissions\n"
+    record.write_bytes(payload)
+    record.chmod(0o600)
+    first = parent.lstat()
+    # Change just the final parent observation while reading the real record.
+    final = list(first)
+    final[stat.ST_MODE] = stat.S_IFDIR | final_mode
+    final[stat.ST_UID] += owner_change
+    samples = iter((first, os.stat_result(final)))
+    lstat = Path.lstat
+
+    def sample(path):
+        return next(samples) if path == parent else lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", sample)
+
+    assert release._recovery_still_named(record, release.entry_identity(first), release.entry_identity(record.lstat()),
+                                         private_record=private_record, payload=payload) is accepted
+
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_release_exchange_records_recovery_before_further_io(tmp_path, monkeypatch, fail_at):
+    import ctypes
+    import errno
+    from macapp import release
+
+    source, destination = tmp_path / "staged", tmp_path / "release"
+    source.mkdir()
+    destination.mkdir()
+    (source / "new.zip").write_bytes(b"release")
+    (destination / "note").write_bytes(b"note")
+    original = destination.stat()
+    state = {}
+    native = ctypes.CDLL(None, use_errno=True)
+    real_stat = os.fstat
+    exchanged = False
+    calls = 0
+    class Native:
+        def __getattr__(self, name):
+            return getattr(native, name)
+        def renameatx_np(self, *args):
+            nonlocal exchanged
+            result = native.renameatx_np(*args)
+            if args[-1] == 2 and not result:
+                exchanged = True
+            return result
+    def inspect(fd):
+        nonlocal calls
+        if exchanged:
+            calls += 1
+            if calls == fail_at:
+                assert state["installed"] and state["retained_binding"][2] == release.entry_identity(original)
+                raise OSError(errno.EIO, "private fixture fault")
+        return real_stat(fd)
+    monkeypatch.setattr(release.ctypes, "CDLL", lambda *args, **kwargs: Native())
+    monkeypatch.setattr(os, "fstat", inspect)
+    with pytest.raises(OSError, match="Release installed. Could not verify"):
+        release.install_generation(source, destination, "arm64", publication=state)
+    assert (destination / "new.zip").read_bytes() == b"release"
+    previous = state["retained"] / "previous"
+    assert os.path.samestat(previous.stat(), original) and (previous / "note").read_bytes() == b"note"
+
+
+@pytest.mark.parametrize("edit", ["stricter-installed", "different-installed", "before-retirement"])
+def test_late_directory_changes_preserve_both_owners(tmp_path, monkeypatch, edit):
+    import ctypes
+    from macapp import release
+
+    output, stage = tmp_path / "release", tmp_path / "incoming"
+    notes = output / "notes"
+    notes.mkdir(parents=True, mode=0o755)
+    (notes / "record").write_bytes(b"original")
+    stage.mkdir()
+    (stage / "new").write_bytes(b"release")
+    original = stage / ".generation"
+    system = ctypes.CDLL(None, use_errno=True)
+    class Publication:
+        def __getattr__(self, name):
+            return getattr(system, name)
+        def renameatx_np(self, *args):
+            status = system.renameatx_np(*args)
+            if status == 0 and args[-1] == 2 and edit != "before-retirement":
+                (original / "notes").chmod(0o750)
+                if edit == "different-installed":
+                    notes.rename(output / "first copy")
+                    notes.mkdir(mode=0o700)
+                notes.chmod(0o700)
+            return status
+    monkeypatch.setattr(release.ctypes, "CDLL", lambda *args, **kwargs: Publication())
+    retire = release.retire_entry
+    def before_retirement(*args, **kwargs):
+        if edit == "before-retirement" and original.exists():
+            original.chmod(0o700)
+        return retire(*args, **kwargs)
+    monkeypatch.setattr(release, "retire_entry", before_retirement)
+    state = {}
+    release.install_generation(stage, output, "arm64", publication=state)
+    assert state["installed"] and state["retained"] and (output / "new").read_bytes() == b"release"
+    kept = state["retained"] / "previous"
+    assert (kept / "notes/record").read_bytes() == b"original"
+    if edit == "before-retirement":
+        assert kept.stat().st_mode & 0o777 == output.stat().st_mode & 0o777 == 0o700
+    else:
+        assert notes.stat().st_mode & 0o777 == 0o700
+        assert (kept / "notes").stat().st_mode & 0o777 == 0o750
 
 
 def test_native_zip_preserves_modes_links_and_omits_owner_extras(tmp_path):

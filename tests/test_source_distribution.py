@@ -215,10 +215,11 @@ def test_local_refreeze_records_actual_substitution_and_stays_outside_release(tm
     edited = tmp_path / "edited.lock"
     original.write_text("# h11-0.16.0-py3-none-any.whl\nh11==0.16.0 --hash=sha256:" + "a" * 64 + "\n")
     edited.write_text(original.read_text().replace("a" * 64, "b" * 64))
-    assert local_selections(original, edited, {"h11"}) == {"h11": {"upstreamWheel": "a" * 64, "wheel": "b" * 64}}
+    shipped = {"h11": {"version": "0.16.0", "wheel": "a" * 64}}
+    assert local_selections(original, edited, shipped) == {"h11": {"upstreamWheel": "a" * 64, "wheel": "b" * 64}}
     edited.write_text(edited.read_text().replace("h11", "other"))
     with pytest.raises(ValueError, match="release component"):
-        local_selections(original, edited, {"h11"})
+        local_selections(original, edited, shipped)
 
 
 
@@ -254,6 +255,36 @@ def test_local_extract_skips_git_pointer_and_checks_promoted_root(tmp_path):
     with pytest.raises(ValueError, match="link"):
         unpack_source(path, tmp_path / "bad")
     assert not (tmp_path / "bad").exists()
+
+
+@pytest.mark.parametrize("target", ["internal", "crosses-root"])
+def test_component_link_chain_uses_final_directory(tmp_path, monkeypatch, target):
+    import io
+    import tarfile
+    from rebuild_sources import unpack_source
+
+    archive = tmp_path / "component.tar"
+    with tarfile.open(archive, "w") as package:
+        data = tarfile.TarInfo("wrapper/src/value")
+        data.size = 5
+        package.addfile(data, io.BytesIO(b"value"))
+        for name, destination in (("wrapper/alias", "src/value"), ("wrapper/src/chain", "../alias")):
+            link = tarfile.TarInfo(name)
+            link.type, link.linkname = tarfile.SYMTYPE, destination
+            package.addfile(link)
+    output = tmp_path / "editable"
+    if target == "crosses-root":
+        # The staged fixture has only internal links. Supply the boundary case to the validator in memory.
+        readlink = Path.readlink
+        def logical_target(path):
+            return Path("../wrapper/src/value") if path.name == "alias" else readlink(path)
+        monkeypatch.setattr(Path, "readlink", logical_target)
+        with pytest.raises(ValueError, match="link"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert (output / "src/chain").is_symlink() and (output / "src/chain").read_bytes() == b"value"
 
 
 def test_provider_matches_actual_collected_stdlib(tmp_path):
@@ -295,7 +326,150 @@ def test_local_project_can_be_refrozen_with_unmodified_dependency_lock(tmp_path)
     from rebuild_sources import local_selections
     lock = tmp_path / "original.lock"
     lock.write_text("# h11-0.16.0-py3-none-any.whl\nh11==0.16.0 --hash=sha256:" + "a" * 64 + "\n")
-    assert local_selections(lock, lock, {"h11"}) == {}
+    assert local_selections(lock, lock, {"h11": {"version": "0.16.0", "wheel": "a" * 64}}) == {}
+
+
+@pytest.mark.parametrize("modification", ["build-tool", "missing", "version", "signed-version"])
+def test_local_wheel_selection_preserves_full_build_lock(tmp_path, modification):
+    from rebuild_sources import local_selections
+
+    runtime = "# h11-0.16.0-py3-none-any.whl\nh11==0.16.0 --hash=sha256:" + "a" * 64 + "\n"
+    tool = "# wheel-0.46.3-py3-none-any.whl\nwheel==0.46.3 --hash=sha256:" + "b" * 64 + "\n"
+    original, edited = tmp_path / "prepared.lock", tmp_path / "edited.lock"
+    original.write_text(runtime + tool)
+    chosen = {"build-tool": runtime + tool.replace("b" * 64, "c" * 64), "missing": runtime,
+              "version": runtime + tool.replace("0.46.3", "0.46.4"), "signed-version": runtime + tool}
+    edited.write_text(chosen[modification])
+    owner = {"version": "0.17.0" if modification == "signed-version" else "0.16.0", "wheel": "a" * 64}
+    with pytest.raises(ValueError, match="component"):
+        local_selections(original, edited, {"h11": owner})
+
+
+@pytest.mark.parametrize("selection", ["prepared", "edited", "release", "absent-wheelhouse", "changed-inventory",
+                                      "bounded-inventory", "one-inventory-read"])
+def test_intel_refreeze_binds_prepared_and_edited_wheels(tmp_path, monkeypatch, selection):
+    import rebuild_sources
+    from wheelhouse import records
+
+    filename = "cryptography-50.0.2-cp312-abi3-macosx_14_0_x86_64.whl"
+    filename_tool = "maturin-1.14.1-py3-none-any.whl"
+    prepared_dir = tmp_path / "project/build/dependencies/x86_64"
+    prepared_wheels = prepared_dir / "wheels"
+    prepared_wheels.mkdir(parents=True)
+    wheelhouse = tmp_path / "edited wheels"
+    wheelhouse.mkdir()
+    hashes = {key: hashlib.sha256(key.encode()).hexdigest() for key in ("prepared", "edited", "release", "tool")}
+    def lock(digest):
+        return (f"# {filename}\ncryptography==50.0.2 --hash=sha256:{digest}\n"
+                f"# {filename_tool}\nmaturin==1.14.1 --hash=sha256:{hashes['tool']}\n")
+    (prepared_wheels / filename).write_bytes(b"prepared")
+    original = prepared_dir / "requirements-build.lock"
+    original.write_text(lock(hashes["prepared"]))
+    chosen = selection if selection in ("release", "edited") else "prepared"
+    edited = tmp_path / "recipient.lock"
+    edited.write_text(lock(hashes["edited" if selection == "absent-wheelhouse" else chosen]))
+    (wheelhouse / filename).write_bytes(chosen.encode())
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(json.dumps({"owners": {"cryptography": {"version": "50.0.2", "wheel": hashes["release"]}}}))
+    manifest = {"commit": "a" * 40, "architectures": {"x86_64": {"inventory": inventory.name}},
+                "files": {inventory.name: hashlib.sha256(inventory.read_bytes()).hexdigest()}}
+    (tmp_path / "MANIFEST.json").write_text(json.dumps(manifest))
+    if selection == "changed-inventory":
+        inventory.write_bytes(inventory.read_bytes() + b" ")
+    if selection == "bounded-inventory":
+        with inventory.open("r+b") as stream:
+            stream.truncate(rebuild_sources.INVENTORY_LIMIT + 1)
+    opens = []
+    if selection == "one-inventory-read":
+        native_open = rebuild_sources.os.open
+        def single_open(path, flags, *args, **kwargs):
+            if path == inventory:
+                opens.append(flags)
+                assert len(opens) == 1
+                local = native_open(path, flags, *args, **kwargs)
+                inventory.rename(tmp_path / "verified-inventory")
+                inventory.write_bytes(b"new lookup")
+                return local
+            return native_open(path, flags, *args, **kwargs)
+        monkeypatch.setattr(rebuild_sources.os, "open", single_open)
+    monkeypatch.setattr(rebuild_sources.platform, "machine", lambda: "x86_64")
+    monkeypatch.delenv("PIP_FIND_LINKS", raising=False)
+    runs = []
+    def build(command, **kwargs):
+        selected = list(records(command[3]))
+        changes = json.loads(command[5].read_bytes())["components"]
+        runs.append((selected[0], changes))
+    monkeypatch.setattr(rebuild_sources.subprocess, "run", build)
+    wheels = wheelhouse if selection in ("edited", "release") else None
+    out = tmp_path / "app"
+    if selection in ("absent-wheelhouse", "changed-inventory", "bounded-inventory"):
+        with pytest.raises(ValueError, match="wheelhouse|source input|inventory size"):
+            rebuild_sources.refreeze(tmp_path, "x86_64", wheels, edited, out)
+        assert runs == [] and not out.exists()
+    else:
+        rebuild_sources.refreeze(tmp_path, "x86_64", wheels, edited if wheels else None, out)
+        actual, changes = runs[0]
+        selected_path = (wheels or prepared_wheels) / filename
+        assert actual == (filename, "cryptography @ " + selected_path.as_uri(), hashes[chosen])
+        assert changes == ({} if chosen == "release" else {
+            "cryptography": {"upstreamWheel": hashes["release"], "wheel": hashes[chosen]}})
+        if selection == "one-inventory-read":
+            assert len(opens) == 1
+
+
+@pytest.mark.parametrize("location", ["quoted-path", "file-url", "localhost", "remote", "wrong-bytes",
+                                     "colon", "relative-file", "query", "fragment", "short-https", "long-https"])
+def test_locked_wheelhouse_accepts_local_locations_with_matching_bytes(tmp_path, monkeypatch, location):
+    import shlex
+    from rebuild_sources import selected_lock
+
+    monkeypatch.chdir(tmp_path)
+    directory = tmp_path / ("wheels:daily" if location == "colon" else "locked wheels")
+    directory.mkdir()
+    name = "chardet-7.7.0-py3-none-any.whl"
+    value = hashlib.sha256(b"wheel").hexdigest()
+    wheel = directory / name
+    wheel.write_bytes(b"different" if location == "wrong-bytes" else b"wheel")
+    locator = {"quoted-path": shlex.quote(str(directory)), "file-url": directory.as_uri(),
+               "localhost": directory.as_uri().replace("file://", "file://localhost"),
+               "remote": directory.as_uri().replace("file://", "file://other.invalid"),
+               "colon": directory.name, "relative-file": "file:locked%20wheels",
+               "query": directory.as_uri() + "?view=wheels", "fragment": directory.as_uri() + "#local",
+               "wrong-bytes": directory.as_uri(), "short-https": "https://example.invalid/page " + directory.as_uri(),
+               "long-https": "https://example.invalid/" + "x" * 1700 + " " + directory.as_uri()}[location]
+    monkeypatch.setenv("PIP_FIND_LINKS", locator)
+    original = "chardet @ https://example.invalid/" + name
+    result = selected_lock([(name, original, value)], tmp_path / "empty", set(), cached=True)
+    selected = original if location in ("remote", "wrong-bytes") else "chardet @ " + wheel.as_uri()
+    assert result == f"# {name}\n{selected} --hash=sha256:{value}\n"
+
+
+@pytest.mark.parametrize("name", ["docs/readme.md", "./docs/readme.md", "docs//./readme.md",
+                                 "../readme.md", "docs/../readme.md", ".git/readme.md", "/docs/readme.md",
+                                 "docs/readme.md/", "docs/readme.md/.", "docs/link.md"])
+def test_metadata_paths_retain_regular_public_files(tmp_path, name):
+    from frozen_sources import local_project_input, local_root_inputs
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "readme.md").write_bytes(b"Project description")
+    (docs / "link.md").symlink_to("readme.md")
+    (tmp_path / "pyproject.toml").write_text(f'[project]\nreadme="{name}"\n')
+    def captured():
+        return {key: local_project_input(tmp_path, key) for key in local_root_inputs(tmp_path)}
+    if name in ("docs/readme.md", "./docs/readme.md", "docs//./readme.md"):
+        assert captured()["docs/readme.md"] == b"Project description"
+    else:
+        with pytest.raises(ValueError):
+            captured()
+
+
+def test_metadata_pattern_requires_a_string(tmp_path):
+    from frozen_sources import local_root_inputs
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nlicense-files = [42]\n")
+    with pytest.raises(ValueError, match="metadata|source path"):
+        local_root_inputs(tmp_path)
 
 
 def test_local_install_lock_retains_wheel_identity_without_download_location(tmp_path):

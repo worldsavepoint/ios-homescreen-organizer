@@ -53,7 +53,16 @@ def test_reported_archive_damage_keeps_write_pending(tmp_path, source_type, dama
             meta[key] = True if damage == "bool-columns" else 7 if damage == "rows" else 5
 
     source.set_icon_state = write
-    assert apply(session)["status"] == "unknown"
+    result = apply(session)
+    assert result["status"] == "unknown"
+    if damage == "cell":
+        assert result["mismatches"]["fixed_position"] == {
+            "owner": "example.a", "page": 1, "requested_cell": 5, "observed_cell": 0,
+            "requested": {"row": 2, "column": 2}, "observed": {"row": 1, "column": 1},
+        }
+        assert result["backup"] in session.backups() and result["recovery"] == "read"
+    if damage == "fraction":
+        assert "pin cell" in result["error"]
     assert session._pending_path.exists()
     assert not session._gaps_path.exists()
 
@@ -81,6 +90,35 @@ def test_phone_reader_distinguishes_exported_empty_metadata_and_clears_each_read
     file_source = FileSource(path)
     run(file_source.read())
     assert file_source.pins == {}
+
+
+@pytest.mark.parametrize("size", ["large", "extralarge"])
+def test_apply_counts_a_fitting_four_by_four_widget_by_its_footprint(tmp_path, size):
+    source = ArchiveSource(5, 6, "dictionary")
+    source.raw = to_root_archive([[app("b", "B")], [widget("Weather", size), app("a", "A")]], [])
+    session = Session(source, tmp_path / "data")
+    run(session.read())
+    session.edit(lambda layout: layout.move("b", "page:1"))
+    assert not session.require().validate()
+    assert apply(session)["ok"] and len(source.payloads) == 1
+
+
+def test_today_readback_uses_the_value_captured_before_transport(tmp_path):
+    source = PhoneArchiveSource(4, 6, "dictionary")
+    source.raw["today"] = [{"selected": 1}]
+    session = Session(source, tmp_path)
+    run(session.read())
+    session.edit(lambda layout: layout.move("com.example.b", "dock"))
+    async def altered(payload):
+        # The send saw the original int. This adapter reuses its argument as a readback buffer.
+        source.payloads.append(copy.deepcopy(payload))
+        payload["today"][0]["selected"] = True
+        source.raw = payload
+    source.set_icon_state = altered
+    result = apply(session)
+    assert type(source.payloads[0]["today"][0]["selected"]) is int
+    assert result["status"] == "unknown" and "Today View" in result["error"]
+    assert result["backup"] in session.backups() and session._pending_path.exists()
 
 
 def test_phone_list_readback_retains_unreported_pin_contract(tmp_path):
@@ -146,7 +184,7 @@ def test_observed_frame_changes_block_write_even_after_draft_reload(tmp_path, wh
 @pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.parametrize("fits", [False, True])
 def test_restore_widget_uses_footprint_geometry(tmp_path, legacy, fits):
-    # The legacy extralarge slot estimate is 32, but its actual footprint is 4x4.
+    # A restored extra-large widget occupies a 4x4 rectangle.
     state = [[], [widget("Weather", "extralarge")]]
     if not fits:
         state[1].append(widget("Calendar", "large"))

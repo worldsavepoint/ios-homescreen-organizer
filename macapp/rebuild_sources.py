@@ -1,5 +1,7 @@
 """Prepare editable components and local rebuild inputs from a release source tree."""
 import argparse
+import errno
+import hashlib
 import json
 import os
 import platform
@@ -11,9 +13,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from urllib.parse import unquote_to_bytes, urlsplit
 import zipfile
 
-from source_inputs import canonical, relative_name, sha256
+from source_inputs import INVENTORY_LIMIT, canonical, relative_name, sha256
 
 
 def unpack_source(archive, output):
@@ -64,14 +67,20 @@ def unpack_source(archive, output):
                     raise ValueError("Unsafe upstream archive link or member") from error
         children = list(stage.iterdir())
         unpacked = children[0] if len(children) == 1 and children[0].is_dir() and not children[0].is_symlink() else stage
+        root = unpacked.resolve()
         for path in unpacked.rglob("*"):
             if path.is_symlink():
-                try:
-                    valid = not path.readlink().is_absolute() and path.resolve(strict=True).is_relative_to(unpacked.resolve())
-                except (OSError, RuntimeError):
-                    valid = False
-                if not valid:
+                target = path.readlink()
+                if target.is_absolute():
                     raise ValueError("Invalid archive link in editable source tree")
+                current = path.parent.resolve(strict=True)
+                try:
+                    for part in target.parts:
+                        current = (current / part).resolve(strict=True)
+                        if not current.is_relative_to(root):
+                            raise ValueError("Invalid archive link in editable source tree")
+                except (OSError, RuntimeError) as error:
+                    raise ValueError("Invalid archive link in editable source tree") from error
         unpacked.rename(output)
 
 
@@ -205,11 +214,25 @@ def compiler_environment(roots, arch):
     return env
 
 
-def selected_lock(records, wheelhouse, changed, *, cached=False):
+def selected_lock(records, wheelhouse, changed, *, cached=False, prepared=None):
     lines = []
     locations = [wheelhouse]
     if cached:
-        locations.extend(Path(path) for path in shlex.split(os.environ.get("PIP_FIND_LINKS", "")))
+        if prepared is not None:
+            locations.append(prepared)
+        for location in shlex.split(os.environ.get("PIP_FIND_LINKS", "")):
+            if not location.lower().startswith("file://"):
+                directory = Path(location)
+                try:
+                    if directory.is_dir():
+                        locations.append(directory)
+                        continue
+                except OSError as error:
+                    if error.errno != errno.ENAMETOOLONG:
+                        raise
+            url = urlsplit(location)
+            if url.scheme == "file" and url.netloc.lower() in ("", "localhost") and url.path:
+                locations.append(Path(os.fsdecode(unquote_to_bytes(url.path))))
     for filename, requirement, value in records:
         owner = canonical(filename.split("-")[0])
         if owner in changed:
@@ -240,10 +263,12 @@ def local_selections(original, edited, shipped):
     before, after = indexed(original), indexed(edited)
     if before.keys() != after.keys() or any(v[0] != after[k][0] for k, v in before.items()):
         raise ValueError("The local lock must retain the release component names and versions")
-    changed = {k: {"upstreamWheel": v[1], "wheel": after[k][1]} for k, v in before.items() if v != after[k]}
-    if not changed.keys() <= set(shipped):
+    if any(before[name] != after[name] for name in before.keys() - shipped.keys()):
         raise ValueError("Select an edited frozen runtime component")
-    return changed
+    if any(name not in after or after[name][0] != owner["version"] for name, owner in shipped.items()):
+        raise ValueError("The local lock must retain the shipped component versions")
+    return {name: {"upstreamWheel": owner["wheel"], "wheel": after[name][1]}
+            for name, owner in shipped.items() if owner["wheel"] != after[name][1]}
 
 
 def refreeze(root, arch, wheelhouse, lock, output):
@@ -251,12 +276,26 @@ def refreeze(root, arch, wheelhouse, lock, output):
         raise ValueError("Use a new output directory on the matching native Mac")
     from wheelhouse import entries, records
     manifest = json.loads((root / "MANIFEST.json").read_bytes())
-    volume = json.loads((root / relative_name(manifest["architectures"][arch]["inventory"])).read_bytes())
+    inventory = relative_name(manifest["architectures"][arch]["inventory"])
+    fd = os.open(root / inventory, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > INVENTORY_LIMIT:
+            raise ValueError("Invalid source inventory size or type")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(info.st_size + 1)
+    finally:
+        os.close(fd)
+    if len(data) != info.st_size or hashlib.sha256(data).hexdigest() != manifest["files"][inventory]:
+        raise ValueError("Changed release source input inventory")
+    volume = json.loads(data)
     project = root / "project"
     original = project / ("requirements-build.lock" if arch == "arm64" else "build/dependencies/x86_64/requirements-build.lock")
     lock = lock or original
     changed = local_selections(original, lock, volume["owners"])
-    if changed and wheelhouse is None:
+    prepared = set(entries(original))
+    edited = {canonical(wheel.split("-")[0]) for wheel, value in entries(lock) if (wheel, value) not in prepared}
+    if edited and wheelhouse is None:
         raise ValueError("Supply the wheelhouse containing your modified components")
     wheels = wheelhouse.resolve() if wheelhouse is not None else None
     roots = [root, project, output, lock.parent, Path(sys.prefix), Path(sys.base_prefix)]
@@ -265,11 +304,6 @@ def refreeze(root, arch, wheelhouse, lock, output):
         roots.append(wheels)
         if (wheels / RECORD).exists():
             roots.extend(read_roots(wheels, sorted(wheels.glob("*.whl"))))
-    for wheel, value in entries(lock):
-        owner = canonical(wheel.split("-")[0])
-        if owner in changed and sha256(wheels / wheel) != value:
-            raise ValueError("Edited wheel does not match its local lock")
-    output.mkdir(parents=True)
     with tempfile.TemporaryDirectory() as temporary:
         if wheels is None:
             wheels = Path(temporary) / "wheels"
@@ -277,7 +311,9 @@ def refreeze(root, arch, wheelhouse, lock, output):
         # A package index or find-links directory may also have the original wheel under
         # the same filename. Direct local references select the trusted replacement bytes.
         effective_lock = Path(temporary) / "local-download.lock"
-        effective_lock.write_text(selected_lock(records(lock), wheels, changed, cached=True))
+        prepared_wheels = original.parent / "wheels" if arch == "x86_64" else None
+        effective_lock.write_text(selected_lock(records(lock), wheels, edited, cached=True, prepared=prepared_wheels))
+        output.mkdir(parents=True)
         settings = Path(temporary) / "rebuild.json"
         settings.write_text(json.dumps({"upstreamCommit": manifest["commit"], "components": changed,
                                         "manifest": str(root / "MANIFEST.json"),

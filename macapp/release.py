@@ -1,8 +1,11 @@
 """Assemble versioned macOS release assets from a completed app build."""
 import argparse
+import base64
 import ctypes
 from contextlib import ExitStack
+import errno
 import fcntl
+from functools import cached_property
 import hashlib
 import json
 import os
@@ -37,6 +40,8 @@ def project_version(tag=None, *, root=ROOT):
 
 
 def localization_resources(locales):
+    from tools.check_translations import product_display_name
+
     manifest = json.loads((locales / "manifest.json").read_text())
     codes = [language["code"] for language in manifest["languages"]]
     if (manifest.get("default") != "en" or "en" not in codes or len(codes) != len(set(codes))
@@ -46,7 +51,7 @@ def localization_resources(locales):
     for code in codes:
         data = (locales / f"{code}.json").read_bytes()
         catalog = json.loads(data)
-        expected = {"zh-Hans": "屏幕整理", "zh-Hant": "螢幕整理"}.get(code, "Screen Organizer")
+        expected = product_display_name(code)
         if catalog.get("app.name") != expected:
             raise ValueError(f"Check the localized app display name: {code}")
         files[f"Localization/{code}.json"] = data
@@ -78,17 +83,16 @@ def localize(app, locales, check=False):
 
 
 def private_transaction(parent):
-    folder = Path(tempfile.mkdtemp(dir=parent, prefix=".native-release-"))
-    try:
-        subprocess.run(["/bin/chmod", "-N", folder], check=True, capture_output=True)
-        folder.chmod(0o700)
-        mode = folder.stat()
-        if mode.st_uid != os.getuid() or stat.S_IMODE(mode.st_mode) != 0o700 or any(folder.iterdir()):
-            raise OSError("Could not prepare a private release transaction")
+    from homescreen.private_store import create_private_directory
+
+    for _ in range(tempfile.TMP_MAX):
+        folder = parent / (".native-release-" + uuid.uuid4().hex)
+        try:
+            create_private_directory(folder)
+        except FileExistsError:
+            continue
         return folder
-    except BaseException:
-        folder.rmdir()
-        raise
+    raise FileExistsError("Could not allocate a new private release transaction")
 
 
 def check_tree_metadata(root):
@@ -149,6 +153,7 @@ def package(build_dir, output_dir, version, arch):
     basename = f"home-screen-organizer-{version}-macos-{arch}"
     folder = private_transaction(output_dir.parent)
     publication = {}
+    retirement_error = None
     try:
         staged = folder / "assets"
         staged.mkdir()
@@ -167,6 +172,11 @@ def package(build_dir, output_dir, version, arch):
             lines.append(f"{digest}  {asset.name}\n")
         (staged / "SHA256SUMS.txt").write_text("".join(lines))
         install_generation(staged, output_dir, arch, publication=publication)
+    except OSError as error:
+        if not publication.get("installed"):
+            raise
+        retirement_error = error if isinstance(error, _RetirementError) else _RetirementError(
+            "Release installed. Could not complete private release cleanup.")
     finally:
         # Retained entries can share an inode with the live generation and with another hardlink.
         # Ordinary unlink never resets an ACL or mode to force retirement.
@@ -175,10 +185,30 @@ def package(build_dir, output_dir, version, arch):
             try:
                 shutil.rmtree(folder)
             except OSError:
-                if publication.get("installed") and retained is None:
-                    retained = folder
-        if publication.get("installed") and retained is not None:
-            print(f"Release installed. Previous files were retained in {retained}.", file=sys.stderr)
+                if publication.get("installed") and retirement_error is None:
+                    retirement_error = _RetirementError("Release installed. Could not complete private release cleanup.")
+        if publication.get("installed"):
+            messages = []
+            record = publication.get("permissions_record")
+            if retained is not None:
+                if not _recovery_still_named(*publication["retained_binding"]):
+                    messages.append("Could not confirm the location of the remaining previous directory.")
+                    retirement_error = retirement_error or _RetirementError("Release installed. Recovery is incomplete.")
+                elif record:
+                    messages.append(f"The remaining previous directory was retained in {retained}.")
+                else:
+                    messages.append(f"Previous files were retained in {retained}.")
+            if record:
+                if _recovery_still_named(record, *publication["permissions_binding"], private_record=True,
+                                         payload=publication["permissions_payload"]):
+                    messages.append(f"Previous directory permissions were saved in {record}.")
+                else:
+                    messages.append("Could not verify the saved directory permissions.")
+                    retirement_error = retirement_error or _RetirementError("Release installed. Recovery is incomplete.")
+            if retirement_error:
+                raise _RetirementError(" ".join([str(retirement_error), *messages])) from None
+            if messages:
+                print("Release installed.", *messages, file=sys.stderr)
 
 
 def app_contents(app):
@@ -306,17 +336,175 @@ def entry_identity(info):
 
 
 def check_preserved_entry(parent, name, identity):
-    if entry_identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity:
-        raise OSError("The retained release directory changed")
+    try:
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except (FileNotFoundError, NotADirectoryError):
+        raise _DirectoryChanged("The retained release directory changed") from None
+    if entry_identity(current) != identity:
+        raise _DirectoryChanged("The retained release directory changed")
 
 
-def preserve_entry(name, source_parent, destination_parent, libc, stack, checks, directories):
+def _recovery_still_named(path, parent_identity, identity, *, private_record=False, payload=None):
+    def private_parent(info):
+        return stat.S_IMODE(info.st_mode) == 0o700 and info.st_uid == os.geteuid()
+
+    try:
+        parent, entry = path.parent.lstat(), path.lstat()
+        if entry_identity(parent) != parent_identity or entry_identity(entry) != identity:
+            return False
+        if private_record and (not private_parent(parent) or stat.S_IMODE(entry.st_mode) != 0o600
+                               or entry.st_nlink != 1 or entry.st_uid != os.geteuid()):
+            return False
+        if payload is None:
+            return True
+        if entry.st_size != len(payload):
+            return False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb", buffering=0) as stream:
+            opened = os.fstat(fd)
+            if entry_identity(opened) != identity or asset_state(opened) != asset_state(entry):
+                return False
+            if stream.read(len(payload) + 1) != payload:
+                return False
+            named = path.lstat()
+            if not os.path.samestat(named, opened) or asset_state(named) != asset_state(opened):
+                return False
+            final_parent = path.parent.lstat()
+            return os.path.samestat(final_parent, parent) and (not private_record or private_parent(final_parent))
+    except OSError:
+        return False
+
+
+def _reserve_permissions_record(directory, name, stack):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600, dir_fd=directory)
+    stream = stack.enter_context(os.fdopen(fd, "wb"))
+    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+        os.fchmod(fd, 0o600)
+    return stream
+
+
+def directory_permissions(fd, libc):
+    info = os.fstat(fd)
+    acl = libc.acl_get_fd_np(fd, 0x100)  # ACL_TYPE_EXTENDED
+    encoded = b""
+    if acl:
+        try:
+            size = libc.acl_size(acl)
+            if size < 0:
+                raise OSError(ctypes.get_errno(), "Could not read the release directory permissions")
+            data = ctypes.create_string_buffer(size)
+            if libc.acl_copy_ext(data, acl, size) != size:
+                raise OSError(ctypes.get_errno(), "Could not read the release directory permissions")
+            encoded = data.raw
+        finally:
+            libc.acl_free(acl)
+    elif ctypes.get_errno() != errno.ENOENT:
+        raise OSError(ctypes.get_errno(), "Could not read the release directory permissions")
+    return stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid, encoded
+
+
+class _DirectoryChanged(OSError):
+    pass
+
+
+class _RemovedDirectoryChanged(_DirectoryChanged):
+    def __init__(self, directory, permissions):
+        super().__init__("The removed directory's permissions changed")
+        self.directory = directory
+        self.permissions = permissions
+
+    @cached_property
+    def payload(self):
+        mode, uid, gid, encoded = self.permissions
+        info = os.fstat(self.directory.source)
+        metadata = {"directory": str(self.directory.relative), "device": info.st_dev, "inode": info.st_ino,
+                    "uid": uid, "gid": gid, "mode": mode, "aclFormat": "Darwin acl_copy_ext",
+                    "aclBase64": base64.b64encode(encoded).decode("ascii")}
+        return (json.dumps(metadata) + "\n").encode("utf-8")
+
+    def save(self, record):
+        record.write(self.payload)
+        record.flush()
+        os.fsync(record.fileno())
+
+
+class _RetirementError(_DirectoryChanged):
+    pass
+
+
+def set_directory_permissions(fd, current, wanted, libc):
+    mode, uid, gid, encoded = wanted
+    ownership_changed = (uid, gid) != current[1:3]
+    if ownership_changed:
+        os.fchown(fd, uid if uid != current[1] else -1, gid if gid != current[2] else -1)
+    if ownership_changed or mode != current[0]:
+        os.fchmod(fd, mode)
+    if encoded != current[3]:
+        acl = libc.acl_copy_int(encoded) if encoded else libc.acl_init(0)
+        if not acl:
+            raise OSError(ctypes.get_errno(), "Could not read the saved directory ACL")
+        try:
+            if libc.acl_set_fd_np(fd, acl, 0x100):
+                raise OSError(ctypes.get_errno(), "Could not set the release directory ACL")
+        finally:
+            libc.acl_free(acl)
+
+
+class _DirectoryCopy:
+    def __init__(self, source, destination, source_entry, destination_entry, parent, libc):
+        self.source, self.destination = source, destination
+        self.source_entry, self.destination_entry = source_entry, destination_entry
+        self.parent = parent
+        self.relative = parent.relative / source_entry[1] if parent else Path(".")
+        self.permissions = directory_permissions(source, libc)
+        self.names = set()
+
+    def check_bindings(self, *, removed=False):
+        if self.parent:
+            self.parent.check_bindings()
+        if not removed:
+            check_preserved_entry(*self.source_entry, entry_identity(os.fstat(self.source)))
+        check_preserved_entry(*self.destination_entry, entry_identity(os.fstat(self.destination)))
+
+    def reconcile(self, libc, source, *, removed=False):
+        self.check_bindings(removed=removed)
+        current = directory_permissions(self.destination, libc)
+        if current == self.permissions and directory_permissions(self.source, libc) == source:
+            set_directory_permissions(self.destination, current, source, libc)
+            self.check_bindings(removed=removed)
+            if directory_permissions(self.destination, libc) != directory_permissions(self.source, libc):
+                raise _DirectoryChanged("The retained release directory permissions changed again")
+
+    def check_removed(self, libc):
+        try:
+            permissions = directory_permissions(self.source, libc)
+        except OSError as error:
+            raise _RetirementError("Release installed. Could not read the removed directory's permissions.") from error
+        if permissions != self.permissions:
+            raise _RemovedDirectoryChanged(self, permissions)
+
+    def check(self, libc, *, installed=False):
+        self.check_bindings()
+        source = directory_permissions(self.source, libc)
+        destination = directory_permissions(self.destination, libc)
+        if source == destination == self.permissions:
+            return
+        if installed and source != self.permissions and destination == self.permissions:
+            # Reconcile only the bound copy while it still has the permissions we installed.
+            self.reconcile(libc, source)
+        # Even a reconciled change keeps the original generation.
+        raise _DirectoryChanged("The retained release directory permissions changed")
+
+
+def preserve_entry(name, parent, libc, stack, checks, directories):
+    source_parent, destination_parent = parent.source, parent.destination
     identity = entry_identity(os.stat(name, dir_fd=source_parent, follow_symlinks=False))
     entry = {"identity": identity}
     checks.append((source_parent, name, identity))
     if identity[2] != stat.S_IFDIR:
         os.link(name, name, src_dir_fd=source_parent, dst_dir_fd=destination_parent, follow_symlinks=False)
         check_preserved_entry(destination_parent, name, identity)
+        checks.append((destination_parent, name, identity))
         return entry
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     source = os.open(name, flags, dir_fd=source_parent)
@@ -326,6 +514,9 @@ def preserve_entry(name, source_parent, destination_parent, libc, stack, checks,
     os.mkdir(name, dir_fd=destination_parent)
     destination = os.open(name, flags, dir_fd=destination_parent)
     stack.callback(os.close, destination)
+    directory = _DirectoryCopy(source, destination, (source_parent, name), (destination_parent, name), parent, libc)
+    directories.append(directory)
+    entry["directory"] = directory
     # New directories receive the retained ACL after their children are linked.
     acl = libc.acl_init(0)
     if not acl:
@@ -336,18 +527,20 @@ def preserve_entry(name, source_parent, destination_parent, libc, stack, checks,
     finally:
         libc.acl_free(acl)
     children = os.listdir(source)
-    directories.append((source, set(children)))
+    directory.names = set(children)
     entry["children"] = {}
     for child in children:
-        entry["children"][child] = preserve_entry(child, source, destination, libc, stack, checks, directories)
+        entry["children"][child] = preserve_entry(child, directory, libc, stack, checks, directories)
     check_preserved_entry(source_parent, name, identity)
     # Set the directory's own restrictions after copying its existing children.
     if libc.fcopyfile(source, destination, None, 7) != 0:  # COPYFILE_METADATA
         raise OSError(ctypes.get_errno(), "Could not preserve the release directory metadata")
+    directory.check(libc)
     return entry
 
 
-def retire_entry(parent, name, expected, libc):
+def retire_entry(parent, name, expected, libc, containing):
+    containing.check(libc, installed=True)
     if expected is None:
         return
     if "verified_state" in expected:
@@ -361,6 +554,9 @@ def retire_entry(parent, name, expected, libc):
     name = os.fsencode(name)
     if libc.renameatx_np(parent, name, parent, claimed, 4) != 0:  # RENAME_EXCL
         return
+    retained = expected.get("directory")
+    if retained is not None:
+        retained.source_entry = (parent, claimed)
     try:
         info = os.stat(claimed, dir_fd=parent, follow_symlinks=False)
         if entry_identity(info) != expected["identity"]:
@@ -385,16 +581,22 @@ def retire_entry(parent, name, expected, libc):
                 if entry_identity(os.fstat(directory)) != expected["identity"]:
                     return
                 for child in os.listdir(directory):
-                    retire_entry(directory, child, expected["children"].get(child), libc)
+                    retire_entry(directory, child, expected["children"].get(child), libc, retained)
+                retained.check(libc, installed=True)
             finally:
                 os.close(directory)
             # A child saved at the final syscall boundary prevents removal.
             os.rmdir(claimed, dir_fd=parent)
+            retained.check_removed(libc)
+    except _DirectoryChanged:
+        raise
     except OSError:
         pass
     finally:
         # A changed or protected object keeps its original private name when available.
         libc.renameatx_np(parent, claimed, parent, name, 4)
+        if retained is not None:
+            retained.source_entry = (parent, name)
 
 
 def install_generation(staged, output, arch, *, publication=None):
@@ -427,18 +629,29 @@ def install_generation(staged, output, arch, *, publication=None):
         replacement = staged / ".generation"
         libc = ctypes.CDLL(None, use_errno=True)
         libc.acl_init.restype = ctypes.c_void_p
+        libc.acl_copy_int.argtypes = [ctypes.c_char_p]
+        libc.acl_copy_int.restype = ctypes.c_void_p
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        libc.acl_size.argtypes = [ctypes.c_void_p]
+        libc.acl_size.restype = ctypes.c_ssize_t
+        libc.acl_copy_ext.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t]
+        libc.acl_copy_ext.restype = ctypes.c_ssize_t
         libc.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
         libc.acl_free.argtypes = [ctypes.c_void_p]
         checks = []
         if existing:
-            checks.append((parent_fd, output.name, entry_identity(os.fstat(output_fd))))
             replacement.mkdir()
             subprocess.run(["chmod", "-N", replacement], check=True, capture_output=True)
             replacement_fd = os.open(".generation", flags, dir_fd=staged_fd)
             stack.callback(os.close, replacement_fd)
+            root = _DirectoryCopy(output_fd, replacement_fd, (parent_fd, output.name),
+                                  (staged_fd, ".generation"), None, libc)
+            directories = [root]
             # Darwin COPYFILE_SECURITY copies the directory stat and ACL before its children inherit them.
             if libc.fcopyfile(output_fd, replacement_fd, None, 3) != 0:
                 raise OSError(ctypes.get_errno(), "Could not preserve the release directory permissions")
+            root.check(libc)
         else:
             # A new output inherits its parent's ACL before its files are assembled in private.
             with tempfile.TemporaryDirectory(dir=output.parent, prefix=".native-generation-") as folder:
@@ -451,38 +664,126 @@ def install_generation(staged, output, arch, *, publication=None):
             publication["installed"] = True
             return
         names = os.listdir(output_fd)
-        directories = [(output_fd, set(names))]
+        root.names = set(names)
         retired = {name: getattr(owned, "verified", {}).get(name) for name in names}
         for name in names:
             if name in current_names:
                 continue
-            retired[name] = preserve_entry(name, output_fd, replacement_fd, libc, stack, checks, directories)
+            retired[name] = preserve_entry(name, root, libc, stack, checks, directories)
         for parent, name, identity in checks:
             check_preserved_entry(parent, name, identity)
-        if any(set(os.listdir(directory)) != names for directory, names in directories):
-            raise OSError("The retained release directory changed")
-        # Darwin RENAME_SWAP exchanges two populated directories on the same volume.
+        for directory in directories:
+            if set(os.listdir(directory.source)) != directory.names:
+                raise OSError("The retained release directory changed")
+            directory.check(libc)
+        previous_identity = entry_identity(os.fstat(output_fd))
+        retained_binding = (replacement, entry_identity(os.fstat(staged_fd)), previous_identity)
+        # Once Darwin RENAME_SWAP succeeds, the caller must protect the named previous generation.
         if libc.renameatx_np(staged_fd, b".generation", parent_fd, os.fsencode(output.name), 2) != 0:
             raise OSError(ctypes.get_errno(), "Could not install the verified release")
-        publication.update(installed=True, retained=replacement)
+        publication.update(installed=True, retained=replacement, retained_binding=retained_binding)
+        root.source_entry, root.destination_entry = root.destination_entry, root.source_entry
+        protected = None
+        protected_fd = None
+        permission_record = None
+        record = None
+        record_saved = False
+        recovery_error = None
         try:
-            for name in os.listdir(output_fd):
-                retire_entry(output_fd, name, retired.get(name), libc)
-            os.rmdir(".generation", dir_fd=staged_fd)
-            publication["retained"] = None
-        except OSError:
-            # Keep protected data outside any caller-owned temporary cleanup envelope.
-            try:
-                protected = private_transaction(output.parent)
-                protected_fd = os.open(protected, flags)
+            changed = False
+            for directory in directories:
                 try:
-                    os.rename(".generation", "previous", src_dir_fd=staged_fd, dst_dir_fd=protected_fd)
+                    directory.check(libc, installed=True)
+                except _DirectoryChanged:
+                    changed = True
+                except OSError as error:
+                    raise _RetirementError("Release installed. Could not verify the previous release directory.") from error
+            if changed:
+                raise _DirectoryChanged("The retained release directory changed")
+            # Reserve a private recovery name before the last link to a directory can be removed.
+            protected = private_transaction(output.parent)
+            protected_fd = os.open(protected.name, flags, dir_fd=parent_fd)
+            stack.callback(os.close, protected_fd)
+            parent_identity = entry_identity(os.fstat(protected_fd))
+            permission_record = protected / "directory-permissions.json"
+            record = _reserve_permissions_record(protected_fd, permission_record.name, stack)
+            try:
+                for name in os.listdir(output_fd):
+                    retire_entry(output_fd, name, retired.get(name), libc, root)
+                root.check(libc, installed=True)
+                os.rmdir(".generation", dir_fd=staged_fd)
+                publication["retained"] = None
+                root.check_removed(libc)
+            except _RemovedDirectoryChanged as change:
+                try:
+                    # If the reservation moved, use one fresh private name for the held permissions.
+                    for attempt in range(2):
+                        if attempt:
+                            check_preserved_entry(parent_fd, protected.name, parent_identity)
+                            fresh = protected / ("directory-permissions-" + uuid.uuid4().hex + ".json")
+                            record = _reserve_permissions_record(protected_fd, fresh.name, stack)
+                            permission_record = fresh
+                            record_saved = False
+                        identity = entry_identity(os.fstat(record.fileno()))
+                        if _recovery_still_named(permission_record, parent_identity, identity, private_record=True):
+                            change.save(record)
+                            record_saved = True
+                            if _recovery_still_named(permission_record, parent_identity, identity, private_record=True,
+                                                     payload=change.payload):
+                                break
+                            try:
+                                check_preserved_entry(protected_fd, permission_record.name, identity)
+                            except _DirectoryChanged:
+                                continue
+                            raise _RetirementError("Release installed. Could not verify the saved directory permissions.")
+                    else:
+                        raise _RetirementError("Release installed. Could not confirm the saved directory permissions location.")
+                except _RetirementError:
+                    raise
+                except OSError as error:
+                    raise _RetirementError("Release installed. Could not save the removed directory's permissions.") from error
+                publication.update(permissions_record=permission_record, permissions_binding=(parent_identity, identity),
+                                   permissions_payload=change.payload)
+                try:
+                    os.fsync(protected_fd)
+                except OSError:
+                    recovery_error = _RetirementError("Release installed. Could not confirm that the saved directory permissions would survive a crash.")
+                change.directory.reconcile(libc, change.permissions, removed=True)
+                raise
+        except OSError as error:
+            if isinstance(error, _RetirementError):
+                recovery_error = error
+            # Keep protected data outside any caller-owned temporary cleanup envelope.
+            if publication["retained"] is not None:
+                try:
+                    check_preserved_entry(staged_fd, ".generation", previous_identity)
+                    if protected is None:
+                        protected = private_transaction(output.parent)
+                    if protected_fd is None:
+                        protected_fd = os.open(protected.name, flags, dir_fd=parent_fd)
+                        stack.callback(os.close, protected_fd)
+                    parent_identity = entry_identity(os.fstat(protected_fd))
+                    check_preserved_entry(parent_fd, protected.name, parent_identity)
+                    if libc.renameatx_np(staged_fd, b".generation", protected_fd, b"previous", 4):  # RENAME_EXCL
+                        raise OSError(ctypes.get_errno(), "Could not move the previous release directory")
                     publication["retained"] = protected
-                finally:
-                    os.close(protected_fd)
+                    publication["retained_binding"] = (protected / "previous", parent_identity, previous_identity)
+                except OSError:
+                    # Publication completed; the original private container remains protected.
+                    pass
+        finally:
+            try:
+                if record is not None and not record_saved:
+                    identity = entry_identity(os.fstat(record.fileno()))
+                    if _recovery_still_named(permission_record, parent_identity, identity, private_record=True):
+                        os.unlink(permission_record.name, dir_fd=protected_fd)
+                if protected_fd is not None and protected != publication["retained"] and not record_saved:
+                    check_preserved_entry(parent_fd, protected.name, entry_identity(os.fstat(protected_fd)))
+                    os.rmdir(protected.name, dir_fd=parent_fd)
             except OSError:
-                # Publication completed; the original private container remains protected.
-                pass
+                recovery_error = recovery_error or _RetirementError("Release installed. Could not complete private release cleanup.")
+        if recovery_error is not None:
+            raise recovery_error
 
 
 def collect(input_dir, output_dir, version):
@@ -588,6 +889,8 @@ def main():
         elif args.command == "verify":
             verify_distribution(args.input_dir.resolve(), version, args.repository, args.commit)
         print(version)
+    except _RetirementError as exc:
+        parser.exit(1, f"{exc}\n")
     except (OSError, subprocess.CalledProcessError, tarfile.TarError, zipfile.BadZipFile) as exc:
         if args.command == "package":
             parser.exit(1, "Could not prepare the verified native release\n")
@@ -601,4 +904,5 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, str(ROOT))
     main()

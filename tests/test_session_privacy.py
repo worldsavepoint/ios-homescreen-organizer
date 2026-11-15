@@ -188,3 +188,46 @@ def test_existing_unowned_or_writable_descendant_is_preserved(tmp_path, monkeypa
         session._backup(session.require().to_state(), None, "capture")
     assert list(backups.iterdir()) == []
     assert backups.stat().st_mode & 0o777 == (0o777 if kind == "writable" else 0o700)
+
+
+@pytest.mark.parametrize("kind", ["regular", "unsupported", "shared-writable"])
+def test_private_file_validates_nonblocking_descriptor_before_use(tmp_path, monkeypatch, kind):
+    import stat
+    from homescreen.private_store import open_private_file
+
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    record = root / "record"
+    record.write_bytes(b"record")
+    record.chmod(0o664 if kind == "shared-writable" else 0o644)
+    opened = []
+    real_open, real_fstat = os.open, os.fstat
+
+    def observe(name, flags, *args, **kwargs):
+        fd = real_open(name, flags, *args, **kwargs)
+        if name == record.name:
+            opened.append((fd, flags, kwargs["dir_fd"]))
+        return fd
+
+    def descriptor(fd):
+        info = real_fstat(fd)
+        if kind == "unsupported" and opened and opened[0][0] == fd:
+            fields = list(info)
+            fields[0] = stat.S_IFIFO | 0o600
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(os, "open", observe)
+    monkeypatch.setattr(os, "fstat", descriptor)
+    if kind == "regular":
+        with os.fdopen(open_private_file(root, record), "rb") as stream:
+            assert os.get_blocking(stream.fileno()) and stream.read() == b"record"
+    else:
+        with pytest.raises(PermissionError):
+            with os.fdopen(open_private_file(root, record), "rb"):
+                pass
+        with pytest.raises(OSError):
+            real_fstat(opened[0][0])
+    _, flags, parent = opened[0]
+    required = os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    assert parent is not None and flags & required == required

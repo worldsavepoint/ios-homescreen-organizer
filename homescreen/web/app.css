@@ -2,12 +2,14 @@
   --bg: #f2f2f7; --panel: #ffffff; --panel-2: #f7f7fa; --fg: #1c1c1e; --muted: #6e6e73;
   --line: #d9d9de; --accent: #0a84ff; --accent-fg: #fff; --warn: #ff9f0a; --danger: #ff3b30;
   --ok: #30d158; --phone: #e9e9ee; --tile: #d1d1d6; --shadow: 0 8px 30px rgba(0,0,0,.12);
+  --primary-bg: #005eb8; --danger-text: #a32620; --success-text: #17652d;
   --drop: rgba(10,132,255,.18);
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #000; --panel: #1c1c1e; --panel-2: #242427; --fg: #f5f5f7; --muted: #98989f;
     --line: #38383a; --phone: #151517; --tile: #3a3a3c; --shadow: 0 8px 30px rgba(0,0,0,.5);
+    --primary-bg: #095fae; --danger-text: #ff8178; --success-text: #71df8d;
     --drop: rgba(10,132,255,.28);
   }
 }
@@ -15,6 +17,7 @@
 [hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
+  --drawer-width: min(400px, 100%);
   margin: 0; background: var(--bg); color: var(--fg); display: grid;
   grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto;
   font: 13px/1.35 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
@@ -26,8 +29,8 @@ button {
 }
 button:hover:not(:disabled) { filter: brightness(.97); }
 button:disabled { opacity: .45; cursor: default; }
-button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; font-weight: 600; }
-button.danger { color: var(--danger); }
+button.primary { background: var(--primary-bg); color: var(--accent-fg); border-color: transparent; font-weight: 600; }
+button.danger { color: var(--danger-text); }
 button.big { font-size: 15px; padding: 10px 22px; border-radius: 10px; }
 button svg { width: 16px; height: 16px; display: block; }
 input[type=search], input:not([type]) {
@@ -48,7 +51,7 @@ input:focus { border-color: var(--accent); }
 .device-btn svg { width: 11px; height: 11px; }
 .device-btn.static { cursor: default; pointer-events: none; }
 .device-btn.static svg { display: none; }
-.device-menu { left: 0; right: auto; min-width: 300px; }
+.device-menu .device-row .t { min-width: 0; }
 .device-row { display: flex !important; align-items: center; gap: 10px; }
 .device-row i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .device-row i.on { background: var(--ok); }
@@ -68,10 +71,10 @@ input:focus { border-color: var(--accent); }
 .menu button { text-align: left; background: none; border: 0; padding: 8px 10px; border-radius: 6px; }
 .menu button:hover { background: var(--panel-2); }
 .menu .check { display: flex; gap: 8px; align-items: center; padding: 8px 10px; border-top: 1px solid var(--line); margin-top: 4px; color: var(--muted); }
-#organize-menu { position: fixed; top: auto; left: 12px; right: auto;
+#organize-menu, #device-menu { position: fixed; top: auto; left: 12px; right: auto;
   min-width: min(260px, calc(100vw - 24px)); max-width: calc(100vw - 24px);
   max-height: calc(100vh - 24px); overflow-y: auto; }
-#organize-menu button, #organize-menu .check { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+#organize-menu button, #organize-menu .check, #device-menu button { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 
 main { grid-column: 1; grid-row: 2; display: flex; min-height: 0; }
 header.bar { grid-column: 1; grid-row: 1; }
@@ -163,7 +166,7 @@ footer.bar { grid-column: 1; grid-row: 3; }
 .lib-row.moved .n::after { content: " •"; color: var(--warn); }
 .lib-empty { color: var(--muted); padding: 20px 8px; text-align: center; }
 
-.drawer { position: relative; grid-column: 1; grid-row: 2; justify-self: end; min-height: 0; width: 400px; background: var(--panel); border-left: 1px solid var(--line);
+.drawer { position: relative; grid-column: 1; grid-row: 2; justify-self: end; min-height: 0; width: var(--drawer-width); background: var(--panel); border-left: 1px solid var(--line);
   box-shadow: var(--shadow); z-index: 20; display: flex; flex-direction: column; }
 .drawer-head { display: flex; gap: 8px; padding: 14px; border-bottom: 1px solid var(--line); }
 .drawer-head input { flex: 1; font-size: 16px; font-weight: 600; }
@@ -194,8 +197,8 @@ footer.bar { grid-column: 1; grid-row: 3; }
 .usage .ubar i { display: block; width: 46px; border-radius: 8px; background: var(--tile); min-height: 4px; }
 .usage .ubar.now i { background: var(--accent); }
 .usage .ubar span { color: var(--muted); font-size: 11px; }
-.usage .gain { text-align: center; font-weight: 600; color: var(--ok); margin: 4px 0 8px; }
-.usage .gain.worse { color: var(--danger); }
+.usage .gain { text-align: center; font-weight: 600; color: var(--success-text); margin: 4px 0 8px; }
+.usage .gain.worse { color: var(--danger-text); }
 .usage .top { list-style: none; margin: 0; padding: 0; max-height: 170px; overflow: auto; }
 .usage .top li { display: flex; gap: 8px; align-items: center; padding: 3px 0; font-size: 12px; }
 .usage .top .tile { width: 22px; height: 22px; border-radius: 6px; overflow: hidden; background: var(--tile); flex: none; color: #fff;
@@ -251,7 +254,11 @@ footer.bar { grid-column: 1; grid-row: 3; }
   .bar.top { flex-wrap: wrap; }
   #search { width: 100%; order: 10; }
   .page { width: 100%; }
-  .grid { grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr)); }
+  main:not(.drawer-open) .grid { grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr)); }
+  .dock-row { flex-direction: column; align-items: stretch; gap: 4px; }
+  .dock { min-width: 0; }
+  main:not(.drawer-open) .dock { grid-template-columns: repeat(var(--dock-cols, 4), minmax(0, 1fr)); }
+  .dock .name { max-width: 100%; }
 }
 
 /* Toolbar controls share the editor's system typography and neutral surfaces. */
@@ -294,6 +301,8 @@ main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template
   #library-panel { grid-column: 1; grid-row: 3; width: 100%; overflow: visible; border-left: 0; border-top: 1px solid var(--line); }
   #library { overflow: visible; }
   #empty { min-height: 260px; }
-  .drawer { width: min(400px, 100%); }
 }
+main.drawer-open { grid-template-columns: minmax(0, 1fr) var(--drawer-width); grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+main.drawer-open #board { overflow: auto; }
+main.drawer-open #library-panel { grid-column: 2; grid-row: 2; width: 100%; }
 .add-page { background: none; white-space: normal; padding: 0; }

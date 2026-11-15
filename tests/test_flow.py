@@ -252,7 +252,7 @@ def test_root_archive_for_phone_write():
     page = out["iconLists"][0]
     assert "iconLists" not in page[0] and page[0]["gridSize"] == "small"
     assert page[1] == "9F1E" and page[3] == "com.x.y"
-    assert page[2]["iconLists"] == [["com.a.b"]] and page[2]["displayName"] == "Travel"
+    assert page[2]["iconLists"] == [["com.a.b"], []] and page[2]["displayName"] == "Travel"
     assert out["ignored"] == ["com.lib.app"]
 
 

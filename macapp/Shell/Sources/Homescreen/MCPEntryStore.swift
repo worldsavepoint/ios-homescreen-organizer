@@ -184,7 +184,7 @@ struct MCPEntryStore {
               strategies.contains("replace") else { throw MCPClientOperationCode.unsupportedClient }
     }
 
-    func read(effective: Bool = false) async throws -> MCPUserSnapshot {
+    func read(effective: Bool = false, passive: Bool = false) async throws -> MCPUserSnapshot {
         if let readOverride { return try await readOverride() }
         if client == .claudeCode {
             let override = environment["CLAUDE_CONFIG_DIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
@@ -192,7 +192,9 @@ struct MCPEntryStore {
             let customOAuth = !(environment["CLAUDE_CODE_CUSTOM_OAUTH_URL"] ?? "").isEmpty
             let url = try exists(legacy) ? legacy : (override ?? home).appendingPathComponent(customOAuth ? ".claude-custom-oauth.json" : ".claude.json")
             guard try exists(url) else { return MCPUserSnapshot(file: url.path, entry: .absent) }
-            guard let root = try MCPJSON.decode(Data(contentsOf: url)) as? [String: Any] else { throw MCPClientOperationCode.snapshotReadFailed }
+            guard let root = try MCPJSON.decode(Data(contentsOf: url), deferNumbers: passive) as? [String: Any] else {
+                throw MCPClientOperationCode.snapshotReadFailed
+            }
             return try MCPUserSnapshot(file: url.path, entry: .from(root, table: "mcpServers"))
         }
         let result = try await MCPSubprocess.session(executable, ["app-server"], environment, timeout) { io in
@@ -206,7 +208,7 @@ struct MCPEntryStore {
         let key = "mcp_servers." + MCPClientRegistration.serverID
         let origins = result["origins"] as? NSDictionary ?? [:]
         let relevant = origins.allKeys.compactMap { $0 as? String }.filter { $0 == key || $0.hasPrefix(key + ".") }
-        var projectFiles = Set<String>()
+        var projectEntries: [String: NSDictionary] = [:]
         let userOrigin = !relevant.isEmpty && relevant.allSatisfy {
             guard let origin = origins[$0] as? [String: Any], let source = origin["name"] as? [String: Any] else { return false }
             return source["type"] as? String == "user" && source["file"] as? String == codexFile.path &&
@@ -221,7 +223,7 @@ struct MCPEntryStore {
             guard let config = layer["config"] as? [String: Any] else { throw MCPClientOperationCode.unsupportedClient }
             if kind == "project" {
                 let fields = try MCPOwnedEntry.fields(in: config, table: "mcp_servers")
-                if let folder = name["dotCodexFolder"] as? String, fields != nil { projectFiles.insert(folder) }
+                if let folder = name["dotCodexFolder"] as? String, let fields { projectEntries[folder] = fields }
                 continue
             }
             let entry = try MCPOwnedEntry.from(config, table: "mcp_servers")
@@ -244,10 +246,15 @@ struct MCPEntryStore {
             snapshot.effectiveEntry = try MCPOwnedEntry(fields)
             let saved = try snapshot.entry.object() ?? [:], active = fields ?? [:]
             var changedPaths: [[String]] = []
+            let defaults: [String: Any] = ["enabled": true, "environment_id": "local", "args": [String](), "env_vars": [String]()]
+            func registration(_ fields: NSDictionary) throws -> MCPOwnedEntry {
+                let values = fields.mutableCopy() as! NSMutableDictionary
+                for (name, value) in defaults where values[name] == nil { values[name] = value }
+                return try MCPOwnedEntry(values)
+            }
             // Compare registration semantics, ignoring spelling differences between
             // layer TOML defaults and the typed effective configuration.
             for field in ["command", "args", "url", "enabled", "environment_id", "env_vars"] {
-                let defaults: [String: Any] = ["enabled": true, "environment_id": "local", "args": [String](), "env_vars": [String]()]
                 let a = saved[field] ?? defaults[field], b = active[field] ?? defaults[field]
                 if try MCPOwnedEntry(["v": a ?? NSNull()]) != MCPOwnedEntry(["v": b ?? NSNull()]) {
                     changedPaths.append([key + "." + field, key])
@@ -264,11 +271,21 @@ struct MCPEntryStore {
                     guard let raw = origins[path] else { continue }
                     guard let entry = raw as? [String: Any], let origin = entry["name"] as? [String: Any],
                           origin["type"] as? String == "project", let file = origin["dotCodexFolder"] as? String else { return false }
-                    return projectFiles.contains(file)
+                    return projectEntries[file] != nil
                 }
                 return false
             }
-            snapshot.scope = projectExplainsChange ? .other : (userOrigin ? .user : .unknown)
+            let completeProject: Bool
+            if changedPaths.isEmpty, let table = origins[key] as? [String: Any],
+               let source = table["name"] as? [String: Any], source["type"] as? String == "project",
+               let folder = source["dotCodexFolder"] as? String, let project = projectEntries[folder],
+               fields != nil, try registration(project) == registration(active) {
+                completeProject = relevant.allSatisfy { path in
+                    guard let entry = origins[path] as? [String: Any], let origin = entry["name"] as? [String: Any] else { return false }
+                    return origin["type"] as? String == "project" && origin["dotCodexFolder"] as? String == folder
+                }
+            } else { completeProject = false }
+            snapshot.scope = projectExplainsChange || completeProject ? .other : (userOrigin ? .user : .unknown)
         }
         return snapshot
     }

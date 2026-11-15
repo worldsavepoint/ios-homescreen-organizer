@@ -4,7 +4,7 @@ from fnmatch import fnmatchcase
 from hashlib import sha256 as digest
 from importlib.metadata import distributions, version as package_version
 from itertools import chain
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import argparse
 import configparser
 import json
@@ -294,9 +294,13 @@ def project_root_inputs(names, read, expand=lambda pattern: ()):
     config = tomllib.loads(content("pyproject.toml"))
     project = config.get("project", {})
     setuptools = config.get("tool", {}).get("setuptools", {})
+    def metadata_path(value):
+        if not isinstance(value, str) or value.endswith(("/", "/.")):
+            raise ValueError("Expected a regular project metadata file")
+        return relative_name(PurePosixPath(value).as_posix())
     def files(value):
         if isinstance(value, str):
-            selected.add(relative_name(value))
+            selected.add(metadata_path(value))
         elif isinstance(value, list):
             for name in value:
                 files(name)
@@ -330,7 +334,7 @@ def project_root_inputs(names, read, expand=lambda pattern: ()):
     if legacy:
         patterns = [*patterns, legacy]
     for pattern in patterns:
-        relative_name(pattern)
+        pattern = metadata_path(pattern)
         if pattern.rsplit("/", 1)[-1] == "**":
             pattern += "/*"  # A file needs a basename beneath the directory matched by **.
         selected.update(relative_name(name) for name in chain(names, expand(pattern))

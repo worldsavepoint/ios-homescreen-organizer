@@ -258,3 +258,23 @@ def test_exported_folder_subpage_identifiers_follow_compaction_and_extension(tmp
     assert field["iconLists"] == [["b"], ["x"]]
     assert field["listUniqueIdentifiers"][0] == "second"
     assert field["listUniqueIdentifiers"][1] not in ("first", "second")
+
+
+@pytest.mark.parametrize("with_ids", [False, True])
+def test_vacated_dock_folder_keeps_only_its_editor_drop_target(tmp_path, with_ids):
+    from homescreen.device import FileSource
+
+    saved = {"listType": "folder", "iconLists": [["inside"]]}
+    if with_ids:
+        saved.update(listUniqueIdentifiers=["old"], listMetadata={"old": {"opaque": 1}})
+    path = tmp_path / "archive.plist"
+    path.write_bytes(plistlib.dumps({"buttonBar": [saved], "iconLists": [["stay"]], "ignored": []}))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda layout: layout.move("inside", "page:1"))
+    reopened = Session(FileSource(path), session.dir)
+    assert reopened.require().dock[0].children == [[]]
+    assert asyncio.run(reopened.apply(reopened.require().token()))["ok"]
+    written = plistlib.loads(path.read_bytes())["buttonBar"][0]
+    assert written["iconLists"] == [] and written.get("listUniqueIdentifiers", []) == []
+    assert "old" not in written.get("listMetadata", {})

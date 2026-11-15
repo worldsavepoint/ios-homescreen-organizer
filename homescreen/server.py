@@ -16,6 +16,7 @@ from pydantic import Field
 from . import organize, preview, usage
 from .config import DATA, session
 from .model import Layout, LayoutError
+from .session import Session
 
 ALLOW_APPLY = os.environ.get("HOMESCREEN_ALLOW_APPLY") == "1"
 
@@ -58,11 +59,14 @@ def _project_version() -> str:
 mcp = MCPServer("ios-homescreen-mcp", instructions=INSTRUCTIONS, version=_project_version())
 
 
-def _edit(fn: Callable[[Layout], Any]) -> dict[str, Any]:
+def _edit(fn: Callable[[Layout], Any], *, selected: Session | None = None,
+          expected: dict | None = None) -> dict[str, Any]:
     """Run an edit as one undoable step; on error nothing changes."""
     s = session()
     try:
-        out = s.edit(fn)
+        if selected is not None and selected is not s:
+            raise LayoutError("the selected device changed; review the current layout")
+        out = s.edit(fn, expected=expected)
     except LayoutError as e:
         return {"ok": False, "error": str(e)}
     res: dict[str, Any] = {"ok": True, "problems": s.require().validate()}
@@ -89,8 +93,10 @@ def show_layout() -> dict[str, Any]:
     Items include ids and names; folders include contents and widgets include sizes.
     grid supplies page cols/rows and Dock/folder-page capacities for layout edits.
     Requires a loaded draft. Session setup creates and sets permissions on the local data directory."""
-    lay = session().require()
-    return {**lay.summary(), "grid": lay.grid.to_dict()}
+    s = session()
+    with s.refreshed_draft():
+        lay = s.require()
+        return {**lay.summary(), "grid": lay.grid.to_dict()}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
@@ -100,9 +106,11 @@ def find_apps(
 ) -> list[dict[str, Any]]:
     """Search the loaded draft by name or bundle-id substring; return matching items and positions.
     Session setup creates and sets permissions on the local data directory."""
-    lay = session().require()
-    pos = lay.positions()
-    return [{**n.describe(), "position": pos.get(n.id, "not placed")} for n in lay.find(query)]
+    s = session()
+    with s.refreshed_draft():
+        lay = s.require()
+        pos = lay.positions()
+        return [{**n.describe(), "position": pos.get(n.id, "not placed")} for n in lay.find(query)]
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
@@ -219,8 +227,11 @@ async def sort_by_color(
     Repacking clears gaps, moves folders/widgets across those pages and removes empty pages.
     Saves one undo step; reads and locally caches source icons as needed.
     Return ok and validation problems."""
-    colors = await session().icon_colors()
-    return _edit(lambda lay: organize.by_color(lay, colors, keep_first_page))
+    selected = session()
+    binding = selected.binding
+    colors = await selected.colors_for_sort(keep_first_page)
+    return _edit(lambda lay: organize.by_color(lay, colors, keep_first_page),
+                 selected=selected, expected=binding)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
@@ -421,7 +432,9 @@ def diff() -> dict[str, Any]:
     """Return loaded draft changes, validation problems and its current apply_token.
     Compares with the last-read layout.
     Session setup creates and sets permissions on the local data directory."""
-    return session().require().diff()
+    s = session()
+    with s.refreshed_draft():
+        return s.require().diff()
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,

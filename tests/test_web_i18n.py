@@ -56,8 +56,11 @@ class Element {
  setAttribute(k,v){this.attrs[k]=String(v);if(k.startsWith('data-'))this.dataset[k.slice(5).replace(/-([a-z])/g,(_,c)=>c.toUpperCase())]=String(v);}
  append(...xs){for(let x of xs){if(typeof x==='string')x=new Element('#text',{value:x});x.parent=this;this.children.push(x);}}
  appendChild(x){this.append(x);return x;}replaceChildren(...xs){this.children=[];this._text='';this.append(...xs);}
+ insertBefore(node,ref){if(node.parent)node.remove();const i=ref?this.children.indexOf(ref):this.children.length;
+ this.children.splice(i,0,node);node.parent=this;return node;}
  get lastChild(){return this.children.at(-1);}get firstChild(){return this.children[0];}
  remove(){this.parent.children=this.parent.children.filter(n=>n!==this);}
+ replaceWith(node){this.parent.insertBefore(node,this);this.remove();}
  matches(selector){return selector.split(',').some(s=>{s=s.trim();if(s.includes(' '))return false;
  const attr=s.match(/\[([^=\]]+)(?:=["']?([^"'\]]+)["']?)?\]/);
  if(attr && (this.getAttribute(attr[1])===null || (attr[2]&&this.getAttribute(attr[1])!==attr[2])))return false;
@@ -75,15 +78,18 @@ class Element {
 const document = new Element('document');document.createElement=t=>new Element(t);document.createTextNode=t=>{const n=new Element('#text');n.textContent=t;return n;};
 const nodes=harnessInput.nodes.map(n=>new Element(n.tag,n.attrs));nodes.forEach((n,i)=>{n._text=harnessInput.nodes[i].text||'';(harnessInput.nodes[i].parent==null?document:nodes[harnessInput.nodes[i].parent]).append(n);});
 document.documentElement=nodes.find(n=>n.tagName==='html');document.body=nodes.find(n=>n.tagName==='body');
+document.elementFromPoint=()=>document.activeElement;
 const calls=[], stored=new Map(), bridge=[], copied=[], unhandled=[];
 process.on('unhandledRejection',error=>unhandled.push(error.message));
 const item={id:'synthetic.app',kind:'app',name:'Synthetic Notes',slots:1};
 const fixture={loaded:true,read_only:true,binding:{device:'synthetic',revision:'current'},source:'phone',device:{DeviceName:'Synthetic iPhone',ProductVersion:'18.0',ProductType:'iPhone'},
  dock:[],pages:[[{id:'synthetic.folder',kind:'folder',name:'My Folder',pos:[0,0,1,1],pages:[[item]]}]],library:[],bank:[],moved:['synthetic.app'],history:{undo:true,redo:false},
  grid:{cols:4,rows:6,dock:4,folder:9},slots:{page:24},diff:{has_changes:true,apply_token:"reviewed",placement_changes:[],items_moved:1,pages_before:1,pages_after:1,gaps_changed:0,to_app_library:0,problems:[]},moves:{},usage:null};
-const context={document,console,URL,URLSearchParams,Intl,Date,Set,Map,Promise,innerWidth:1280,innerHeight:900,setTimeout:()=>0,clearTimeout(){},requestAnimationFrame:f=>f(),
+const context={document,console,URL,URLSearchParams,CSS:{escape:value=>String(value)},Intl,Date,Set,Map,Promise,innerWidth:1280,innerHeight:900,setTimeout:()=>0,clearTimeout(){},requestAnimationFrame:f=>f(),
+ getComputedStyle:()=>({gridTemplateColumns:'72px 72px 72px 72px'}),
  location:{hash:'',pathname:'/',search:''},history:{replaceState(){}},navigator:{languages:['en'],clipboard:{writeText:async t=>copied.push(t)}},
  localStorage:{getItem:k=>stored.get(k)||null,setItem:(k,v)=>stored.set(k,v)},Image:class extends Element{constructor(){super('img');}},
+ IntersectionObserver:class{observe(){}unobserve(){}},MutationObserver:class{observe(){}},
  Event:class{constructor(type){this.type=type;}},CustomEvent:class{constructor(type){this.type=type;}},
  addEventListener:(...a)=>document.addEventListener(...a),dispatchEvent:e=>document.dispatchEvent(e),close:()=>{context.closed=true;},
  fetch:async(path,opts={})=>{calls.push(String(path));const file=String(path).slice('/static/locales/'.length);
@@ -849,7 +855,7 @@ row.dispatchEvent({type:'keydown',key:' ',ctrlKey:true});assert.equal(row.getAtt
 assert.equal(context.comparisons,comparisons);
 $('#search').value='Alpha';$('#search').dispatchEvent({type:'input'});
 assert.equal($('#library').children.length,1);assert.equal($('#library').children[0].dataset.id,'library.a');
-assert.notEqual($('#library').children[0],rows[0]);
+assert.equal($('#library').children[0],rows[0]);
 await i18n.setLocale('fr');assert.equal($('#lib-count').textContent,i18n.t('editor.matchCount',{count:1,total:3}));
 context.setView({...fixture,library:null});assert.ok($('#library').textContent.includes(i18n.t('editor.libraryUnavailable')));
 ''', native=True, setup='''

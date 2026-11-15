@@ -71,7 +71,7 @@ builds use Python 3.12 with architecture-specific, hash-checked dependencies.
 ## Intel dependencies
 
 Use a native Intel Mac with Python 3.12. Install Xcode command line tools
-(`clang`, `make`, `lipo` and `otool`), `curl`, Perl and `rustup`, then run:
+(`clang`, `make`, `lipo` and `otool`), Perl and `rustup`, then run:
 
 ```sh
 bash macapp/prepare_intel.sh python3.12 "$PWD/build/dependencies/x86_64"
@@ -222,7 +222,9 @@ For end-user installation and per-client stdio configuration, see the
 The standalone `home-screen-organizer-<version>-macos.mcpb` contains both native
 engines, their dependencies, the original MIT license and the complete per-architecture notice trees. The combined engine is distributed under GPL version 3 or later. It requires macOS 14 or later. An MCPB-compatible client
 can install this archive directly; Python and a separate app installation are not
-required. The launcher selects `arm64` or `x86_64` from the Mac's native architecture.
+required. The launcher selects `arm64` or `x86_64` using the architecture reported
+to its process. An Intel client running under Rosetta on Apple silicon launches the
+`x86_64` engine.
 
 MCPB stdio configuration runs `/bin/sh` with the extracted `server/launch.sh`.
 The manifest configures `HOMESCREEN_READ_ONLY=1`; the launcher defaults to that value

@@ -174,7 +174,7 @@ struct MCPClientManager {
         }
         let store = store(client, path)
         var result = await effectiveQuery(store)
-        if result.code == .success, !Task.isCancelled, let saved = try? await store.read(effective: true) {
+        if result.code == .success, !Task.isCancelled, let saved = try? await store.read(effective: true, passive: true) {
             annotate(&result, snapshot: saved)
         }
         return result
@@ -205,6 +205,7 @@ struct MCPClientManager {
             guard local ? transport["command"] is String : (["streamable_http", "sse"].contains(kind) && transport["url"] is String) else {
                 return queryFailure(client, .invalidResponse)
             }
+            if local, let args = transport["args"], !(args is [String]) { return queryFailure(client, .invalidResponse) }
             var forwarded: Set<Data> = []
             guard let environment = try? mcpEnvironment(transport["env"]) else { return queryFailure(client, .invalidResponse) }
             if let names = transport["env_vars"], !(names is NSNull) {
@@ -301,8 +302,12 @@ struct MCPClientManager {
         let local = active["url"] == nil
         let activeEnv = try? mcpEnvironment(fields["env"])
         let activeForwarded = (try? forwardedOptions(active["env_vars"] ?? []).map(\.name)) ?? []
+        let arguments = active["args"] as? [String]
+        let argsAgree = local
+            ? (active["args"] == nil || arguments != nil) && mcpArgumentsEqual(query.arguments ?? [], arguments ?? [])
+            : mcpArgumentsEqual(query.arguments, arguments)
         let agrees = query.enabled == enabled && mcpBytesEqual(query.command, active["command"] as? String) &&
-            mcpArgumentsEqual(query.arguments, active["args"] as? [String]) && mcpBytesEqual(query.url, active["url"] as? String) &&
+            argsAgree && mcpBytesEqual(query.url, active["url"] as? String) &&
             (!local || (query.transportEnvironment == activeEnv && query.forwardedNames == Set(activeForwarded.map { Data($0.utf8) })))
         if !agrees {
             query.code = .invalidResponse

@@ -26,7 +26,7 @@
     <button id="redo" title="Redo (⇧⌘Z)" data-i18n-title="editor.redoShortcut" aria-label="Redo" data-i18n-aria-label="editor.redo"><svg viewBox="0 0 20 20"><path d="m12 5 5 4.5-5 4.5M16.5 9.5H8a5 5 0 0 0 0 10h3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
   </div>
   <div class="menu-wrap">
-    <button id="organize-btn" aria-haspopup="true" data-i18n="editor.organize">Organize ▾</button>
+    <button id="organize-btn" aria-controls="organize-menu" aria-expanded="false" data-i18n="editor.organize">Organize ▾</button>
     <div class="menu" id="organize-menu" hidden>
       <button data-op="optimize_usage" data-i18n="editor.optimizeUsage">Optimize by app usage</button>
       <button data-op="sort_color" data-i18n="editor.sortColor">Sort by color</button>
@@ -49,6 +49,7 @@
     <div class="empty-card">
       <h1 data-i18n="editor.arrangeTitle">Arrange your Home Screen</h1>
       <p data-i18n="editor.connectHint"></p>
+      <div id="draft-recovery" hidden></div>
       <button class="primary big" id="read-empty" data-i18n="editor.readDevice">Read device</button>
     </div>
   </section>

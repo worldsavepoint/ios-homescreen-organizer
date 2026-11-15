@@ -12,6 +12,17 @@ LOCALES = Path(__file__).resolve().parents[1] / "homescreen/web/locales"
 PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
+def product_display_name(code):
+    language, _, rest = code.partition("-")
+    if language == "zh":
+        script = rest.partition("-")[0]
+        if script == "Hans":
+            return "屏幕整理"
+        if script == "Hant":
+            return "螢幕整理"
+    return "Screen Organizer"
+
+
 def read_json(path):
     def unique_object(pairs):
         result = {}
@@ -102,7 +113,7 @@ def validate(folder):
         if not isinstance(catalog, dict):
             errors.append(f"{code}: catalog must be an object")
             continue
-        expected_name = {"zh-Hans": "屏幕整理", "zh-Hant": "螢幕整理"}.get(code, "Screen Organizer")
+        expected_name = product_display_name(code)
         if catalog.get("app.name") != expected_name:
             errors.append(f"{code}: app.name display name must be {expected_name}")
         if catalog.get("app.subtitle") != "for iOS":

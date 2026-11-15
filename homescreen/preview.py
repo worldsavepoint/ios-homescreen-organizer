@@ -34,7 +34,9 @@ h1{font-size:20px;margin:0 0 4px} .sub{color:var(--muted);margin-bottom:16px}
 async def render(session: Session, out: Path, show_original: bool = True) -> Path:
     lay = session.require()
     cache: dict[str, str] = {}
-    moved = {k.rsplit("[", 1)[-1].rstrip("]") for k in lay.diff()["moves"]}
+    original = lay.original()
+    d = lay.diff(original)
+    moved = {k.rsplit("[", 1)[-1].rstrip("]") for k in d["moves"]}
 
     async def img(node: Node, cls: str = "") -> str:
         if not node.bundle_id:
@@ -82,13 +84,12 @@ async def render(session: Session, out: Path, show_original: bool = True) -> Pat
                          f'<h3>{title} · {label}</h3><div class="{grid_class}">{cells}</div>{extra}</div>')
         return f'<div class="row">{"".join(parts)}</div>'
 
-    d = lay.diff()
     body = [f"<h1>Home Screen draft</h1><div class='sub'>{d['items_moved']} items moved · "
             f"{d['pages_before']} → {d['pages_after']} pages · {d['to_app_library']} to App Library · "
             f"{'no problems' if not d['problems'] else html.escape('; '.join(d['problems']))}</div>",
             "<h2>Draft</h2>", await phone(lay, "Draft", True)]
     if show_original:
-        body += ["<h2>Last read from the phone</h2>", await phone(lay.original(), "Last read", False)]
+        body += ["<h2>Last read from the phone</h2>", await phone(original, "Last read", False)]
     document = (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
                 f"content='width=device-width,initial-scale=1'><title>Home Screen Draft</title>"
                 f"<style>{CSS}</style></head><body>{''.join(body)}</body></html>")

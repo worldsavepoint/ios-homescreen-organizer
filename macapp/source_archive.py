@@ -19,7 +19,7 @@ import zipfile
 from native_sources import selected_assets
 from source_checkout import tracked_blobs
 from source_tar import canonical_members
-from source_inputs import (HEX, cache_directory, fetch, json_bytes, pin_name, read_locks,
+from source_inputs import (HEX, INVENTORY_LIMIT, cache_directory, fetch, json_bytes, pin_name, read_locks,
                            relative_name, sha256, source_member)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -194,7 +194,7 @@ def verify_tar(path, version, commit=None, *, release=False, root=ROOT, reposito
     manifest = None
     capture = {"MANIFEST.json": 32 * 1024**2}
     if release:
-        capture.update({f"inventories/{arch}.json": 16 * 1024**2 for arch in ARCHES})
+        capture.update({f"inventories/{arch}.json": INVENTORY_LIMIT for arch in ARCHES})
     for name, mode, digest, data in canonical_members(path, capture, LIMIT):
         if name in files or manifest is not None:
             raise ValueError("Invalid source archive member order or duplicate")

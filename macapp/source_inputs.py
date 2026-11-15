@@ -1,19 +1,33 @@
 """Authenticate immutable release inputs and inspect upstream source archives."""
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
+import errno
 import os
 from pathlib import Path
 import re
 import stat
 import tarfile
 import tempfile
+import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import urlopen
 import zipfile
 
 LOCKS = Path(__file__).with_name("sources")
 BLOCK = 1024 * 1024
+INVENTORY_LIMIT = 16 * 1024**2
 HEX = re.compile(r"[0-9a-f]{64}")
+_WEEKDAY = r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+_MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+_CLOCK = r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+_HTTP_DATE = re.compile(
+    rf"{_WEEKDAY}, [0-9]{{2}} {_MONTH} [0-9]{{4}} {_CLOCK} GMT"
+    rf"|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), [0-9]{{2}}-{_MONTH}-[0-9]{{2}} {_CLOCK} GMT"
+    rf"|{_WEEKDAY} {_MONTH} (?: [0-9]|[0-9]{{2}}) {_CLOCK} [0-9]{{4}}"
+)
 
 
 def sha256(path):
@@ -43,37 +57,119 @@ def pin_name(pin):
     return relative_name(name)
 
 
-def fetch(pin, cache, offline=False):
+class _SourceMismatch(ValueError):
+    pass
+
+
+def _copy_pinned(stream, pin, outputs):
+    remaining = pin["size"]
+    digest = hashlib.sha256()
+    while remaining:
+        chunk = stream.read(min(BLOCK, remaining))
+        if not chunk:
+            break
+        if len(chunk) > remaining:
+            raise _SourceMismatch(f"Incorrect source size: {pin_name(pin)}")
+        digest.update(chunk)
+        for output in outputs:
+            output.write(chunk)
+        remaining -= len(chunk)
+    if stream.read(1):
+        raise _SourceMismatch(f"Incorrect source size: {pin_name(pin)}")
+    if remaining or digest.hexdigest() != pin["sha256"]:
+        raise _SourceMismatch(f"Incorrect source digest: {pin_name(pin)}")
+
+
+def _cached_source(path, pin, outputs):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ELOOP):
+            return False
+        if error.errno in (errno.EACCES, errno.EPERM):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return False
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_size != pin["size"]:
+                return False
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != pin["size"]:
+            return False
+        try:
+            with os.fdopen(fd, "rb", buffering=0, closefd=False) as stream:
+                _copy_pinned(stream, pin, outputs)
+        except _SourceMismatch:
+            return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _transient_source_error(error):
+    if isinstance(error, HTTPError):
+        return error.code in (408, 429, 500, 502, 503, 504)
+    reason = error.reason if isinstance(error, URLError) else error
+    return isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError))
+
+
+def _retry_delay(error, backoff):
+    if not isinstance(error, HTTPError) or not error.headers:
+        return backoff
+    value = error.headers.get("Retry-After", "").strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return max(backoff, float(value))
+    if not _HTTP_DATE.fullmatch(value):
+        return backoff
+    try:
+        date = parsedate_to_datetime(value)
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        return max(backoff, date.timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return backoff
+
+
+def fetch(pin, cache, offline=False, *, staged=None, retry_transient=False):
     name = pin_name(pin)
     cache.mkdir(parents=True, exist_ok=True)
     out = cache / (pin["sha256"] + "-" + name)
-    if (out.is_file() and not out.is_symlink() and out.stat().st_size == pin["size"]
-            and sha256(out) == pin["sha256"]):
+    outputs = (staged,) if staged is not None else ()
+    if _cached_source(out, pin, outputs):
         return out
     if offline:
         raise ValueError(f"Missing verified source input: {name}")
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=cache, delete=False) as output:
-            temporary = Path(output.name)
-            with urlopen(pin["url"], timeout=45) as response:
-                if urlsplit(response.geturl()).scheme != "https":
-                    raise ValueError("Expected HTTPS for release sources")
-                size = 0
-                digest = hashlib.sha256()
-                while chunk := response.read(BLOCK):
-                    size += len(chunk)
-                    if size > pin["size"]:
-                        raise ValueError(f"Incorrect source size: {name}")
-                    output.write(chunk)
-                    digest.update(chunk)
-        if size != pin["size"] or digest.hexdigest() != pin["sha256"]:
-            raise ValueError(f"Incorrect source digest: {name}")
-        os.replace(temporary, out)
-        return out
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    attempts = 4 if retry_transient else 1
+    wait_budget = 45
+    for attempt in range(attempts):
+        if staged is not None:
+            staged.seek(0)
+            staged.truncate()
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=cache, delete=False) as output:
+                temporary = Path(output.name)
+                with urlopen(pin["url"], timeout=45) as response:
+                    if urlsplit(response.geturl()).scheme != "https":
+                        raise ValueError("Expected HTTPS for release sources")
+                    _copy_pinned(response, pin, (output, *outputs))
+            os.replace(temporary, out)
+            return out
+        except OSError as error:
+            if attempt + 1 == attempts or not _transient_source_error(error):
+                raise
+            delay = _retry_delay(error, 2 ** attempt)
+            if delay > wait_budget:
+                raise
+            if isinstance(error, HTTPError):
+                error.close()
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        time.sleep(delay)
+        wait_budget -= delay
 
 
 def read_locks():
@@ -83,6 +179,26 @@ def read_locks():
 
 def cache_directory():
     return Path(os.environ.get("HOMESCREEN_SOURCE_CACHE", Path.home() / ".cache/screen-organizer/sources"))
+
+
+def prepare_intel_sources(directory, openssl_version):
+    """Stage the authenticated native archives with their upstream filenames."""
+    python, native = read_locks()
+    openssl = next(asset for asset in native["assets"] if asset["id"] == "openssl/" + openssl_version)
+    crypto = python["cryptography"]["source"]
+    requirement = f"cryptography @ {crypto['url']} --hash=sha256:{crypto['sha256']}"
+    lock = LOCKS.parents[1] / "requirements-cryptography-x86_64.lock"
+    if [line for line in lock.read_text().splitlines() if line and not line.startswith("#")] != [requirement]:
+        raise ValueError("Intel cryptography source differs from the build lock")
+    cache = cache_directory()
+    for pin in (openssl, crypto):
+        target = directory / pin_name(pin)
+        with tempfile.NamedTemporaryFile(dir=directory) as staged:
+            fetch(pin, cache, staged=staged, retry_transient=True)
+            staged.flush()
+            os.link(staged.name, target)
+    local_sdist = (directory / pin_name(crypto)).resolve().as_uri()
+    (directory / "cryptography.lock").write_text(f"cryptography @ {local_sdist} --hash=sha256:{crypto['sha256']}\n")
 
 
 def json_bytes(value):
@@ -125,3 +241,12 @@ def source_members(path, members):
 def source_member(path, member):
     """Read a specific regular member verbatim, without extracting a tree."""
     return source_members(path, {member: None})[member]
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Prepare authenticated source archives for an Intel build.")
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("openssl_version")
+    args = parser.parse_args()
+    prepare_intel_sources(args.directory, args.openssl_version)

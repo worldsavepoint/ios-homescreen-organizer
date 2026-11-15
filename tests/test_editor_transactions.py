@@ -5,7 +5,7 @@ import plistlib
 import pytest
 from starlette.requests import Request
 
-from homescreen import config, ui, usage
+from homescreen import config, server, ui, usage
 from homescreen.session import Session
 from test_integrity import MemorySource
 
@@ -97,13 +97,47 @@ def test_suspended_color_operation_rechecks_binding_before_edit(pair):
     first, second = pair
     binding = view_binding(first)
     saved = first.draft_path.read_bytes()
-    async def fetch():
+    async def fetch(ids):
+        assert ids == ["a", "b"]
         config.select_device("second")
         return {}
     first.icon_colors = fetch
-    response = asyncio.run(ui.post_op(request({"op": "sort_color", "binding": binding, "args": {}})))
+    response = asyncio.run(ui.post_op(request({"op": "sort_color", "binding": binding,
+                                               "args": {"keep_first_page": False}})))
     assert response.status_code == 409 and first.history()["undo"] == second.history()["undo"] == 0
     assert first.draft_path.read_bytes() == saved
+
+
+@pytest.mark.parametrize("intervening", ["edit", "read", "switch"])
+def test_mcp_color_sort_commits_only_to_its_original_selected_revision(pair, monkeypatch, intervening):
+    first, second = pair
+    monkeypatch.setattr(server, "session", config.session)
+    expected = []
+    async def analyze(*args):
+        if intervening == "edit":
+            first.edit(lambda layout: layout.move("b", "page:2"))
+        elif intervening == "read":
+            await first.read()
+        else:
+            config.select_device("second")
+        expected.extend((s.draft_path.read_bytes(), s.history()) for s in pair)
+        return {}
+    monkeypatch.setattr(first, "icon_colors", analyze)
+    result = asyncio.run(server.sort_by_color(keep_first_page=False))
+    assert not result["ok"] and "changed" in result["error"]
+    assert [(s.draft_path.read_bytes(), s.history()) for s in pair] == expected
+    assert first.source.writes == second.source.writes == 0
+
+
+def test_failed_device_selection_retains_persisted_and_displayed_session(pair, monkeypatch):
+    first, _ = pair
+    config.select_device("first")
+    def full(*args, **kwargs):
+        raise OSError("selector storage unavailable")
+    monkeypatch.setattr(config, "_private_replace", full)
+    response = asyncio.run(ui.post_device(request({"binding": first.binding, "udid": "second"})))
+    assert response.status_code == 502 and json.loads(response.body)["view"]["binding"] == first.binding
+    assert config.session() is first and config.LAST_DEVICE.read_text() == "first"
 
 
 def test_reviewed_read_checks_shared_committed_draft_before_source_access(pair):

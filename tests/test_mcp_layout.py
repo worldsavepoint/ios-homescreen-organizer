@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
-from homescreen import server
+from homescreen import server, ui
+from fake_phone import app, folder, widget
+from test_integrity import MemorySource
 from homescreen.device import FileSource
 from homescreen.model import Grid, Layout
 from homescreen.session import Session
@@ -27,10 +29,70 @@ def draft(tmp_path, monkeypatch):
     return load
 
 
-def call(name, **arguments):
-    result = asyncio.run(server.mcp.call_tool(name, arguments)).model_dump(by_alias=True)
+def call(tool, **arguments):
+    result = asyncio.run(server.mcp.call_tool(tool, arguments)).model_dump(by_alias=True)
     assert not result.get("isError"), result
     return result["structuredContent"]
+
+
+@pytest.mark.parametrize("tool", ["show_layout", "find_apps", "diff"])
+def test_inspection_reads_another_sessions_current_draft(tmp_path, monkeypatch, tool):
+    source = MemorySource()
+    session = Session(source, tmp_path)
+    monkeypatch.setattr(server, "session", lambda: session)
+    call("read_phone")
+    other = Session(source, tmp_path)
+    other.edit(lambda layout: layout.move("b", "dock"))
+    assert not call("move", item_id="a", target="dock")["ok"]
+    if tool == "show_layout":
+        assert [node["id"] for node in call(tool)["dock"]] == ["b"]
+    elif tool == "find_apps":
+        assert call(tool, query="b")["result"][0]["position"] == "dock #1"
+    else:
+        assert call(tool)["apply_token"] == other.require().token()
+    assert session.binding == other.binding
+
+
+def test_review_details_for_parked_children_widgets_and_folder_names(tmp_path, monkeypatch):
+    source = MemorySource()
+    source.state = [[], [folder("Work", [app("a", "A")]), app("b", "B")], [widget("Weather", "small")]]
+    session = Session(source, tmp_path)
+    monkeypatch.setattr(server, "session", lambda: session)
+    call("read_phone")
+    lay = session.require()
+    group, weather = lay.pages[0][0].id, lay.pages[1][0].id
+    assert call("move", item_id=group, target="bank")["ok"]
+    assert call("move", item_id="b", target=group)["ok"]
+    assert call("rename_folder", folder_id=group, name="Today")["ok"]
+    assert call("move", item_id=weather, target="page:1")["ok"]
+    assert call("find_apps", query="b")["result"][0]["position"] == "folder 'Today' p1 #2"
+    diff = call("diff")
+    assert diff["items_moved"] == 1
+    detail = diff["move_details"]["B [b]"]
+    assert detail["from"] == {"kind": "page", "page": 1, "index": 2}
+    assert detail["to"] == {"kind": "folder", "name": "Today", "page": 1, "index": 2}
+    changes = {row["id"]: row for row in diff["placement_changes"]}
+    assert changes[group]["reason"] == "renamed" and changes[group]["before_name"] == "Work"
+    assert changes[group]["from"]["page"] == 1 and changes[group]["to"] == {"kind": "bank"}
+    assert changes[weather]["from"]["page"] == 2 and changes[weather]["to"]["page"] == 1
+    assert ui.view(session)["diff"]["placement_changes"] == diff["placement_changes"]
+
+
+@pytest.mark.parametrize("tool,arguments", [
+    ("create_folder", {"name": "", "item_ids": ["a"], "target": "page:1"}),
+    ("rename_folder", {"name": "", "folder_id": "folder:1"}),
+    ("move", {"item_id": "a", "target": "page:two"}), ("move", {"item_id": "a", "target": "page:0"}),
+])
+def test_invalid_folder_names_and_page_targets_preserve_saved_draft(tmp_path, monkeypatch, tool, arguments):
+    source = MemorySource()
+    source.state = [[], [folder("Work", [app("b", "B")]), app("a", "A")]]
+    session = Session(source, tmp_path)
+    monkeypatch.setattr(server, "session", lambda: session)
+    call("read_phone")
+    before = session.draft_path.read_bytes(), session.binding, session.history()
+    result = call(tool, **arguments)
+    assert not result["ok"] and ("number" if tool == "move" else "name") in result["error"]
+    assert (session.draft_path.read_bytes(), session.binding, session.history()) == before
 
 
 @pytest.mark.parametrize("cols,rows,row,column", [

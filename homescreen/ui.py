@@ -12,9 +12,9 @@ import hmac
 import os
 import re
 import secrets
-import struct
 import threading
 import webbrowser
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit
@@ -29,14 +29,13 @@ from starlette.staticfiles import StaticFiles
 from . import organize, usage
 from . import config
 from .config import DATA, session
-from .model import Layout, LayoutError, Node, widget_apps
+from .model import Layout, LayoutError, Node, PageCells, widget_apps
 from .session import ReviewChanged
 
 WEB = Path(__file__).parent / "web"
 TOKEN = os.environ.get("HOMESCREEN_UI_TOKEN") or secrets.token_urlsafe(32)
 _HEALTH_SECRET = os.environ.get("HOMESCREEN_HEALTH_SECRET")
-_BROWSER_TOKEN = secrets.token_urlsafe(32)
-_COOKIE = "homescreen_session"
+_BROWSER_SECRET = secrets.token_bytes(32)
 LOCAL_HOSTS = {"127.0.0.1", "localhost"}
 _device_lock = asyncio.Lock()  # one read/apply/restore at a time
 _icon_gate = asyncio.Semaphore(4)
@@ -62,11 +61,7 @@ def _item(n: Node, lay: Layout) -> dict[str, Any]:
     return d
 
 
-_GridPosition = tuple[int, int, int, int]
-_PageCells = dict[str, _GridPosition]
-
-
-def _page(page: list[Node], lay: Layout, pos: _PageCells) -> list[dict[str, Any]]:
+def _page(page: list[Node], lay: Layout, pos: PageCells) -> list[dict[str, Any]]:
     out = []
     for n in page:
         d = _item(n, lay)
@@ -92,127 +87,6 @@ def _usage_view(lay: Layout, u: dict[str, Any] | None, original: Layout) -> dict
 
 def _read_only() -> bool:
     return os.environ.get("HOMESCREEN_READ_ONLY") == "1"
-
-
-def _same_fields(a: Any, b: Any) -> bool:
-    """Python equality merges plist integers, booleans and reals."""
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        return a.keys() == b.keys() and all(_same_fields(value, b[key]) for key, value in a.items())
-    if isinstance(a, list):
-        return len(a) == len(b) and all(_same_fields(x, y) for x, y in zip(a, b))
-    if isinstance(a, float):
-        return struct.pack(">d", a) == struct.pack(">d", b)
-    return a == b
-
-
-def _has_changes(lay: Layout, original: Layout) -> bool:
-    if (lay.bank or lay.pins != lay.source_pins or lay.page_origins != list(range(len(lay.source) - 1)) or
-            lay.identity()["ids"] != lay.source_identity["ids"] or
-            not _same_fields(lay.to_library(), lay.source_library)):
-        return True
-    state = lay.to_state()
-    # Serialization normalizes imported folders with unnamed or empty subpages.
-    return not _same_fields(state, lay.source) and not _same_fields(state, original.to_state())
-
-
-def _original_cells(original: Layout, lay: Layout, current_cells: dict[int, _PageCells],
-                    pinned: set[str]) -> dict[int, _PageCells]:
-    """Reuse current geometry when order, footprints and anchors match the original page."""
-    cells = {}
-    for page, nodes in enumerate(original.pages, 1):
-        if not any(n.kind in ("widget", "folder") or n.id in pinned for n in nodes):
-            continue
-        current = lay.pages[page - 1] if page <= len(lay.pages) else []
-        same = (len(nodes) == len(current) and original.grid == lay.grid and
-                all(old.id == new.id and original.dims(old) == lay.dims(new)
-                    and original.pins.get(old.id) == lay.pins.get(new.id) for old, new in zip(nodes, current)))
-        cells[page] = current_cells[page] if same else original.place(nodes)[0]
-    return cells
-
-
-def _special_positions(
-    lay: Layout, pinned: set[str], cells: dict[int, _PageCells]
-) -> dict[str, tuple[str, int, int, _GridPosition | None]]:
-    positions = {}
-    for kind, page, nodes in [("dock", 0, lay.dock), ("bank", 0, lay.bank),
-                              *(("page", p, nodes) for p, nodes in enumerate(lay.pages, 1))]:
-        for index, node in enumerate(nodes, 1):
-            if node.kind in ("folder", "widget") or node.id in pinned:
-                positions[node.id] = (kind, page, index, cells.get(page, {}).get(node.id))
-    return positions
-
-
-def _placement_changes(lay: Layout, original: Layout, pins: set[str], old_cells: dict[int, _PageCells],
-                       new_cells: dict[int, _PageCells]) -> dict[str, dict[str, Any]]:
-    old = _special_positions(original, pins, old_cells)
-    new = _special_positions(lay, pins, new_cells)
-    changes = {}
-    for nid in sorted(old.keys() | new.keys()):
-        before, after = original.nodes.get(nid), lay.nodes.get(nid)
-        node = after or before
-        reason = None
-        if nid not in old and node.kind in ("folder", "widget"):
-            reason = "added"
-        elif nid not in new and node.kind in ("folder", "widget"):
-            reason = "removed"
-        elif before and after and before.name != after.name:
-            reason = "renamed"
-        elif nid in pins:
-            reason = "pinned" if nid in lay.pins else "unpinned"
-        elif node.kind == "folder" and (
-            [[n.id for n in p] for p in before.children if p] != [[n.id for n in p] for p in after.children if p]
-            or not _same_fields(original._unwrap(before), lay._unwrap(after))
-        ):
-            reason = "edited"
-        elif node.kind == "widget" and not _same_fields(before.raw, after.raw):
-            reason = "edited"
-        if reason or old.get(nid) != new.get(nid):
-            row = {"id": nid, "kind": node.kind, "name": lay.widget_label(node) if node.kind == "widget" else node.name,
-                   "reason": reason or "moved"}
-            if reason == "renamed":
-                row["before_name"] = before.name
-            changes[nid] = row
-    return changes
-
-
-def _locations(lay: Layout, wanted: set[str], physical: set[str],
-               page_cells: dict[int, _PageCells],
-               qualified: set[str]) -> dict[str, tuple[str, dict[str, Any]]]:
-    """Only materialize endpoints needed by Review or the visible usage list."""
-    found = {}
-
-    def walk(nodes: list[Node], kind: str, where: str, page: int = 0, name: str = "", folder_id: str = "") -> None:
-        cells = page_cells.get(page, {}) if kind == "page" else {}
-        for index, node in enumerate(nodes, 1):
-            if node.id in wanted:
-                descriptor = {"kind": kind}
-                raw = where
-                if kind not in ("library", "bank"):
-                    descriptor["index"] = index
-                    raw += f" #{index}"
-                if page:
-                    descriptor["page"] = page
-                if kind == "folder":
-                    descriptor["name"] = name
-                    if folder_id in qualified:
-                        descriptor["folder_id"] = folder_id
-                if node.id in physical and node.id in cells:
-                    row, col, _, _ = cells[node.id]
-                    descriptor.update(row=row + 1, column=col + 1)
-                found[node.id] = (raw, descriptor)
-            if node.kind == "folder":
-                for p, children in enumerate(node.children, 1):
-                    suffix = f" [{node.id}]" if node.id in qualified else ""
-                    walk(children, "folder", f"folder {node.name!r}{suffix} p{p}", p, node.name, node.id)
-
-    walk(lay.dock, "dock", "dock")
-    for page, nodes in enumerate(lay.pages, 1):
-        walk(nodes, "page", f"page {page}", page)
-    walk(lay.library or [], "library", "App Library")
-    walk(lay.bank, "bank", "App Bank")
-    return found
 
 
 def _problem_details(lay: Layout, problems: list[str]) -> list[dict[str, Any]]:
@@ -256,40 +130,19 @@ def view(s=None) -> dict[str, Any]:
         return result
     lay = s.layout
     original = lay.original()
-    d = lay.diff(original)
-    has_changes = _has_changes(lay, original)
-    new_cells = {page: lay.place(nodes)[0] for page, nodes in enumerate(lay.pages, 1)}
-    old_cells = {}
-    placements = {}
-    if has_changes:
-        pins = {key for key in lay.pins.keys() | lay.source_pins.keys() if lay.pins.get(key) != lay.source_pins.get(key)}
-        old_cells = _original_cells(original, lay, new_cells, pins)
-        placements = _placement_changes(lay, original, pins, old_cells, new_cells)
-    moved = {}
-    if d["moves"]:
-        for node in lay.nodes.values():
-            key = f"{node.name} [{node.id}]"
-            if key in d["moves"]:
-                moved[node.id] = key
+    placements = {page: lay.place(nodes) for page, nodes in enumerate(lay.pages, 1)}
+    new_cells = {page: result[0] for page, result in placements.items()}
+    page_problems = {page: result[1] for page, result in placements.items()}
     usage_view = _usage_view(lay, s.usage, original)
     top = usage_view.get("top", []) if usage_view else []
     usage_ids = {row["id"]: row.pop("placement_id") for row in top}
-    changed_ids = moved.keys() | placements.keys()
-    wanted = changed_ids | {usage_ids[row["id"]] for row in top}
-    physical = set(placements)
-    qualified = lay.qualified_folders(original) if changed_ids else lay.qualified_folders()
-    old = _locations(original, changed_ids, physical, old_cells, qualified) if changed_ids else {}
-    new = _locations(lay, wanted, physical, new_cells, qualified) if wanted else {}
+    d, old, new = lay.review(original, page_cells=new_cells, page_problems=page_problems,
+                           location_ids=set(usage_ids.values()))
     labels = dict(old.values())
     labels.update(new.values())
     for row in top:
         node_id = usage_ids[row["id"]]
         row.update(name=lay.nodes[node_id].name, where=new[node_id][0])
-    move_details = {key: {"id": nid, "name": lay.nodes[nid].name, "from": old[nid][1], "to": new[nid][1]}
-                    for nid, key in moved.items()}
-    for nid, change in placements.items():
-        change["from"] = old[nid][1] if nid in old else None
-        change["to"] = new[nid][1] if nid in new else None
     return {
         "loaded": True,
         "binding": getattr(s, "binding", None),
@@ -302,18 +155,17 @@ def view(s=None) -> dict[str, Any]:
         "library": None if lay.library is None else [_item(n, lay) for n in lay.library],
         "bank": [_item(n, lay) for n in lay.bank],
         "usage": usage_view,
-        "moved": sorted(moved),
+        "moved": sorted(detail["id"] for detail in d["move_details"].values()),
         "diff": {**{k: d[k] for k in ("items_moved", "to_app_library", "pages_before", "pages_after",
-                                   "problems", "apply_token", "gaps_changed")},
-                 "has_changes": has_changes, "placement_changes": list(placements.values()),
+                                   "problems", "apply_token", "gaps_changed", "has_changes", "placement_changes")},
                  "problem_details": _problem_details(lay, d["problems"]) if d["problems"] else []},
         "location_labels": labels,
-        "move_details": move_details,
+        "move_details": d["move_details"],
         "moves": d["moves"],
         "history": s.history(),
         "gaps": {"readable": s.gaps_readable, "count": len(lay.pins), "changed": d["gaps_changed"]},
         "slots": {"page": lay.page_slots, "dock": lay.dock_slots},
-        "grid": lay.grid.to_dict(),
+        "grid": {**lay.grid.to_dict(), **({"folder_columns": s.folder_columns} if getattr(s, "folder_columns", None) else {})},
     }
 
 
@@ -352,6 +204,11 @@ def _matches(value: str | None, expected: str) -> bool:
     return value is not None and secrets.compare_digest(value.encode(), expected.encode())
 
 
+def _browser_credential(request: Request) -> str:
+    origin = f"{request.url.scheme}://{request.headers['host']}"
+    return hmac.new(_BROWSER_SECRET, origin.encode(), hashlib.sha256).hexdigest()
+
+
 def _security_error(message: str, status: int, code: str, param: str | None = None) -> JSONResponse:
     error_type = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error"}[status]
     return JSONResponse({"error": {"message": message, "type": error_type,
@@ -378,7 +235,7 @@ def _guard(request: Request, *, public: bool = False, header_only: bool = False)
         return None
     if _matches(request.headers.get("x-token"), TOKEN):
         return None
-    if not header_only and _matches(request.cookies.get(_COOKIE), _BROWSER_TOKEN):
+    if not header_only and _matches(request.headers.get("x-editor-session"), _browser_credential(request)):
         if request.method in {"GET", "HEAD"} or origin is not None:
             return None
         return _security_error("same-origin proof required", 403, "origin_required", "origin")
@@ -388,9 +245,7 @@ def _guard(request: Request, *, public: bool = False, header_only: bool = False)
 async def post_auth(request: Request) -> Response:
     if (bad := _guard(request, header_only=True)):
         return bad
-    response = JSONResponse({"ok": True})
-    response.set_cookie(_COOKIE, _BROWSER_TOKEN, httponly=True, samesite="strict", path="/")
-    return response
+    return JSONResponse({"ok": True, "credential": _browser_credential(request)})
 
 
 async def get_health(request: Request) -> Response:
@@ -456,9 +311,11 @@ async def post_op(request: Request) -> Response:
         elif name == "reset":
             s.reset(expected=expected)
         elif name == "sort_color":
-            colors = await s.icon_colors()
-            _reviewed_session(body).edit(lambda lay: organize.by_color(lay, colors, args.get("keep_first_page", True)),
-                                        expected=expected)
+            keep_first = args.get("keep_first_page", True)
+            colors = await s.colors_for_sort(keep_first)
+            if session() is not s:
+                raise ReviewChanged("the reviewed device or draft changed; review the current layout")
+            s.edit(lambda lay: organize.by_color(lay, colors, keep_first), expected=expected)
         elif name == "load_usage":
             provider = args.get("source", "mac")
             if provider not in ("device", "mac"):
@@ -603,6 +460,8 @@ async def post_device(request: Request) -> Response:
                 config.select_device(udid)
         except LayoutError as e:
             return _err(e)
+        except OSError as e:
+            return _err(e, 502, s)
     return JSONResponse(view())
 
 
@@ -642,11 +501,9 @@ async def post_restore(request: Request) -> Response:
     return JSONResponse({"result": result, "view": view(s)})
 
 
-async def get_icon(request: Request) -> Response:
-    if (bad := _guard(request)):
-        return bad
-    bundle = request.query_params.get("id", "")
-    lay = session().layout
+@lru_cache(maxsize=1)
+def _icon_membership(selected, lay: Layout | None, revision: str) -> frozenset[str]:
+    """Index the complete selection for this layout instance and saved revision."""
     known = set()
     if lay is not None:
         for node in lay.nodes.values():
@@ -654,13 +511,34 @@ async def get_icon(request: Request) -> Response:
                 known.add(node.bundle_id)
             if node.kind == "widget":
                 known.update(widget_apps(node.raw))
-    if not bundle or bundle not in known:
+    return frozenset(known)
+
+
+async def get_icon(request: Request) -> Response:
+    if (bad := _guard(request)):
+        return bad
+    bundle = request.query_params.get("id", "")
+    selected = session()
+    source, lay, binding = selected.source, selected.layout, selected.binding
+    revision = binding["revision"]
+    if request.headers.get("x-draft-revision", revision) != revision:
+        return Response(status_code=409)
+    if not bundle or bundle not in _icon_membership(selected, lay, revision):
         return Response(status_code=404)
+
+    def current() -> bool:
+        return (session() is selected and selected.source is source
+                and selected.layout is lay and selected.binding == binding)
+
     async with _icon_gate:
+        if not current():
+            return Response(status_code=409)
         try:
-            png = await session().icon(bundle)
+            png = await selected.icon(bundle)
         except Exception:
             png = None
+        if not current():
+            return Response(status_code=409)
     if not png:
         return Response(status_code=404)
     return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
@@ -696,7 +574,7 @@ async def local_boundary(request: Request, call_next: Callable) -> Response:
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
         "Content-Security-Policy": "default-src 'self'; script-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; "
             "frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'",
     })
     return response
@@ -728,8 +606,23 @@ def main(port: int = 8765, open_browser: bool = True) -> None:
     config.enable_device_switching()
     if os.environ.get("HOMESCREEN_PARENT_PID", "").isdigit():
         _exit_with_parent(int(os.environ["HOMESCREEN_PARENT_PID"]))
-    url = f"http://127.0.0.1:{port}/"
-    print(f"Screen Organizer is running at {url}  (Ctrl-C to stop)")
-    if open_browser:
-        threading.Timer(1.0, webbrowser.open, args=(url + "#token=" + quote(TOKEN, safe=""),)).start()
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    class EditorServer(uvicorn.Server):
+        async def startup(self, sockets=None):
+            try:
+                await super().startup(sockets)
+                if self.started and not self.should_exit:
+                    actual_port = self.servers[0].sockets[0].getsockname()[1]
+                    url = f"http://127.0.0.1:{actual_port}/"
+                    print(f"Screen Organizer is running at {url}  (Ctrl-C to stop)")
+                    if open_browser:
+                        try:
+                            await asyncio.to_thread(webbrowser.open, url + "#token=" + quote(TOKEN, safe=""))
+                        except Exception:
+                            raise RuntimeError("The browser could not open the editor.") from None
+            except BaseException:
+                for listener in getattr(self, "servers", []):
+                    listener.close()
+                    await listener.wait_closed()
+                raise
+
+    EditorServer(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")).run()

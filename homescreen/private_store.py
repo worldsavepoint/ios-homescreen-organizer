@@ -36,7 +36,11 @@ def _os_error():
     return OSError(number, os.strerror(number))
 
 
-def _mkdir_darwin(path: pathlib.Path):
+def create_private_directory(path: pathlib.Path, *, exist_ok=False):
+    """Create an owner-only directory with its final permissions at creation."""
+    if sys.platform != "darwin":
+        path.mkdir(mode=0o700, exist_ok=exist_ok)
+        return
     lib = _libsystem()
     sec = lib.filesec_init()
     acl = ctypes.c_void_p(lib.acl_init(0))
@@ -48,7 +52,7 @@ def _mkdir_darwin(path: pathlib.Path):
                 lib.acl_add_flag_np(flags, 1 << 17) or lib.filesec_set_property(sec, 4, ctypes.byref(mode)) or
                 lib.filesec_set_property(sec, 5, ctypes.byref(acl))):
             raise _os_error()
-        if lib.mkdirx_np(os.fsencode(path), sec) and ctypes.get_errno() != errno.EEXIST:
+        if lib.mkdirx_np(os.fsencode(path), sec) and not (exist_ok and ctypes.get_errno() == errno.EEXIST):
             raise _os_error()
     finally:
         if acl:
@@ -82,10 +86,7 @@ def _check_darwin_acl(fd: int):
 
 def ensure_private_directory(path: pathlib.Path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "darwin":
-        _mkdir_darwin(path)
-    else:
-        path.mkdir(mode=0o700, exist_ok=True)
+    create_private_directory(path, exist_ok=True)
     if path.is_symlink():
         raise PermissionError("the Session data directory must not be a symlink")
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -146,13 +147,15 @@ def open_private_file(root, path, flags=os.O_RDONLY, *, directory_fd=None):
     if directory_fd is None:
         with open_private_directory(root, path.parent) as directory:
             return open_private_file(root, path, flags, directory_fd=directory)
-    fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory_fd)
+    fd = os.open(path.name, flags | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory_fd)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-            raise PermissionError("the Session data file must be a regular owned file")
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise PermissionError("the Session data file must be regular, owned and private")
         if sys.platform == "darwin":
             _check_darwin_acl(fd)
+        if not flags & os.O_NONBLOCK:
+            os.set_blocking(fd, True)
         return fd
     except BaseException:
         os.close(fd)

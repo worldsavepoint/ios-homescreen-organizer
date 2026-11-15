@@ -442,6 +442,7 @@ if action == "get":
     if os.getenv("TEST_PROJECT_FIELDS"): entry = {**entry, **json.loads(os.environ["TEST_PROJECT_FIELDS"])}
     if os.getenv("TEST_SYSTEM_ENV"): entry["env"] = {**json.loads(os.environ["TEST_SYSTEM_ENV"]), **entry.get("env",{})}
     if os.getenv("TEST_EFFECTIVE"): entry = {**entry, **json.loads(os.environ["TEST_EFFECTIVE"])}
+    if os.getenv("TEST_OMIT_GET_FIELD"): entry.pop(os.environ["TEST_OMIT_GET_FIELD"], None)
     if "--json" in args:
         print(json.dumps({"name": "ios-homescreen-mcp", "enabled": entry.get("enabled", True), "transport": {"type": "stdio", **{k:v for k,v in entry.items() if k != "environment_id"}}}))
     else:
@@ -1094,6 +1095,59 @@ def test_unsupported_real_precision_fails_before_mutation(native_mcp_binary,sand
     assert not journal_file(sandbox).with_name(client + ".json").exists()
 
 
+@pytest.mark.parametrize("literal", ["1.25", "1.23456789012345678", "1e400"])
+def test_passive_claude_query_keeps_mode_with_unrelated_numbers(native_mcp_binary, sandbox, tmp_path, literal):
+    _, entries = seed_user(sandbox)
+    file = Path(sandbox["HOME"]) / ".claude.json"
+    original = ('{"mcpServers":' + json.dumps(entries) + ',"other":' + literal + '}').encode()
+    file.write_bytes(original)
+    result = execute(native_mcp_binary, sandbox, "scope", "claudeCode", fake_client(tmp_path))
+    assert result["user"] == result["effective"] == "readOnly"
+    assert file.read_bytes() == original and mutations(sandbox) == []
+
+
+@pytest.mark.parametrize("ownership", ["project", "project-default", "mixed", "partial", "different-extra"])
+def test_equal_project_registration_requires_consistent_provenance(native_mcp_binary, sandbox, tmp_path, ownership):
+    store, entries = seed_user(sandbox, extra="user") if ownership == "different-extra" else seed_user(sandbox)
+    project = dict(entries[SERVER_ID])
+    if ownership == "project-default":
+        project["enabled"] = True
+    if ownership == "different-extra":
+        del project["extra"]
+    origin = {"name": {"type": "project", "dotCodexFolder": "/synthetic/.codex"}, "version": "p"}
+    key = "mcp_servers." + SERVER_ID
+    origins = {key: origin, **{key + "." + name: origin for name in project}}
+    if ownership == "mixed":
+        origins[key + ".command"] = {"name": {"type": "system", "file": "/synthetic/system.toml"}}
+    elif ownership == "partial":
+        del project["env"]
+    env = {**sandbox, "TEST_PROJECT": "custom", "TEST_PROJECT_FIELDS": json.dumps(project),
+           "TEST_ORIGINS": json.dumps(origins)}
+    original = store.read_bytes()
+    result = execute(native_mcp_binary, env, "scope", "codex", fake_client(tmp_path))
+    assert result["scope"] == ("other" if ownership in ("project", "project-default") else "unknown")
+    assert result["user"] == result["effective"] == "readOnly"
+    assert store.read_bytes() == original and mutations(sandbox) == []
+
+
+@pytest.mark.parametrize("field,literal", [
+    ("selected", "1e400"), ("unrelated", "1e"), ("unrelated", "01"),
+    ("unrelated", "[true,]"), ("unrelated", '{"key" false}'), ("unrelated", "null true"),
+])
+def test_passive_claude_validates_syntax_and_selected_numbers(native_mcp_binary, sandbox, tmp_path, field, literal):
+    _, entries = seed_user(sandbox)
+    root = {"mcpServers": entries, "other": "replace-me"}
+    if field == "selected":
+        entries[SERVER_ID]["value"] = "replace-me"
+        del root["other"]
+    original = json.dumps(root).replace('"replace-me"', literal).encode()
+    file = Path(sandbox["HOME"]) / ".claude.json"
+    file.write_bytes(original)
+    result = execute(native_mcp_binary, sandbox, "scope", "claudeCode", fake_client(tmp_path))
+    assert result["user"] == "" and result["effective"] == "readOnly"
+    assert file.read_bytes() == original and mutations(sandbox) == []
+
+
 @pytest.mark.parametrize("token", ["12.000", "1e0", "-0.00e10", "1.2345678901234567"])
 def test_equivalent_real_spellings_keep_kind_and_value(native_mcp_binary,sandbox,tmp_path,token):
     store, _ = seed_user(sandbox,numeric="fixture-number-token")
@@ -1110,7 +1164,10 @@ def test_equivalent_real_spellings_keep_kind_and_value(native_mcp_binary,sandbox
     ("args",["mcp","cafe\u0301"],["mcp","cafe\u0301"],True),
     ("args",["mcp","caf\u00e9"],["mcp","cafe\u0301"],False),
     ("args",["first","second"],["second","first"],False),
-    ("args",None,[],False),
+    ("args",None,[],True),
+    ("args",[],None,True),
+    ("args",None,"bad",False),
+    ("args","bad",[],False),
     ("url","https://fixture.invalid/cafe\u0301","https://fixture.invalid/cafe\u0301",True),
     ("url","https://fixture.invalid/caf\u00e9","https://fixture.invalid/cafe\u0301",False),
     ("env_vars",["FIRST","SECOND"],["SECOND","FIRST"],True),
@@ -1132,7 +1189,8 @@ def test_refresh_compares_transport_fields_by_utf8(native_mcp_binary,sandbox,tmp
         entry[field] = saved
     store.write_text(json.dumps(entries))
     cli = fake_client(tmp_path)
-    result = execute(native_mcp_binary,{**sandbox,"TEST_EFFECTIVE":json.dumps({field:reported})},"query","codex",cli)
+    observation = {"TEST_OMIT_GET_FIELD": field} if reported is None else {"TEST_EFFECTIVE":json.dumps({field:reported})}
+    result = execute(native_mcp_binary,{**sandbox,**observation},"query","codex",cli)
     assert result["code"] == ("success" if agrees else "invalidResponse")
     assert result["configuration"] == ("configured" if agrees else "unknown")
     assert result["mode"] == ("readOnly" if agrees and field != "url" else None)

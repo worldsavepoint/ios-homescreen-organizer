@@ -31,12 +31,11 @@ from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any, Protocol
 
-from .model import Grid, LayoutError, is_folder, is_widget, item_list, widget_wire_fields
+from .model import Grid, LayoutError, NAME_MARK, is_folder, is_widget, item_list, widget_wire_fields
 
 Layout = tuple[list[Any], list[Any] | None]
 
 DISK_MARK = "__bundleIdOnly__"  # an app that was a bare bundle id string in the dict format
-NAME_MARK = "__nameFromDefault__"  # folder had no displayName of its own
 DEVICE_OPERATION_TIMEOUT = 30.0
 SUBPROCESS_TIMEOUT = 10.0
 
@@ -71,9 +70,6 @@ def _item_in(x: Any, names: dict[str, str]) -> Any:
         return {"bundleIdentifier": x, "displayIdentifier": x, "displayName": names.get(x, x), DISK_MARK: True}
     if isinstance(x, dict) and is_folder(x):
         out = dict(x)
-        if "displayName" not in x:  # iOS leaves it out while the folder keeps its default name
-            out["displayName"] = x.get("defaultDisplayName") or "Folder"
-            out[NAME_MARK] = True
         out["iconLists"] = [[_item_in(i, names) for i in item_list(page)] for page in item_list(x.get("iconLists"))]
         return out
     return x
@@ -117,7 +113,7 @@ def _item_out(x: Any) -> Any:
         return _leaf_id(x)
     if isinstance(x, dict) and is_folder(x):
         out = {k: v for k, v in x.items() if k != NAME_MARK}
-        if x.get(NAME_MARK) and out.get("displayName") == out.get("defaultDisplayName"):
+        if x.get(NAME_MARK) and out.get("displayName") == (out.get("defaultDisplayName") or "Folder"):
             del out["displayName"]
         out["iconLists"] = [[_item_out(i) for i in page] for page in x["iconLists"]]
         _fix_list_ids(out, len(out["iconLists"]))
@@ -151,7 +147,7 @@ def _modern(x: Any, owners: dict[str, str]) -> Any:
         return out
     if is_folder(x):
         out = {k: v for k, v in x.items() if k not in (NAME_MARK, "iconLists")}
-        out["iconLists"] = [[_modern(i, owners) for i in page] for page in x["iconLists"] if page]
+        out["iconLists"] = [[_modern(i, owners) for i in page] for page in x["iconLists"]]
         return out
     wire = _leaf_id(x)
     return _archive_leaf(wire, x.get("bundleIdentifier") or wire, owners)
@@ -253,6 +249,12 @@ def page_fields(archive: dict, count: int) -> dict:
 
 def is_dict_format(raw: Any) -> bool:
     return isinstance(raw, dict) and "iconLists" in raw
+
+
+def today_evidence(archive: Any) -> dict[str, Any] | None:
+    if not isinstance(archive, dict):
+        return None
+    return {"today": copy.deepcopy(archive["today"])} if "today" in archive else {}
 
 
 def _archive_metrics(path: Path) -> dict[str, int]:
@@ -478,6 +480,7 @@ class PhoneSource:
 
         async def send() -> None:
             require_writable()
+            self.written_today = today_evidence(payload)
             await self._call(lambda sb: sb.set_icon_state(payload))
 
         return library, send
@@ -563,6 +566,7 @@ class SimSource:
         self.name = f"sim:{udid[:8]}"
         self.dir = Path.home() / f"Library/Developer/CoreSimulator/Devices/{udid}/data/Library/SpringBoard"
         self._apps: dict[str, dict[str, Any]] | None = None
+        self._tablet: bool | None = None
 
     @property
     def path(self) -> Path:
@@ -576,14 +580,20 @@ class SimSource:
             self._apps = json.loads(conv.stdout)
         return self._apps
 
-    async def info(self) -> dict[str, Any]:
+    def _device_info(self) -> tuple[str, dict[str, Any]]:
         devs = json.loads(_run("xcrun", "simctl", "list", "devices", "-j"))["devices"]
         for runtime, items in devs.items():
             for d in items:
                 if d["udid"] == self.udid:
-                    return {"DeviceName": d["name"], "ProductVersion": runtime.rsplit(".", 1)[-1].replace("iOS-", "").replace("-", "."),
-                            "State": d["state"], "UniqueDeviceID": self.udid, "icon_metrics": _archive_metrics(self.path)}
+                    kind = str(d.get("deviceTypeIdentifier", "")).lower()
+                    self._tablet = ".ipad" in kind if kind else None
+                    return runtime, d
         raise ValueError(f"no simulator {self.udid}")
+
+    async def info(self) -> dict[str, Any]:
+        runtime, d = await asyncio.to_thread(self._device_info)
+        return {"DeviceName": d["name"], "ProductVersion": runtime.rsplit(".", 1)[-1].replace("iOS-", "").replace("-", "."),
+                "State": d["state"], "UniqueDeviceID": self.udid, "icon_metrics": _archive_metrics(self.path)}
 
     async def read(self) -> Layout:
         raw = plistlib.loads(self.path.read_bytes())
@@ -610,6 +620,7 @@ class SimSource:
         out = model_to_disk(state, library, base, pins if pins is not None else [], grid,
                             keep_archive_frame=True, page_archive=page_archive)
         before = self._springboard_pid()
+        self.written_today = today_evidence(out)
         self.path.write_bytes(plistlib.dumps(out, fmt=plistlib.FMT_BINARY))
         # SIGKILL so SpringBoard can't save its old in-memory layout over ours on the way out
         subprocess.run(["xcrun", "simctl", "spawn", self.udid, "launchctl", "kill", "SIGKILL",
@@ -648,32 +659,64 @@ class SimSource:
             info = plistlib.loads((bundle / "Info.plist").read_bytes())
         except (OSError, ValueError):
             info = {}
-        primary = info.get("CFBundleIcons", {}).get("CFBundlePrimaryIcon", {})
-        names = (primary.get("CFBundleIconFiles") or info.get("CFBundleIconFiles")
-                 or app.get("CFBundleIcons", {}).get("CFBundlePrimaryIcon", {}).get("CFBundleIconFiles")
-                 or ["AppIcon60x60"])
+        def declarations(key, legacy=False):
+            result = []
+            for source in (info, app):
+                group = source.get(key)
+                primary = group.get("CFBundlePrimaryIcon") if isinstance(group, dict) else None
+                if isinstance(primary, dict) and primary:
+                    result.append(primary)
+                if legacy and source.get("CFBundleIconFiles"):
+                    result.append({"CFBundleIconFiles": source["CFBundleIconFiles"]})
+            return result
+
+        generic = declarations("CFBundleIcons", legacy=True)
+        tablet = declarations("CFBundleIcons~ipad")
+        tablet_only = info.get("UIDeviceFamily", app.get("UIDeviceFamily")) == [2]
         if info.get("SBIconClass"):
             png = await asyncio.to_thread(_simulator_icon_png, self.udid, bundle_id)
             if png:
                 return png
-        for name in names:
-            if not isinstance(name, str):
-                continue
-            has_extension = name.lower().endswith(".png")
-            stem = name[:-4] if has_extension else name
-            for filename in (f"{stem}@3x.png", f"{stem}@2x.png", name if has_extension else f"{name}.png"):
-                p = bundle / filename
-                if p.is_file() and p.resolve().is_relative_to(bundle.resolve()):
-                    return p.read_bytes()
-        # many system apps don't list their icon files; take the biggest phone-size one
-        found = sorted((p for p in bundle.glob("*60x60@*.png")
-                        if "~ipad" not in p.name and p.is_file()
-                        and p.resolve().is_relative_to(bundle.resolve())), key=lambda p: p.name)
-        if found:
-            return found[-1].read_bytes()
-        if primary.get("CFBundleIconName") and (bundle / "Assets.car").exists():
-            return await asyncio.to_thread(_simulator_icon_png, self.udid, bundle_id)
-        return None
+        catalog = bundle / "Assets.car"
+        has_catalog = catalog.is_file() and catalog.resolve().is_relative_to(bundle.resolve())
+        async def image_for(group, *, qualified):
+            names = [name for primary in group if isinstance(primary.get("CFBundleIconFiles"), list)
+                     for name in primary["CFBundleIconFiles"]]
+            if not names and not qualified:
+                names = ["AppIcon60x60"]
+            for name in names:
+                if not isinstance(name, str):
+                    continue
+                has_extension = name.lower().endswith(".png")
+                stem = name[:-4] if has_extension else name
+                variants = [f"{stem}@2x~ipad.png", f"{stem}~ipad.png"] if qualified else []
+                for filename in [*variants, f"{stem}@3x.png", f"{stem}@2x.png", name if has_extension else f"{stem}.png"]:
+                    p = bundle / filename
+                    if p.is_file() and p.resolve().is_relative_to(bundle.resolve()):
+                        if image := p.read_bytes():
+                            return image
+            if not qualified:
+                found = sorted((p for p in bundle.glob("*60x60@*.png")
+                                if "~ipad" not in p.name and p.is_file()
+                                and p.resolve().is_relative_to(bundle.resolve())), key=lambda p: p.name)
+                for path in reversed(found):
+                    if image := path.read_bytes():
+                        return image
+            if has_catalog and any(primary.get("CFBundleIconName") for primary in group):
+                return await asyncio.to_thread(_simulator_icon_png, self.udid, bundle_id) or None
+            return None
+
+        if tablet and generic and self._tablet is None and not tablet_only:
+            await asyncio.to_thread(self._device_info)
+        if tablet and (self._tablet or not generic or (self._tablet is None and tablet_only)):
+            preferred = await image_for(tablet, qualified=True)
+            if preferred is not None:
+                return preferred
+        elif tablet and self._tablet is None:
+            preferred = await image_for(tablet, qualified=True)
+            fallback = await image_for(generic, qualified=False)
+            return fallback if preferred is None or preferred == fallback else None
+        return await image_for(generic, qualified=False)
 
 
 # ---- fixture file ---------------------------------------------------------------------
@@ -721,6 +764,7 @@ class FileSource:
         else:
             _check_list_write(pins, library)
             out = state
+        self.written_today = today_evidence(out)
         self.path.write_bytes(plistlib.dumps(out, fmt=plistlib.FMT_BINARY))
 
     async def icon_png(self, bundle_id: str) -> bytes | None:

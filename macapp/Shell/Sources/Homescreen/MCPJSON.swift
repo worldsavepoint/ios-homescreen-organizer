@@ -41,13 +41,23 @@ private final class MCPJSONNumber {
 }
 
 enum MCPJSON {
-    static func decode(_ data: Data, validated: Bool = false) throws -> Any {
-        if !validated { _ = try JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) }
-        var parser = Parser(bytes: Array(data))
-        return try parser.value()
+    private struct NumberLiteral { let text: String }
+
+    static func decode(_ data: Data, validated: Bool = false, deferNumbers: Bool = false) throws -> Any {
+        if !validated && !deferNumbers { _ = try JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) }
+        var parser = Parser(bytes: Array(data), deferNumbers: deferNumbers)
+        let result = try parser.value(depth: 0)
+        parser.whitespace()
+        guard parser.index == parser.bytes.count else { throw MCPClientOperationCode.snapshotReadFailed }
+        return result
     }
 
     static func text(_ value: Any) throws -> String {
+        if let number = value as? NumberLiteral {
+            // Only numbers in the selected entry must be representable by the strict reader.
+            _ = try JSONSerialization.jsonObject(with: Data(number.text.utf8), options: .fragmentsAllowed)
+            return try MCPJSONNumber(number.text).text
+        }
         if let number = value as? MCPJSONNumber { return number.text }
         if value is NSNull { return "null" }
         if let string = value as? String {
@@ -71,70 +81,102 @@ enum MCPJSON {
 
     private struct Parser {
         let bytes: [UInt8]
+        let deferNumbers: Bool
         var index = 0
 
         mutating func whitespace() {
             while index < bytes.count, [9, 10, 13, 32].contains(bytes[index]) { index += 1 }
         }
 
+        mutating func consume(_ byte: UInt8) -> Bool {
+            guard index < bytes.count, bytes[index] == byte else { return false }
+            index += 1
+            return true
+        }
+
+        mutating func digits() -> Bool {
+            let start = index
+            while index < bytes.count, (48...57).contains(bytes[index]) { index += 1 }
+            return index != start
+        }
+
+        mutating func number() throws -> Any {
+            let start = index
+            _ = consume(45) // minus
+            guard consume(48) || digits() else { throw MCPClientOperationCode.snapshotReadFailed }
+            if consume(46) && !digits() { throw MCPClientOperationCode.snapshotReadFailed }
+            if consume(101) || consume(69) {
+                _ = consume(43) || consume(45)
+                guard digits() else { throw MCPClientOperationCode.snapshotReadFailed }
+            }
+            let token = String(decoding: bytes[start..<index], as: UTF8.self)
+            if deferNumbers { return NumberLiteral(text: token) }
+            return try MCPJSONNumber(token)
+        }
+
         mutating func string() throws -> String {
             let start = index
-            index += 1
+            guard consume(34) else { throw MCPClientOperationCode.snapshotReadFailed }
             while index < bytes.count {
                 let byte = bytes[index]
                 index += 1
+                guard byte >= 32 else { throw MCPClientOperationCode.snapshotReadFailed }
                 if byte == 34 {
                     guard let string = try JSONSerialization.jsonObject(with: Data(bytes[start..<index]), options: .fragmentsAllowed) as? String else {
                         throw MCPClientOperationCode.snapshotReadFailed
                     }
                     return string
                 }
-                if byte == 92 { index += 1 }
+                if byte == 92 {
+                    guard index < bytes.count, [34, 47, 92, 98, 102, 110, 114, 116, 117].contains(bytes[index]) else {
+                        throw MCPClientOperationCode.snapshotReadFailed
+                    }
+                    index += 1
+                }
             }
             throw MCPClientOperationCode.snapshotReadFailed
         }
 
-        mutating func value() throws -> Any {
+        mutating func value(depth: Int) throws -> Any {
             whitespace()
-            guard index < bytes.count else { throw MCPClientOperationCode.snapshotReadFailed }
+            guard index < bytes.count, depth <= 512 else { throw MCPClientOperationCode.snapshotReadFailed }
             switch bytes[index] {
             case 34: return try string()
             case 123:
                 let fields = NSMutableDictionary()
                 index += 1
                 whitespace()
-                if bytes[index] == 125 { index += 1; return fields.copy() as! NSDictionary }
+                if consume(125) { return fields.copy() as! NSDictionary }
                 while true {
                     let key = try string()
                     whitespace()
-                    index += 1 // colon, validated by JSONSerialization
-                    let member = try value()
+                    guard consume(58) else { throw MCPClientOperationCode.snapshotReadFailed }
+                    let member = try value(depth: depth + 1)
                     fields.setObject(member, forKey: key as NSString)
                     whitespace()
-                    let delimiter = bytes[index]
-                    index += 1
-                    if delimiter == 125 { return fields.copy() as! NSDictionary }
+                    if consume(125) { return fields.copy() as! NSDictionary }
+                    guard consume(44) else { throw MCPClientOperationCode.snapshotReadFailed }
                     whitespace()
                 }
             case 91:
                 var array: [Any] = []
                 index += 1
                 whitespace()
-                if bytes[index] == 93 { index += 1; return array }
+                if consume(93) { return array }
                 while true {
-                    array.append(try value())
+                    array.append(try value(depth: depth + 1))
                     whitespace()
-                    let delimiter = bytes[index]
-                    index += 1
-                    if delimiter == 93 { return array }
+                    if consume(93) { return array }
+                    guard consume(44) else { throw MCPClientOperationCode.snapshotReadFailed }
                 }
-            case 116: index += 4; return true
-            case 102: index += 5; return false
-            case 110: index += 4; return NSNull()
-            default:
-                let start = index
-                while index < bytes.count, ![9, 10, 13, 32, 44, 93, 125].contains(bytes[index]) { index += 1 }
-                return try MCPJSONNumber(String(decoding: bytes[start..<index], as: UTF8.self))
+            case 116, 102, 110:
+                let first = bytes[index]
+                let literal = first == 116 ? "true" : first == 102 ? "false" : "null"
+                guard bytes[index...].starts(with: literal.utf8) else { throw MCPClientOperationCode.snapshotReadFailed }
+                index += literal.utf8.count
+                if first == 110 { return NSNull() }
+                return first == 116
+            default: return try number()
             }
         }
     }

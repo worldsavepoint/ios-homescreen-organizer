@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from argparse import Namespace
 
 import pytest
@@ -7,6 +8,26 @@ import pytest
 from homescreen import cli
 from homescreen.session import Session
 from test_integrity import MemorySource
+
+
+@pytest.mark.parametrize("operation", ["apply", "restore"])
+@pytest.mark.parametrize("confirmation", ["no", "yes"])
+def test_readonly_cli_handles_confirmation_without_a_device_write(tmp_path, monkeypatch, capsys, operation, confirmation):
+    source = MemorySource()
+    session = Session(source, tmp_path)
+    asyncio.run(session.read())
+    backup = session._backup(source.state, None, "saved")
+    monkeypatch.setenv("HOMESCREEN_READ_ONLY", "1")
+    monkeypatch.setattr(cli, "session", lambda: session)
+    monkeypatch.setattr("builtins.input", lambda prompt: confirmation)
+    monkeypatch.setattr(sys, "argv", ["home-screen-organizer", operation,
+                                     backup.name if operation == "restore" else session.require().token()])
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    assert stopped.value.code == 1 and source.writes == 0
+    error = capsys.readouterr().err
+    assert ("read-only" in error) is (confirmation == "yes")
+    assert "Traceback" not in error and not session._pending_path.exists()
 
 
 @pytest.mark.parametrize("operation", ["apply", "restore"])

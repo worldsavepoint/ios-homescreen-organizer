@@ -17,29 +17,38 @@ import json
 import os
 import uuid
 import plistlib
+import re
 import stat
 import tempfile
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Set
 from pathlib import Path
 from typing import Any, Callable
 from xml.parsers.expat import ExpatError
 
-from . import colors
-from .device import DISK_MARK, NAME_MARK, ObservedPins, Source, archive_page_order, disk_pins, disk_to_model, page_fields, require_writable
-from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, widget_configuration
+from . import colors, organize
+from .device import (DISK_MARK, NAME_MARK, ObservedPins, Source, archive_page_order, disk_pins,
+                     disk_to_model, page_fields, require_writable, today_evidence)
+from .model import Grid, Layout, LayoutError, Node, is_folder, is_widget, node_structure, same_fields, widget_configuration
 from .private_store import ensure_private_directory, open_private_directory, open_private_file
 
 KEEP_READS = 10
 MAX_UNDO = 200
+MAX_ICON_COLORS = 256
 OPERATION_TIMEOUT = 30.0
 _MISSING = object()  # Older drafts did not record the source's placement observation.
 
 
 class ReviewChanged(LayoutError):
     """The editor action was prepared against a different device, draft or backup."""
+
+
+class _ReadbackMismatch(LayoutError):
+    def __init__(self, reason, details=None):
+        super().__init__(reason)
+        self.details = details
 
 
 @contextmanager
@@ -60,12 +69,19 @@ def _exclusive_file(path: Path, data: bytes, *, root: Path | None = None, direct
     """Create a private file without overwriting another operation's recovery data."""
     with _local_directory(path.parent, root, directory_fd) as directory:
         fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-        with os.fdopen(fd, "wb") as stream:
-            if stream.write(data) != len(data):
-                raise OSError("incomplete local file write")
-            stream.flush()
-            os.fsync(stream.fileno())
-        _sync_directory(path.parent, directory_fd=directory)
+        owned = os.fstat(fd)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                if stream.write(data) != len(data):
+                    raise OSError("incomplete local file write")
+                stream.flush()
+                os.fsync(stream.fileno())
+            _sync_directory(path.parent, directory_fd=directory)
+        except BaseException:
+            with suppress(FileNotFoundError):
+                if os.path.samestat(owned, os.stat(path.name, dir_fd=directory, follow_symlinks=False)):
+                    _unlink_file(path, directory_fd=directory)
+            raise
 
 
 def _publish_exclusive(path: Path, data: bytes, *, root: Path | None = None) -> None:
@@ -134,6 +150,58 @@ def _private_replace(path: Path, data: bytes, *, root: Path | None = None, direc
 
 def _stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+_READ_NAME = re.compile(r"([0-9]{8}-[0-9]{6})(?:~([0-9]{10}))?\.plist")
+
+
+def _read_key(name: str) -> tuple[str, int] | None:
+    match = _READ_NAME.fullmatch(name)
+    if match:
+        stamp, sequence = match.groups()
+        try:
+            dt.datetime.strptime(stamp, "%Y%m%d-%H%M%S")
+        except ValueError:
+            return None
+        return stamp, int(sequence or 0)
+    return None
+
+
+@contextmanager
+def _read_snapshot(root: Path, reads: Path, data: bytes):
+    """Publish one observation and roll back only the inode created by this Read."""
+    stamp = _stamp()
+    temporary = f".read-{uuid.uuid4().hex}.tmp"
+    with open_private_directory(root, reads) as directory:
+        _exclusive_file(reads / temporary, data, directory_fd=directory)
+        try:
+            latest = max((key for name in os.listdir(directory) if (key := _read_key(name))),
+                         default=(stamp, 0))
+            stamp, previous = max(latest, (stamp, 0))
+            sequence = previous + 1
+            while True:
+                if sequence > 9_999_999_999:
+                    stamp = (dt.datetime.strptime(stamp, "%Y%m%d-%H%M%S") +
+                             dt.timedelta(seconds=1)).strftime("%Y%m%d-%H%M%S")
+                    sequence = 1
+                name = f"{stamp}~{sequence:010d}.plist"
+                try:
+                    os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+                    break
+                except FileExistsError:
+                    sequence += 1
+            try:
+                _sync_directory(reads, directory_fd=directory)
+                yield
+            except BaseException:
+                if os.path.samestat(os.stat(temporary, dir_fd=directory, follow_symlinks=False),
+                                    os.stat(name, dir_fd=directory, follow_symlinks=False)):
+                    _unlink_file(reads / name, directory_fd=directory)
+                    _sync_directory(reads, directory_fd=directory)
+                raise
+        finally:
+            with suppress(OSError):
+                _unlink_file(reads / temporary, directory_fd=directory, missing_ok=True)
 
 
 def _pending_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -369,10 +437,12 @@ def node_pins(lay: Layout, keyed: dict[str, Any] | list[dict[str, int]], by_memo
     return wanted
 
 
-def _retains_pins(requested: Layout, observed: Layout, memory: dict[str, Any] | None = None) -> bool:
+def _pin_mismatch(requested: Layout, observed: Layout, memory: dict[str, Any] | None = None, *,
+                  changed_folders: set | None = None) -> dict | None:
     instances = _instance_ids(requested, memory or {})
     for index, page in enumerate(requested.pages):
-        pinned = [node for node in page if node.id in requested.pins]
+        pinned = [node for node in page if node.id in requested.pins and
+                  (changed_folders is None or (node.kind == "folder" and pin_key(node) in changed_folders))]
         if not pinned:
             continue
         others = observed.pages[index] if index < len(observed.pages) else []
@@ -388,10 +458,40 @@ def _retains_pins(requested: Layout, observed: Layout, memory: dict[str, Any] | 
                 if same_wire:
                     matches = [node for node in same_wire if observed_shapes[node.id] == shape]
                 elif owner.id in instances or sum(value == shape for value in requested_shapes.values()) != 1:
-                    return False
+                    matches = []
             if len(matches) != 1 or observed.pins.get(matches[0].id) != cell:
-                return False
-    return True
+                actual = observed.pins.get(matches[0].id) if len(matches) == 1 else None
+                result = {"owner": owner.id, "page": index + 1, "requested_cell": cell, "observed_cell": actual}
+                wire = pin_key(owner)
+                if len(matches) != 1 or pin_key(matches[0]) != wire:
+                    # A unique folder can be exported with a fresh wire ID. Instance-bound
+                    # folders must still match their wire, as in the requested-page check.
+                    use_wire = bool(wire and any(pin_key(n) == wire and n.kind == owner.kind
+                                                 for n in observed.nodes.values()))
+                    def same_owner(node):
+                        return (node.kind == owner.kind and node_structure(node) == shape
+                                and (not use_wire or pin_key(node) == wire))
+
+                    locations = [(i, node) for i, nodes in enumerate(observed.pages, 1)
+                                 for node in nodes if same_owner(node)]
+                    if ((use_wire or (owner.kind == "folder" and owner.id not in instances))
+                            and len(locations) == 1 and locations[0][0] != index + 1
+                            and sum(same_owner(n) for n in observed.nodes.values()) == 1
+                            and sum(same_owner(n) for n in requested.nodes.values()) == 1):
+                        actual = observed.pins.get(locations[0][1].id)
+                        if actual is not None:
+                            result.update(observed_page=locations[0][0], observed_cell=actual)
+                for label, value in (("requested", cell), ("observed", actual)):
+                    if value is not None:
+                        row, col = divmod(value, requested.grid.cols)
+                        result[label] = {"row": row + 1, "column": col + 1}
+                if changed_folders is None or "observed_page" in result:
+                    return result
+    return None
+
+
+def _retains_pins(requested: Layout, observed: Layout, memory: dict[str, Any] | None = None) -> bool:
+    return _pin_mismatch(requested, observed, memory) is None
 
 
 def placed_structure(state: list[Any], library: list[Any] | None,
@@ -418,9 +518,9 @@ def _carried_node(node: Node, leaf_dicts: bool) -> Any:
     """Compare fields actually sent by the selected writer, separately from persistent pin identities."""
     if node.kind == "folder":
         fields = {k: v for k, v in node.raw.items()
-                  if k not in (NAME_MARK, "iconLists", "displayName", "uniqueIdentifier")}
+                  if k not in (NAME_MARK, "iconLists", "uniqueIdentifier")}
         return [node.name, plistlib.dumps(fields, fmt=plistlib.FMT_BINARY).hex(),
-                [[_carried_node(c, leaf_dicts) for c in page] for page in node.children if page]]
+                [[_carried_node(c, leaf_dicts) for c in page] for page in node.exported_folder_pages()]]
     if leaf_dicts and node.bundle_id and not node.raw.get(DISK_MARK):
         return {"fields": plistlib.dumps(node.raw, fmt=plistlib.FMT_BINARY).hex()}
     return node_structure(node)
@@ -480,12 +580,16 @@ def _folder_owners(lay: Layout, *, ordered: bool):
     return wires, ambiguous
 
 
-def _compatible_folder_ids(before: Layout, after: Layout, bound_ids: Set[str] = frozenset(), *,
-                           ordered: bool = True) -> bool:
+def _changed_folder_wires(before: Layout, after: Layout, bound_ids: Set[str], *, ordered: bool) -> set:
     old, ambiguous = _folder_owners(before, ordered=ordered)
     new, _ = _folder_owners(after, ordered=ordered)
     required = ambiguous | {pin_key(before.nodes[nid]) for nid in bound_ids}
-    return required <= new.keys() and all(old[wire] == new[wire] for wire in old.keys() & new.keys())
+    return (required - new.keys()) | {wire for wire in old.keys() & new.keys() if old[wire] != new[wire]}
+
+
+def _compatible_folder_ids(before: Layout, after: Layout, bound_ids: Set[str] = frozenset(), *,
+                           ordered: bool = True) -> bool:
+    return not _changed_folder_wires(before, after, bound_ids, ordered=ordered)
 
 
 def _restore_archive_app_ids(state, library, reference):
@@ -562,11 +666,13 @@ class Session:
         self.device_id: str | None = device
         self.info: dict[str, Any] = {}
         self.grid = Grid()
+        self.folder_columns: int | None = None
         self._observed_placement = _MISSING
         self._page_identity = _MISSING
         self._reported_clips = _MISSING
         self._placement_revision = ""
         self._draft_digest: bytes | None = None
+        self._icon_colors: OrderedDict[bytes, dict] = OrderedDict()
         self.usage: dict[str, Any] | None = None  # Screen Time opens, loaded on request
         self._undo: list[dict[str, Any]] = []
         self._redo: list[dict[str, Any]] = []
@@ -630,6 +736,7 @@ class Session:
             if digest != self._draft_digest:
                 fresh = Session(self.source, self.dir, device=self._draft_key)
                 self.layout, self.device_id, self.info, self.grid = fresh.layout, fresh.device_id, fresh.info, fresh.grid
+                self.folder_columns = fresh.folder_columns
                 self._draft_error, self._draft_digest = fresh._draft_error, fresh._draft_digest
                 self._observed_placement, self._page_identity = fresh._observed_placement, fresh._page_identity
                 self._reported_clips, self._placement_revision = fresh._reported_clips, fresh._placement_revision
@@ -679,7 +786,12 @@ class Session:
         assert self.layout is not None
         blob = {"device": self.device_id, "info": self.info, "draft_revision": uuid.uuid4().hex,
                 **self.layout.current_fields(), **self.layout.baseline()}
+        folders = {n.id: n.saved_folder_fields() for n in self.layout.nodes.values() if n.kind == "folder"}
+        if folders:
+            blob["saved_folder_fields"] = folders
         blob["placement_revision"] = self._placement_revision
+        if self.folder_columns is not None:
+            blob["folder_columns"] = self.folder_columns
         if self._page_identity is not _MISSING:
             blob["source_page_identity"] = self._page_identity
         if self._reported_clips is not _MISSING:
@@ -723,6 +835,7 @@ class Session:
                     placement = blob["source_pin_map"] if blob["source_pins_reported"] else None
                 lay = Layout.from_snapshot(blob)
                 original = lay.original()  # validate source identity independently
+                lay.recover_saved_folders(original, blob)
                 reported_clips = blob.get("source_reported_clips", _MISSING)
                 if reported_clips is not _MISSING and (not isinstance(reported_clips, list) or
                         any(not isinstance(value, str) for value in reported_clips)):
@@ -751,6 +864,10 @@ class Session:
                             if not stable:
                                 raise LayoutError("saved draft pin identity is ambiguous; call read again")
                 self.info, self.grid = info, lay.grid
+                columns = blob.get("folder_columns")
+                if columns is not None and (type(columns) is not int or columns < 1 or lay.grid.folder % columns):
+                    raise ValueError("invalid folder grid")
+                self.folder_columns = columns
                 self._observed_placement = placement
                 self._page_identity = blob.get("source_page_identity", _MISSING)
                 self._reported_clips = reported_clips
@@ -830,7 +947,10 @@ class Session:
             before = self.require()
             snapshot = self._history_snapshot()
             try:
-                self.layout = Layout.from_snapshot(copy.deepcopy(steps[-1]))
+                target = steps[-1]
+                baseline_keys = {"source", "source_library", "source_identity", "source_pins"}
+                current = copy.deepcopy({k: v for k, v in target.items() if k not in baseline_keys})
+                self.layout = Layout.from_snapshot({**target, **current})
                 self.layout.approval_device = self.device_id
                 self._save_draft()
             except BaseException:
@@ -1009,30 +1129,76 @@ class Session:
     def _webclips_path(self) -> Path:
         return self._dev_dir("webclips") / "seen.plist"
 
-    def _known_webclips(self) -> dict[str, dict[str, Any]]:
+    def _known_webclips(self) -> list[dict[str, Any]]:
         path = self._webclips_path
-        if self._exists_local(path):
-            return plistlib.loads(self._read_local(path))
-        legacy = path.with_suffix(".json")
-        return json.loads(self._read_local(legacy)) if self._exists_local(legacy) else {}
+        try:
+            known = plistlib.loads(self._read_local(path))
+        except FileNotFoundError:
+            try:
+                known = json.loads(self._read_local(path.with_suffix(".json")))
+            except FileNotFoundError:
+                return []
+        if isinstance(known, dict):
+            # Legacy keys were draft-local node IDs. The raw records retain their wire owners.
+            known = [n.raw for n in Layout([[], list(known.values())]).nodes.values() if n.kind == "webclip"]
+        return known
+
+    @staticmethod
+    def _clip_proxy(raw):
+        # Dictionary archives can report only the bare wire identifier and its display label.
+        return raw.keys() <= {"bundleIdentifier", "displayIdentifier", "displayName", DISK_MARK}
+
+    @staticmethod
+    def _missing_webclips(known, observed):
+        groups = {}
+        for raw in known:
+            wire = raw.get("displayIdentifier") or raw.get("bundleIdentifier") or raw.get("webClipURL")
+            groups.setdefault(wire, []).append(raw)
+        unmatched = []
+        for raw in observed:
+            wire = raw.get("displayIdentifier") or raw.get("bundleIdentifier") or raw.get("webClipURL")
+            available = groups.get(wire, [])
+            exact = next((i for i, known in enumerate(available) if same_fields(raw, known)), None)
+            if exact is not None:
+                available.pop(exact)
+            else:
+                unmatched.append((wire, raw))
+        def semantic_bundle(raw):
+            # A converted bare string repeats its wire ID in the model's bundle field.
+            return None if raw.get(DISK_MARK) else raw.get("bundleIdentifier")
+
+        for wire, raw in sorted(unmatched, key=lambda pair: not semantic_bundle(pair[1])):
+            available = groups.get(wire, [])
+            bundle = semantic_bundle(raw)
+            candidates = [(i, item) for i, item in enumerate(available)
+                          if not bundle or semantic_bundle(item) in (None, bundle)]
+            if candidates:
+                match, _ = max(candidates, key=lambda pair: (
+                    bool(bundle and semantic_bundle(pair[1]) == bundle),
+                    pair[1].get("webClipURL") == raw.get("webClipURL")))
+                available.pop(match)
+        return [raw for records in groups.values() for raw in records]
 
     def _remember_webclips(self, state: list[Any], library: list[Any] | None) -> None:
         known = self._known_webclips()
-        updated = dict(known)
-        for n in Layout(state, library=library).nodes.values():
-            if n.kind == "webclip":
-                updated[n.id] = n.raw
-        if updated:
-            result = plistlib.dumps(updated, fmt=plistlib.FMT_BINARY)
-            if result != plistlib.dumps(known, fmt=plistlib.FMT_BINARY):
-                _private_replace(self._webclips_path, result, root=self.dir)
+        observed = [n.raw for n in Layout(state, library=library).nodes.values() if n.kind == "webclip"]
+        explicit = [raw for raw in observed if not self._clip_proxy(raw)]
+        proxies = [raw for raw in observed if self._clip_proxy(raw)]
+        remaining = self._missing_webclips(known, explicit)
+        updated = [*explicit, *remaining, *self._missing_webclips(proxies, remaining)]
+        if not same_fields(updated, known):
+            _private_replace(self._webclips_path, plistlib.dumps(updated, fmt=plistlib.FMT_BINARY), root=self.dir)
 
     def _with_webclips(self, state: list[Any], library: list[Any] | None) -> list[Any] | None:
         """library plus every remembered web clip that isn't on the Home Screen."""
         if library is None:
             return None
-        here = {n.id for n in Layout(state, library=library).nodes.values()}
-        return library + [dict(w) for i, w in sorted(self._known_webclips().items()) if i not in here]
+        leaves = Layout(state, library=library).nodes.values()
+        clips = [node.raw for node in leaves if node.kind == "webclip" and not self._clip_proxy(node.raw)]
+        proxies = [node.raw for node in leaves if node.kind in ("app", "webclip")
+                   and self._clip_proxy(node.raw)]
+        missing = self._missing_webclips(self._known_webclips(), clips)
+        return library + self._missing_webclips(missing, proxies)
 
     async def _read_source(self, reference=None, *, verifying: bool = False) -> tuple[list[Any], list[Any] | None, list[str] | None]:
         state, library = await asyncio.wait_for(self.source.read(), OPERATION_TIMEOUT)
@@ -1096,7 +1262,7 @@ class Session:
 
     @property
     def gaps_readable(self) -> bool:
-        return getattr(self.source, "pins", None) is not None
+        return self._observed_placement is not _MISSING and self._observed_placement is not None
 
     async def read(self, *, expected: dict | None = None) -> dict[str, Any]:
         with self._exclusive(refresh=True, expected=expected):
@@ -1109,13 +1275,22 @@ class Session:
             raise LayoutError("device identity is unavailable; no layout was loaded")
         if self._draft_key not in (None, "unselected", device_id):
             raise LayoutError("device identity differs from the selected device; select the intended device")
-        grid = Grid.from_metrics(info.get("icon_metrics"))
+        metrics = info.get("icon_metrics")
+        grid = Grid.from_metrics(metrics)
+        folder_columns = int(metrics["homeScreenIconFolderColumns"]) if metrics and "homeScreenIconFolderColumns" in metrics else None
         state, library = await asyncio.wait_for(self.source.read(), OPERATION_TIMEOUT)
         verified = await asyncio.wait_for(self.source.info(), OPERATION_TIMEOUT)
         if verified.get("UniqueDeviceID") != device_id:
             raise LayoutError("device identity changed during read; no layout was loaded")
-        if Grid.from_metrics(verified.get("icon_metrics")) != grid:
+        final_metrics = verified.get("icon_metrics")
+        if Grid.from_metrics(final_metrics) != grid:
             raise LayoutError("device grid changed during read; no layout was loaded")
+        reported_columns = (final_metrics or {}).get("homeScreenIconFolderColumns")
+        final_columns = int(reported_columns) if reported_columns is not None else None
+        if (folder_columns or 3) != (final_columns or 3) or (folder_columns is not None and final_columns is None):
+            raise LayoutError("device grid changed during read; no layout was loaded")
+        if final_columns is not None:
+            folder_columns = final_columns
         raw = Layout(state, library=library, grid=grid)  # validate the shape before committing identity
         reported_clips = _clip_inventory(raw) if getattr(self.source, "source_archive", None) is not None else None
         clear_pending = False
@@ -1131,7 +1306,7 @@ class Session:
                     pending.get("device_id") == self.source.legacy_fixture_id and pending.get("status") == "pending"
                     ):
                 legacy_pending = pending_bytes
-        previous = (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
+        previous = (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo, self.folder_columns,
                     self._observed_placement, self._page_identity, self._reported_clips,
                     self._draft_digest, self._placement_revision)
         if self.layout is not None and device_id == self.device_id:
@@ -1140,16 +1315,17 @@ class Session:
             self.device_id = device_id
             self.info = {k: v for k, v in info.items() if k in ("DeviceName", "ProductType", "ProductVersion")}
             self.grid = grid
+            self.folder_columns = folder_columns
             reads = self._dev_dir("reads")
-            snapshot = reads / f"{_stamp()}.plist"
             with ExitStack() as transaction:
-                for path in (self._widget_ids_path, self._webclips_path, snapshot, self._gaps_path, self.draft_path):
+                for path in (self._widget_ids_path, self._webclips_path, self._gaps_path, self.draft_path):
                     transaction.enter_context(_previous_file(path, root=self.dir))
                 self._remember_widget_ids(state)
                 self._remember_webclips(state, library)
                 library = self._with_webclips(state, library)
-                _private_replace(snapshot, _pack(state, library), root=self.dir)
-                for old in sorted(self._local_files(reads, ".plist"))[:-KEEP_READS]:
+                transaction.enter_context(_read_snapshot(self.dir, reads, _pack(state, library)))
+                snapshots = sorted(p for p in self._local_files(reads, ".plist") if _read_key(p.name))
+                for old in snapshots[:-KEEP_READS]:
                     directory = transaction.enter_context(_previous_file(old, root=self.dir))
                     _unlink_file(old, directory_fd=directory)
                 self.layout = self._layout_from(state, library, recover_memory=True)
@@ -1178,7 +1354,7 @@ class Session:
             if previous[0] != device_id:
                 self.usage = None
         except BaseException:
-            (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo,
+            (self.device_id, self.info, self.grid, self.layout, self._undo, self._redo, self.folder_columns,
              self._observed_placement, self._page_identity, self._reported_clips,
              self._draft_digest, self._placement_revision) = previous
             raise
@@ -1196,8 +1372,10 @@ class Session:
 
     async def icon(self, bundle_id: str) -> bytes | None:
         cache = self._dev_dir("icons") / f"{_safe(bundle_id)}.png"
-        if self._exists_local(cache):
+        try:
             return self._read_local(cache)
+        except FileNotFoundError:
+            pass
         png = await self.source.icon_png(bundle_id)
         if png:
             _private_replace(cache, png, root=self.dir)
@@ -1210,8 +1388,22 @@ class Session:
         for i in ids:
             node = lay.get(i)
             png = await self.icon(node.bundle_id) if node.bundle_id else None
-            out[i] = {"name": node.name, **(colors.dominant(png) if png else {"family": "unknown"})}
+            out[i] = {"name": node.name, **(self._icon_color(png) if png else {"family": "unknown"})}
         return out
+
+    def _icon_color(self, png: bytes) -> dict:
+        digest = hashlib.sha256(png).digest()
+        color = self._icon_colors.pop(digest, None)
+        if color is None:
+            color = colors.dominant(png)
+        self._icon_colors[digest] = color
+        if len(self._icon_colors) > MAX_ICON_COLORS:
+            self._icon_colors.popitem(last=False)
+        return color
+
+    async def colors_for_sort(self, keep_first_page: bool) -> dict[str, Any]:
+        ids = organize.color_ids(self.require(), keep_first_page)
+        return await self.icon_colors(ids) if ids else {}
 
     # ---- write ------------------------------------------------------------------
 
@@ -1348,6 +1540,8 @@ class Session:
         _publish_exclusive(self._pending_path, json.dumps({"device_id": self.device_id,
                            "backup": backup.name, "status": "pending"}).encode(), root=self.dir)
         write_error = None
+        if hasattr(self.source, "written_today"):
+            self.source.written_today = None
         try:
             operation = (prepared_write() if prepared_write is not None
                          else self.source.write(target, target_lib, want_pins, self.grid, **archive_args))
@@ -1361,8 +1555,23 @@ class Session:
             got_pins = getattr(self.source, "pins", None)
             unreported = got_pins is None
             observed = Layout(after, library=after_lib, grid=self.grid)
-            if not _compatible_folder_ids(requested, observed, _instance_ids(requested, requested_memory), ordered=False):
-                raise LayoutError("readback changed a folder's owner")
+            if final.archive is not None:
+                wanted_today = getattr(self.source, "written_today", None)
+                if wanted_today is None:
+                    wanted_today = today_evidence(final.archive)
+                if not same_fields(wanted_today, today_evidence(getattr(self.source, "source_archive", None))):
+                    raise _ReadbackMismatch("readback changed the Today View")
+            changed_folders = _changed_folder_wires(requested, observed, _instance_ids(requested, requested_memory),
+                                                   ordered=False)
+            if changed_folders:
+                details = None
+                if got_pins is not None and requested.pins:
+                    with suppress(LayoutError):
+                        node_pins(observed, got_pins, strict=True)
+                        mismatch = _pin_mismatch(requested, observed, requested_memory, changed_folders=changed_folders)
+                        if mismatch:
+                            details = {"fixed_position": mismatch}
+                raise _ReadbackMismatch("readback changed a folder's owner", details)
             if unreported:
                 # Retain requested gaps under the no-pin-map contract. Match folders by
                 # exported content without adding outgoing UUIDs to the returned state.
@@ -1372,29 +1581,36 @@ class Session:
                     proposed = memory_pins(submitted, previous_memory, obligations, typed=True)["pages"]
                     prior = memory_pins(saved, previous_memory, typed=True)["pages"]
                     if {i: p for i, p in enumerate(proposed) if p} != {i: p for i, p in enumerate(prior) if p}:
-                        raise LayoutError("write failed and the source did not report the changed fixed positions")
+                        raise _ReadbackMismatch("write failed and the source did not report the changed fixed positions")
                 got_pins = requested_memory
-            node_pins(observed, got_pins, by_memory=unreported, strict=True)
-            if not _retains_pins(requested, observed, requested_memory):
-                raise LayoutError("readback did not retain every requested fixed position")
+            try:
+                node_pins(observed, got_pins, by_memory=unreported, strict=True)
+            except LayoutError as e:
+                raise _ReadbackMismatch(str(e)) from e
+            if mismatch := _pin_mismatch(requested, observed, requested_memory):
+                raise _ReadbackMismatch("readback did not retain every requested fixed position", {"fixed_position": mismatch})
             ok = (placed_structure(after, after_lib if lib_known else None, got_pins, self.grid,
                                    by_memory=unreported, leaf_dicts=final.leaf_dicts)
                   == placed_structure(target, target_lib, want_pins, self.grid, leaf_dicts=final.leaf_dicts))
             if expected_page_ids is not None:
                 raw = getattr(self.source, "source_archive", None) or {}
                 if raw.get("listUniqueIdentifiers") != expected_page_ids:
-                    raise LayoutError("readback changed the exported page identifiers")
+                    raise _ReadbackMismatch("readback changed the exported page identifiers")
             if retained_fields:
                 reported = page_fields(getattr(self.source, "source_archive", None) or {}, len(after) - 1)
                 for pid, wanted in retained_fields.items():
                     present = {k: v for k, v in reported.get(pid, {}).items() if k in wanted}
                     if plistlib.dumps(wanted, fmt=plistlib.FMT_BINARY) != plistlib.dumps(present, fmt=plistlib.FMT_BINARY):
-                        raise LayoutError("readback changed an exported page field")
+                        raise _ReadbackMismatch("readback changed an exported page field")
         except Exception as e:
-            readback_error = type(e).__name__
+            readback_error = "LayoutError" if isinstance(e, _ReadbackMismatch) else type(e).__name__
             result = {"ok": False, "status": "unknown", "backup": backup.name, "recovery": "read",
                       "warnings": [verification_note], "readback_error": readback_error,
                       "error": f"Readback failed ({readback_error}); run Read before applying another change."}
+            if isinstance(e, _ReadbackMismatch):
+                result["error"] = f"{e}. Run Read before applying another change."
+                if e.details:
+                    result["mismatches"] = e.details
             if write_error:
                 result["write_error"] = write_error
                 result["error"] = f"Write returned {write_error}. " + result["error"]

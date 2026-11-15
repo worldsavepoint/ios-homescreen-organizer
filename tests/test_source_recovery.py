@@ -5,10 +5,118 @@ import pytest
 
 from fake_phone import app, folder
 from homescreen import ui
-from homescreen.device import FileSource, disk_to_model
+from homescreen.device import FileSource, NAME_MARK, disk_to_model
 from homescreen.model import Layout, LayoutError
 from homescreen.session import Session
 from test_integrity import MemorySource
+
+
+@pytest.mark.parametrize("dictionary,default,rename", [
+    (False, "Utilities", None), (True, None, None), (True, None, "Folder"), (True, "Utilities", "Utilities"),
+])
+def test_folder_names_keep_wire_presence_after_reopen_and_apply(tmp_path, dictionary, default, rename):
+    path = tmp_path / "source.plist"
+    raw = {"listType": "folder", "iconLists": [[app("child", "Child")]]}
+    if default:
+        raw["defaultDisplayName"] = default
+    page = [raw, app("moving", "Moving")]
+    source = {"buttonBar": [], "iconLists": [page], "ignored": []} if dictionary else [[], page]
+    path.write_bytes(plistlib.dumps(source))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    item = session.require().pages[0][0]
+    assert item.name == (default or "Folder")
+    if rename is not None:
+        session.edit(lambda lay: lay.rename_folder(item.id, rename))
+    session.edit(lambda lay: lay.move("moving", "dock"))
+    restarted = Session(FileSource(path), session.dir)
+    assert asyncio.run(restarted.apply(restarted.require().token()))["ok"]
+    saved = plistlib.loads(path.read_bytes())
+    written = (saved["iconLists"][0] if dictionary else saved[1])[0]
+    assert written == (raw if rename is None else {**raw, "displayName": rename})
+
+
+@pytest.mark.parametrize("saved_name,explicit", [("Utilities", None), ("Chosen", "Chosen")])
+def test_legacy_draft_name_marker_keeps_an_explicit_rename(saved_name, explicit):
+    raw = {"listType": "folder", "iconLists": [[]], "defaultDisplayName": "Utilities",
+           "displayName": saved_name, "__nameFromDefault__": True}
+    layout = Layout([[], [raw]])
+    assert layout.pages[0][0].name == saved_name
+    emitted = layout.to_state()[1][0]
+    assert "__nameFromDefault__" not in emitted
+    assert emitted.get("displayName") == explicit and ("displayName" in emitted) == (explicit is not None)
+
+
+@pytest.mark.parametrize("damage", ["none", "empty-page", "default-name"])
+def test_readback_preserves_unidentified_folder_subpages_and_implicit_name(tmp_path, damage):
+    path = tmp_path / "archive.plist"
+    wire = {"listType": "folder", "defaultDisplayName": "Tools", "iconLists": [[], ["inside"]]}
+    path.write_bytes(plistlib.dumps({"iconLists": [[wire, "move"]], "ignored": []}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda layout: layout.move("move", "dock"))
+    write = source.write
+    async def persist(*args, **kwargs):
+        await write(*args, **kwargs)
+        archive = plistlib.loads(path.read_bytes())
+        folder = archive["iconLists"][0][0]
+        if damage == "empty-page":
+            folder["iconLists"] = folder["iconLists"][1:]
+        elif damage == "default-name":
+            folder["displayName"] = folder["defaultDisplayName"]
+        path.write_bytes(plistlib.dumps(archive))
+    source.write = persist
+    result = asyncio.run(session.apply(session.require().token()))
+    assert result["ok"] is (damage == "none")
+    assert session._pending_path.exists() is (damage != "none")
+    assert result["backup"] in session.backups()
+
+
+@pytest.mark.parametrize("operation", ["apply", "restore"])
+@pytest.mark.parametrize("change", ["keep", "remove", "type"])
+def test_verification_checks_today_from_the_live_write(tmp_path, operation, change):
+    path = tmp_path / "source.plist"
+    path.write_bytes(plistlib.dumps({"iconLists": [["a", "b"]], "ignored": [], "today": ["original"]}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda layout: layout.move("b", "dock"))
+    if operation == "restore":
+        saved = asyncio.run(session.apply(session.require().token()))["backup"]
+    live = plistlib.loads(path.read_bytes())
+    live["today"] = [{"value": 1}]
+    path.write_bytes(plistlib.dumps(live))
+    write = source.write
+    async def persist(*args, **kwargs):
+        await write(*args, **kwargs)
+        archive = plistlib.loads(path.read_bytes())
+        assert archive["today"] == [{"value": 1}] and type(archive["today"][0]["value"]) is int
+        if change == "remove":
+            del archive["today"]
+        if change == "type":
+            archive["today"][0]["value"] = True
+        path.write_bytes(plistlib.dumps(archive))
+    source.write = persist
+    result = asyncio.run(session.restore(saved) if operation == "restore" else session.apply(session.require().token()))
+    assert result["ok"] is (change == "keep") and result["backup"] in session.backups()
+    if change != "keep":
+        assert result["status"] == "unknown" and "Today View" in result["error"]
+        assert result["recovery"] == "read" and session._pending_path.exists()
+
+
+def test_legacy_draft_gap_capability_requires_its_own_observation(tmp_path):
+    path = tmp_path / "source.plist"
+    path.write_bytes(plistlib.dumps({"iconLists": [["a"]], "ignored": []}))
+    source = FileSource(path)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    assert session.gaps_readable and Session(FileSource(path), session.dir).gaps_readable
+    draft = plistlib.loads(session.draft_path.read_bytes())
+    for field in ("source_placement", "source_pins_reported", "source_pin_map"):
+        draft.pop(field, None)
+    session.draft_path.write_bytes(plistlib.dumps(draft))
+    assert not Session(source, session.dir).gaps_readable
 
 
 @pytest.mark.parametrize("operation", ["replace", "reorder-identical"])
@@ -625,3 +733,290 @@ def test_historical_raw_backup_without_reported_pins_can_keep_remembered_positio
     backup.write_bytes(plistlib.dumps(body))
     assert asyncio.run(session.restore(backup.name))["ok"]
     assert plistlib.loads(path.read_bytes())["listMetadata"]["A"]["fixedLocations"] == {"a": 4}
+
+
+@pytest.mark.parametrize("draft_kind", ["fresh", "recorded-omission", "unmarked"])
+def test_old_list_draft_omitted_wire_name(tmp_path, draft_kind):
+    path = tmp_path / "list.plist"
+    folder = {"listType": "folder", "defaultDisplayName": "Utilities", "iconLists": [[app("inside", "Inside")]]}
+    path.write_bytes(plistlib.dumps([[], [folder, app("move", "Move")]]))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    if draft_kind != "fresh":
+        # cde1d8eb Layout._wrap's list fallback was 'folder', and _unwrap always inserted it.
+        draft = plistlib.loads(session.draft_path.read_bytes())
+        if draft_kind == "unmarked":
+            del draft["saved_folder_fields"]
+        draft["state"][1][0]["displayName"] = "folder"
+        session.draft_path.write_bytes(plistlib.dumps(draft))
+    saved, source = session.draft_path.read_bytes(), path.read_bytes()
+    reopened = Session(FileSource(path), session.dir)
+    if draft_kind == "unmarked":
+        with pytest.raises(LayoutError, match="folder name.*read"):
+            reopened.require()
+        assert reopened.draft_path.read_bytes() == saved and path.read_bytes() == source
+        assert not reopened.backups() and not reopened._pending_path.exists()
+        return
+    name = reopened.require().pages[0][0].name
+    reopened.edit(lambda lay: lay.move("move", "dock"))
+    result = asyncio.run(reopened.apply(reopened.require().token()))
+    wire = plistlib.loads(path.read_bytes())[1][0]
+    assert result["ok"] and wire == folder and name == "Utilities"
+
+
+@pytest.mark.parametrize("old", [False, True])
+def test_old_dictionary_draft_preserves_untouched_subpage_and_metadata(tmp_path, old):
+    path = tmp_path / "layout.plist"
+    folder = {"displayName": "Work", "listType": "folder", "uniqueIdentifier": "work",
+              "iconLists": [[], ["inside"]], "listUniqueIdentifiers": ["empty", "used"],
+              "listMetadata": {"empty": {"opaque": "quiet"}, "used": {"opaque": "active"}}}
+    path.write_bytes(plistlib.dumps({"buttonBar": [], "iconLists": [[folder, "move"]], "ignored": []}))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    if old:
+        # The old _unwrap filtered both children and listUniqueIdentifiers; it kept listMetadata.
+        draft = plistlib.loads(session.draft_path.read_bytes())
+        draft.pop("saved_folder_fields", None)
+        item = draft["state"][1][0]
+        item["iconLists"] = item["iconLists"][1:]
+        item["listUniqueIdentifiers"] = item["listUniqueIdentifiers"][1:]
+        session.draft_path.write_bytes(plistlib.dumps(draft))
+    reopened = Session(FileSource(path), session.dir)
+    reopened.edit(lambda lay: lay.move("move", "dock"))
+    result = asyncio.run(reopened.apply(reopened.require().token()))
+    wire = plistlib.loads(path.read_bytes())["iconLists"][0][0]
+    backup = plistlib.loads((reopened._dev_dir("backups") / result["backup"]).read_bytes())
+    restore = asyncio.run(reopened.restore(result["backup"]))
+    assert backup["source_archive"]["iconLists"][0][0] == folder
+    assert result["ok"] and restore["ok"]
+    assert wire == folder
+
+
+@pytest.mark.parametrize("retired,expected", [([], ["A", "B", "C"]), (["A", "B"], ["C"]), (["A"], None)])
+def test_old_folder_page_metadata_distinguishes_retirement_from_filtering(tmp_path, retired, expected):
+    path = tmp_path / "layout.plist"
+    folder = {"listType": "folder", "displayName": "Work", "uniqueIdentifier": "work",
+              "iconLists": [[], [], ["inside"]], "listUniqueIdentifiers": ["A", "B", "C"],
+              "listMetadata": {k: {"opaque": k} for k in ("A", "B", "C")}}
+    path.write_bytes(plistlib.dumps({"iconLists": [[folder, "move", "stay"]], "ignored": []}))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda layout: layout.move("folder:work", "dock"))
+    draft = plistlib.loads(session.draft_path.read_bytes())
+    draft.pop("saved_folder_fields", None)
+    item = draft["state"][0][0]
+    item["iconLists"] = item["iconLists"][2:]
+    item["listUniqueIdentifiers"] = ["C"]
+    for key in retired:
+        del item["listMetadata"][key]
+    saved = plistlib.dumps(draft)
+    session.draft_path.write_bytes(saved)
+    reopened = Session(FileSource(path), session.dir)
+    if expected is None:
+        original = path.read_bytes()
+        with pytest.raises(LayoutError, match="folder.*read"):
+            asyncio.run(reopened.apply(reopened.require().token()))
+        assert reopened.draft_path.read_bytes() == saved and path.read_bytes() == original
+        assert not reopened.backups() and not reopened._pending_path.exists()
+    else:
+        reopened.edit(lambda layout: layout.move("move", "dock"))
+        assert asyncio.run(reopened.apply(reopened.require().token()))["ok"]
+        written = plistlib.loads(path.read_bytes())["buttonBar"][0]
+        assert written["listUniqueIdentifiers"] == expected
+        assert set(written["listMetadata"]) == set(expected)
+
+
+@pytest.mark.parametrize("intent", ["fresh-explicit", "historical-ambiguous", "historical-rename"])
+def test_saved_folder_name_preserves_explicit_and_ambiguous_intent(tmp_path, intent):
+    path = tmp_path / "list.plist"
+    folder = {"listType": "folder", "defaultDisplayName": "folder", "iconLists": [[app("child", "Child")]]}
+    path.write_bytes(plistlib.dumps([[], [folder, app("move", "Move")]]))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    target = "Chosen" if intent == "historical-rename" else "folder"
+    session.edit(lambda layout: layout.rename_folder(layout.pages[0][0].id, target))
+    if intent != "fresh-explicit":
+        draft = plistlib.loads(session.draft_path.read_bytes())
+        draft.pop("saved_folder_fields", None)
+        session.draft_path.write_bytes(plistlib.dumps(draft))
+    saved = session.draft_path.read_bytes()
+    reopened = Session(FileSource(path), session.dir)
+    if intent == "historical-ambiguous":
+        with pytest.raises(LayoutError, match="folder name.*read"):
+            reopened.require()
+        assert reopened.draft_path.read_bytes() == saved and not reopened.backups()
+        asyncio.run(reopened.read())
+        assert "displayName" not in reopened.require().to_state()[1][0]
+    else:
+        reopened.edit(lambda layout: layout.move("move", "dock"))
+        assert asyncio.run(reopened.apply(reopened.require().token()))["ok"]
+        assert plistlib.loads(path.read_bytes())[1][0]["displayName"] == target
+
+
+@pytest.mark.parametrize("twins", [False, True])
+def test_historical_moved_folder_needs_a_unique_owner_without_local_ids(tmp_path, twins):
+    path = tmp_path / "list.plist"
+    def unnamed(child):
+        return {"listType": "folder", "defaultDisplayName": "Tools", "iconLists": [[app(child, child)]]}
+    path.write_bytes(plistlib.dumps([[], [unnamed("a"), unnamed("a" if twins else "b"), app("stay", "Stay")]]))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    session.edit(lambda layout: layout.move(layout.pages[0][0].id, "dock"))
+    draft = plistlib.loads(session.draft_path.read_bytes())
+    for key in ("identity", "source_identity", "saved_folder_fields"):
+        draft.pop(key, None)
+    draft["state"][0][0]["displayName"] = "folder"
+    saved = plistlib.dumps(draft)
+    session.draft_path.write_bytes(saved)
+    reopened = Session(FileSource(path), session.dir)
+    with pytest.raises(LayoutError, match="ownership.*read" if twins else "folder name.*read"):
+        reopened.require()
+    assert reopened.draft_path.read_bytes() == saved and not reopened.backups()
+
+
+@pytest.mark.parametrize("representation", ["marked-dictionary", "dictionary", "list"])
+@pytest.mark.parametrize("chosen", ["Chosen", "folder"])
+def test_unmarked_old_draft_retains_an_explicit_lowercase_rename(tmp_path, representation, chosen):
+    path = tmp_path / "source.plist"
+    f = {"listType": "folder", "defaultDisplayName": "Utilities", "iconLists": [[{"displayIdentifier": "inside"}]]}
+    apps = [f, {"displayIdentifier": "move"}, {"displayIdentifier": "stay"}]
+    archive = {"buttonBar": [], "iconLists": [apps], "ignored": []} if representation != "list" else [[], apps]
+    path.write_bytes(plistlib.dumps(archive))
+    s = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(s.read())
+    def edited(l):
+        l.rename_folder(l.pages[0][0].id, chosen)
+        l.move("move", "dock")
+    s.edit(edited)
+    blob = plistlib.loads(s.draft_path.read_bytes())
+    del blob["saved_folder_fields"]
+    if representation == "marked-dictionary":
+        blob.pop("source_placement", None)
+        # cde1's dictionary reader carried the synthetic marker in both raw projections;
+        # its independent source explicitly records the actual prior default.
+        blob["source"][1][0].update(displayName="Utilities", **{NAME_MARK: True})
+        blob["state"][1][0][NAME_MARK] = True
+    stored = plistlib.dumps(blob)
+    s.draft_path.write_bytes(stored)
+    reopened = Session(FileSource(path), s.dir)
+    if representation == "list" and chosen == "folder":
+        with pytest.raises(LayoutError, match="folder name.*read"):
+            reopened.require()
+        assert reopened.draft_path.read_bytes() == stored and path.read_bytes() == plistlib.dumps(archive)
+        assert not reopened.backups() and not reopened._pending_path.exists()
+        return
+    shown = reopened.require().pages[0][0].name
+    result = asyncio.run(reopened.apply(reopened.require().token()))
+    written = plistlib.loads(path.read_bytes())
+    actual = written["iconLists"][0][0] if representation != "list" else written[1][0]
+    assert result["ok"] and actual.get("displayName") == chosen and shown == chosen
+
+
+@pytest.mark.parametrize("metadata,recorded", [(True, False), (False, False), (False, True)])
+def test_intentional_empty_page_retirement_survives_old_draft(tmp_path, metadata, recorded):
+    path = tmp_path / "source.plist"
+    f = {"listType": "folder", "displayName": "Filed", "uniqueIdentifier": "f",
+         "iconLists": [[], ["inside"]], "listUniqueIdentifiers": ["empty", "used"]}
+    if metadata:
+        f["listMetadata"] = {"empty": {"owner": "discarded"}, "used": {"owner": "retained"}}
+    archive = {"buttonBar": [], "iconLists": [[f, "move", "stay"]], "ignored": []}
+    source_bytes = plistlib.dumps(archive)
+    path.write_bytes(source_bytes)
+    s = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(s.read())
+    def edit(l):
+        l.drop_empty()
+        l.move("move", "dock")
+    s.edit(edit)
+    blob = plistlib.loads(s.draft_path.read_bytes())
+    assert blob["state"][1][0]["listUniqueIdentifiers"] == ["used"]
+    if not recorded:
+        del blob["saved_folder_fields"]
+    stored = plistlib.dumps(blob)
+    s.draft_path.write_bytes(stored)
+    reopened = Session(FileSource(path), s.dir)
+    if not metadata and not recorded:
+        with pytest.raises(LayoutError, match="folder pages.*read"):
+            reopened.require()
+        assert reopened.draft_path.read_bytes() == stored and path.read_bytes() == source_bytes
+        assert not reopened.backups() and not reopened._pending_path.exists()
+        return
+    result = asyncio.run(reopened.apply(reopened.require().token()))
+    written = plistlib.loads(path.read_bytes())["iconLists"][0][0]["listUniqueIdentifiers"]
+    assert result["ok"] and written == ["used"]
+
+
+@pytest.mark.parametrize("metadata", [False, True])
+def test_historical_retirement_with_an_appended_page_needs_owner_evidence(tmp_path, metadata):
+    path = tmp_path / "layout.plist"
+    folder = {"listType": "folder", "displayName": "Filed", "uniqueIdentifier": "f",
+              "iconLists": [[], ["inside"]], "listUniqueIdentifiers": ["empty", "used"]}
+    if metadata:
+        folder["listMetadata"] = {"empty": {"opaque": "old"}, "used": {"opaque": "keep"}}
+    path.write_bytes(plistlib.dumps({"iconLists": [[folder, "append", "stay"]], "ignored": []}))
+    session = Session(FileSource(path), tmp_path / "data")
+    asyncio.run(session.read())
+    def rearrange(layout):
+        layout.drop_empty()
+        layout.move("append", "folder:f:2")
+    session.edit(rearrange)
+    saved = plistlib.loads(session.draft_path.read_bytes())
+    del saved["saved_folder_fields"]
+    saved_ids = saved["state"][1][0]["listUniqueIdentifiers"]
+    assert len(saved_ids) == 2 and saved_ids[0] == "used" and "empty" not in saved_ids
+    stored = plistlib.dumps(saved)
+    session.draft_path.write_bytes(stored)
+    reopened = Session(FileSource(path), session.dir)
+    if metadata:
+        assert asyncio.run(reopened.apply(reopened.require().token()))["ok"]
+        assert plistlib.loads(path.read_bytes())["iconLists"][0][0]["listUniqueIdentifiers"] == saved_ids
+    else:
+        before = path.read_bytes()
+        with pytest.raises(LayoutError, match="folder page.*read"):
+            reopened.require()
+        assert path.read_bytes() == before and reopened.draft_path.read_bytes() == stored
+        assert not reopened.backups() and not reopened._pending_path.exists()
+
+
+@pytest.mark.parametrize("evidence", ["metadata", "receipt", "unproved"])
+@pytest.mark.parametrize("fill_first", [False, True])
+def test_recover_missing_subpages_preserves_the_edited_owner(tmp_path, evidence, fill_first):
+    folder = {"listType": "folder", "displayName": "Filed", "uniqueIdentifier": "f",
+              "iconLists": [[], [], ["inside"]], "listUniqueIdentifiers": ["first", "gap", "used"]}
+    if evidence == "metadata":
+        folder["listMetadata"] = {pid: {"owner": pid} for pid in folder["listUniqueIdentifiers"]}
+    source = plistlib.dumps({"iconLists": [[folder, "fill", "move", "stay"]], "ignored": []})
+    path = tmp_path / "source.plist"
+    path.write_bytes(source)
+    session = Session(FileSource(path), tmp_path / "store")
+    asyncio.run(session.read())
+
+    def edit(layout):
+        if fill_first:
+            layout.move("fill", "folder:f:1")
+        layout.move("move", "dock")
+    session.edit(edit)
+    token = session.require().token()
+    draft = plistlib.loads(session.draft_path.read_bytes())
+    receipt = draft["saved_folder_fields"]["folder:f"]
+    if evidence != "receipt":
+        del draft["saved_folder_fields"]
+    entry = draft["state"][1][0]
+    # Historical serialization filtered each empty row and its page ID together.
+    rows = [(pid, page) for pid, page in zip(entry["listUniqueIdentifiers"], entry["iconLists"]) if page]
+    entry["listUniqueIdentifiers"] = [pid for pid, page in rows]
+    entry["iconLists"] = [page for pid, page in rows]
+    historical = plistlib.dumps(draft)
+    session.draft_path.write_bytes(historical)
+    reopened = Session(FileSource(path), session.dir)
+    if evidence == "unproved":
+        with pytest.raises(LayoutError, match="folder pages.*read"):
+            asyncio.run(reopened.apply(token))
+        assert path.read_bytes() == source and reopened.draft_path.read_bytes() == historical
+        assert not reopened.backups() and not reopened._pending_path.exists()
+        return
+    assert reopened.require().get("folder:f").saved_folder_fields() == receipt
+    assert asyncio.run(reopened.apply(token))["status"] == "verified"
+    written = plistlib.loads(path.read_bytes())
+    expected = {**folder, "iconLists": [["fill"] if fill_first else [], [], ["inside"]]}
+    assert written["iconLists"][0][0] == expected and written["buttonBar"] == ["move"]

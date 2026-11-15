@@ -1,6 +1,6 @@
 #!/bin/bash
 # Prepare CPython 3.12 Intel dependencies: prepare_intel.sh PYTHON OUTPUT_DIR
-# Requires native Intel macOS, Xcode command line tools, Perl, curl and rustup.
+# Requires native Intel macOS, Xcode command line tools, Perl and rustup.
 set -euo pipefail
 
 if [[ "$#" != 2 ]]; then
@@ -17,7 +17,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PYTHON=$1
 OUTPUT=$2
 "$PYTHON" -c 'import platform, sys; assert sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12) and platform.machine() == "x86_64", "Requires native Intel CPython 3.12"'
-for tool in clang make perl curl rustup lipo otool shasum; do
+for tool in clang make perl rustup lipo otool; do
     command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 1; }
 done
 
@@ -26,13 +26,9 @@ WORK=$(mktemp -d "$(cd "$(dirname "$OUTPUT")" && pwd)/.homescreen-intel.XXXXXXXX
 mkdir "$WORK/tmp"
 export TMPDIR="$WORK/tmp"
 trap 'rm -rf "$WORK"' EXIT
-# Release checksum: https://github.com/openssl/openssl/releases/tag/openssl-4.0.3
 OPENSSL_VERSION=4.0.3
-OPENSSL_SHA256=325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9
 OPENSSL_ARCHIVE="$WORK/openssl-$OPENSSL_VERSION.tar.gz"
-curl --fail --location --retry 3 --output "$OPENSSL_ARCHIVE" \
-    "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
-echo "$OPENSSL_SHA256  $OPENSSL_ARCHIVE" | shasum -a 256 -c -
+"$PYTHON" "$ROOT/macapp/source_inputs.py" "$WORK" "$OPENSSL_VERSION"
 tar -xzf "$OPENSSL_ARCHIVE" -C "$WORK"
 
 "$PYTHON" -m venv "$WORK/venv"
@@ -64,7 +60,7 @@ export OPENSSL_LIB_DIR="$OPENSSL_DIR/lib" OPENSSL_INCLUDE_DIR="$OPENSSL_DIR/incl
 # pip verifies the source hash before invoking upstream's locked maturin build.
 "$BUILD_PYTHON" -m pip wheel --no-cache-dir --no-deps --no-build-isolation \
     --require-hashes --no-binary=cryptography --wheel-dir "$WORK/wheels" \
-    -r "$ROOT/requirements-cryptography-x86_64.lock"
+    -r "$WORK/cryptography.lock"
 "$BUILD_PYTHON" "$ROOT/macapp/wheel_sbom.py" "$WORK/wheels"
 "$BUILD_PYTHON" - "$WORK/wheels" "$OUTPUT" "$ROOT/requirements-build-x86_64.lock" \
     "$WORK/openssl-$OPENSSL_VERSION/LICENSE.txt" <<'PY'

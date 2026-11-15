@@ -10,11 +10,90 @@ from homescreen import device
 from homescreen.device import FileSource, SimSource, to_root_archive
 from homescreen.model import Grid, LayoutError
 from homescreen.session import Session
-from test_grid_serialization import metadata
+from test_grid_serialization import ArchiveSource, metadata
 from test_live_frame import FrameSource, external_traps, reviewed
 from test_pin_integrity import apply, run
 from test_reviewed_session import loaded, source_traps
 from test_transaction_identity import change_read, paired_folders
+
+
+def test_repeated_clip_owners_keep_the_unobserved_typed_occurrence(tmp_path):
+    clip = {"iconType": "webClip", "displayIdentifier": "shared", "webClipURL": "/one"}
+    first, second = {**clip, "setting": True}, {**clip, "setting": 1}
+    path = tmp_path / "archive.plist"
+    archive = {"iconLists": [[first, second, "keep"]], "ignored": []}
+    path.write_bytes(plistlib.dumps(archive))
+    session = Session(FileSource(path), tmp_path / "data")
+    run(session.read())
+    archive["iconLists"] = [[second, "keep"]]
+    path.write_bytes(plistlib.dumps(archive))
+    run(session.read())
+    session.edit(lambda layout: layout.move("keep", "dock"))
+    assert apply(session)["ok"]
+    wire = plistlib.loads(path.read_bytes())
+    assert type(wire["iconLists"][0][0]["setting"]) is int
+    assert len(wire["ignored"]) == 1 and wire["ignored"][0]["setting"] is True
+
+
+def test_legacy_json_clip_memory_excludes_explicit_apps_and_preserves_url_clips(tmp_path):
+    path = tmp_path / "archive.plist"
+    path.write_bytes(plistlib.dumps({"iconLists": [["keep"]], "ignored": []}))
+    session = Session(FileSource(path), tmp_path / "data")
+    run(session.read())
+    clip = {"displayIdentifier": "clip", "webClipURL": "/example"}
+    ordinary = {"iconType": "app", "displayIdentifier": "sample.webclipper", "webClipURL": "/help"}
+    session._webclips_path.with_suffix(".json").write_text(json.dumps({"old-one": clip, "old-two": ordinary}))
+    run(session.read())
+    assert [node.raw for node in session.require().library] == [clip]
+
+
+def test_explicit_webclip_with_exported_empty_icon_lists(tmp_path):
+    clip = {"iconType": "webClip", "displayIdentifier": "clip", "iconLists": []}
+    path = tmp_path / "archive.plist"
+    path.write_bytes(plistlib.dumps({"iconLists": [[clip, "keep"]], "ignored": []}))
+    session = Session(FileSource(path), tmp_path / "data")
+    run(session.read())
+    assert session.require().get("clip").kind == "webclip"
+    path.write_bytes(plistlib.dumps({"iconLists": [["keep"]], "ignored": []}))
+    run(session.read())
+    assert [node.raw for node in session.require().library] == [clip]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_remembered_clips_keep_display_owners_across_reads(tmp_path, legacy):
+    clips = [{"iconType": "webClip", "bundleIdentifier": "shared", "displayIdentifier": owner,
+              "webClipURL": "/" + owner, "opaque": owner.encode()} for owner in ("one", "two")]
+    path = tmp_path / "fixture.plist"
+    archive = {"buttonBar": [], "iconLists": [[*clips, "keep"]], "ignored": []}
+    path.write_bytes(plistlib.dumps(archive))
+    s = Session(FileSource(path), tmp_path / "data")
+    run(s.read())
+    if legacy:
+        s._webclips_path.write_bytes(plistlib.dumps(dict(zip(("shared", "webclip:1"), clips))))
+    archive["iconLists"] = [[clips[1], "keep"]]
+    path.write_bytes(plistlib.dumps(archive))
+    run(s.read())
+    s.edit(lambda layout: layout.move("shared", "dock"))
+    assert apply(s)["ok"]
+    written = plistlib.loads(path.read_bytes())
+    assert written["buttonBar"] == [clips[1]] and written["ignored"] == [clips[0]]
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_unrelated_move_preserves_folder_pages_through_recovery(tmp_path, empty):
+    pages = [[], ["inside"]] if empty else [["inside"]]
+    owners = ["empty", "used"] if empty else ["used"]
+    folder = {"listType": "folder", "defaultDisplayName": "Utilities", "iconLists": pages,
+              "listUniqueIdentifiers": owners, "listMetadata": {owner: {"payload": owner} for owner in owners}}
+    path = tmp_path / "device.plist"
+    path.write_bytes(plistlib.dumps({"buttonBar": [], "iconLists": [[folder, "moving"]], "ignored": []}))
+    s = Session(FileSource(path), tmp_path / "data")
+    run(s.read())
+    s.edit(lambda layout: layout.move("moving", "dock"))
+    result = apply(s)
+    assert result["ok"] and plistlib.loads(path.read_bytes())["iconLists"][0][0] == folder
+    assert run(s.restore(result["backup"]))["ok"]
+    assert plistlib.loads(path.read_bytes())["iconLists"][0][0] == folder
 
 
 @pytest.mark.parametrize("reported", [False, True])
@@ -478,3 +557,180 @@ def test_other_phone_formats_preserve_explicit_odd_bundle_fields(tmp_path, dicti
     s, _ = loaded(tmp_path, src)
     assert apply(s)["ok"]
     assert [n.bundle_id for n in s.require().pages[0]] == ["one", "two"]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_typed_app_cannot_consume_missing_clip(tmp_path, shared):
+    clip = {"iconType": "webClip", "displayIdentifier": "wire", "bundleIdentifier": "semantic",
+            "webClipURL": "/news", "config": {"columns": 3}}
+    ordinary = {"iconType": "app", "displayIdentifier": "wire" if shared else "another",
+                "bundleIdentifier": "semantic", "displayName": "Reader"}
+    path = tmp_path / "layout.plist"
+    raw = {"buttonBar": [], "iconLists": [[clip, ordinary, "move"]], "ignored": []}
+    path.write_bytes(plistlib.dumps(raw))
+    sess = Session(FileSource(path), tmp_path / "data")
+    run(sess.read())
+    assert sorted(n.kind for n in sess.require().nodes.values()) == ["app", "app", "webclip"]
+    raw["iconLists"] = [[ordinary, "move"]]
+    path.write_bytes(plistlib.dumps(raw))
+    run(sess.read())
+    draft = [n.raw for n in sess.require().library]
+    sess.edit(lambda l: l.move("move", "dock"))
+    result = apply(sess)
+    written = plistlib.loads(path.read_bytes())
+    assert result["ok"] and written["iconLists"][0] == [ordinary]
+    assert draft == written["ignored"] == [clip]
+
+
+def test_bare_and_typed_clip_occurrences_preserve_both_remembered_configurations(tmp_path):
+    wire = "com.apple.webclip.shared"
+    clips = [{"iconType": "webClip", "displayIdentifier": wire, "webClipURL": name} for name in ("/a", "/b")]
+    raw = {"iconLists": [[*clips, "stay"]], "ignored": []}
+    path = tmp_path / "layout.plist"
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(path), tmp_path / "data")
+    run(session.read())
+    for page in ([wire, clips[1], "stay"], ["stay"]):
+        raw["iconLists"] = [page]
+        path.write_bytes(plistlib.dumps(raw))
+        run(session.read())
+    assert sorted((n.raw for n in session.require().library), key=lambda x: x["webClipURL"]) == clips
+
+
+@pytest.mark.parametrize("cross_page", [False, True])
+def test_reported_anchor_identifies_unique_owner_across_pages(tmp_path, cross_page):
+    src = ArchiveSource(4, 6, "dictionary")
+    src.raw = to_root_archive([[], [app("target", "Target"), app("left", "Left")], [app("right", "Right")]], [])
+    sess = Session(src, tmp_path / "data")
+    run(sess.read())
+    sess.edit(lambda l: l.pin("target", 1, 5))
+    send = src.set_icon_state
+
+    async def returned(payload):
+        await send(payload)
+        raw = src.raw
+        first, second = raw["listUniqueIdentifiers"]
+        meta = raw["listMetadata"]
+        meta[first]["fixedLocations"]["target"] = 3
+        if cross_page:
+            raw["iconLists"][1].append(raw["iconLists"][0].pop(0))
+            meta[second] = meta.pop(first)
+
+    src.set_icon_state = returned
+    result = apply(sess)
+    fixed = result["mismatches"]["fixed_position"]
+    assert result["status"] == "unknown" and sess._pending_path.exists() and result["backup"] in sess.backups()
+    assert fixed["observed_cell"] == 3 and fixed["observed"] == {"row": 1, "column": 4}
+    if cross_page:
+        assert fixed["page"] == 1 and fixed["observed_page"] == 2
+
+
+@pytest.mark.parametrize("owner", ["stable", "regenerated", "ambiguous"])
+def test_unique_reported_folder_location_after_cross_page_move(tmp_path, owner):
+    source = ArchiveSource(4, 6, "dictionary")
+    item = {**folder("Tools", [app("inside", "Inside")]), "uniqueIdentifier": "tools"}
+    other = [app("right", "Right")]
+    if owner == "ambiguous":
+        other.append({**item, "uniqueIdentifier": "other-tools"})
+    source.raw = to_root_archive([[], [item, app("left", "Left")], other], [])
+    session = Session(source, tmp_path / "data")
+    run(session.read())
+    session.edit(lambda layout: layout.pin("folder:tools", 1, 5))
+    send = source.set_icon_state
+
+    async def moved(payload):
+        await send(payload)
+        raw = source.raw
+        first, second = raw["listUniqueIdentifiers"]
+        item = raw["iconLists"][0].pop(0)
+        raw["iconLists"][1].append(item)
+        if owner != "stable":
+            item["uniqueIdentifier"] = "new-tools"
+        record = raw["listMetadata"].pop(first)
+        record["fixedLocations"] = {item["uniqueIdentifier"]: 3}
+        raw["listMetadata"][second] = record
+
+    source.set_icon_state = moved
+    result = apply(session)
+    assert result["status"] == "unknown" and session._pending_path.exists() and result["backup"] in session.backups()
+    detail = result.get("mismatches", {}).get("fixed_position", {})
+    if owner == "ambiguous":
+        assert detail.get("observed_page") is None and detail.get("observed_cell") is None
+    else:
+        assert detail.get("observed_page") == 2 and detail.get("observed_cell") == 3
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_compact_owned_app_keeps_unrelated_clip(tmp_path, explicit):
+    clip = {"iconType": "webClip", "displayIdentifier": "shared", "bundleIdentifier": "reader.bookmark",
+            "webClipURL": "/news", "settings": {"owner": "clip"}}
+    ordinary = {"displayIdentifier": "shared", "bundleIdentifier": "reader.native", "displayName": "Reader"}
+    if explicit:
+        ordinary["iconType"] = "app"
+    path = tmp_path / "phone.plist"
+    raw = {"buttonBar": [], "iconLists": [[clip, ordinary, "move"]], "ignored": []}
+    path.write_bytes(plistlib.dumps(raw))
+    s = Session(FileSource(path), tmp_path / "store")
+    run(s.read())
+    assert s.require().get("reader.native").kind == "app" and s.require().get("reader.bookmark").kind == "webclip"
+    raw["iconLists"] = [[ordinary, "move"]]
+    path.write_bytes(plistlib.dumps(raw))
+    run(s.read())
+    s.edit(lambda l: l.move("move", "dock"))
+    outcome = apply(s)
+    actual = plistlib.loads(path.read_bytes())
+    assert outcome["ok"] and actual["iconLists"][0] == [ordinary] and actual["ignored"] == [clip]
+
+
+@pytest.mark.parametrize("bare_first", [False, True])
+def test_mixed_proxy_occurrences_reserve_matching_semantic_bundles(tmp_path, bare_first):
+    clips = [{"iconType": "webClip", "displayIdentifier": "wire", "bundleIdentifier": owner,
+              "webClipURL": "/" + owner} for owner in ("one", "two", "three", "four")]
+    path = tmp_path / "layout.plist"
+    raw = {"iconLists": [[*clips, "stay"]], "ignored": []}
+    path.write_bytes(plistlib.dumps(raw))
+    session = Session(FileSource(path), tmp_path / "data")
+    run(session.read())
+    proxies = [{"displayIdentifier": "wire", "bundleIdentifier": "two"},
+               {"displayIdentifier": "wire", "bundleIdentifier": "foreign"}]
+    proxies.insert(0 if bare_first else len(proxies), "wire")
+    raw["iconLists"] = [[*proxies, clips[3], "stay"]]
+    path.write_bytes(plistlib.dumps(raw))
+    run(session.read())
+    assert [node.raw for node in session.require().library] == [clips[2]]
+
+
+@pytest.mark.parametrize("move_app_too", [False, True])
+def test_early_folder_owner_diagnostic_keeps_its_cause(tmp_path, move_app_too):
+    src = ArchiveSource(4, 6, "dictionary")
+    f = {**folder("Filed", [app("inside", "Inside")]), "uniqueIdentifier": "f"}
+    src.raw = to_root_archive([[], [app("first", "First"), f, app("left", "Left")],
+                                [app("second", "Second")], [app("third", "Third")]], [])
+    s = Session(src, tmp_path / "data")
+    run(s.read())
+    def pin(l):
+        l.pin("first", 1, 5)
+        l.pin("folder:f", 1, 7)
+    s.edit(pin)
+    write = src.set_icon_state
+    async def moved(payload):
+        await write(payload)
+        raw = src.raw
+        srcpage, apppage, folderpage = raw["iconLists"]
+        p1,p2,p3 = raw["listUniqueIdentifiers"]
+        meta = raw["listMetadata"]
+        row = meta[p1]
+        folderpage.append(srcpage.pop(next(i for i,n in enumerate(srcpage) if isinstance(n,dict))))
+        del row["fixedLocations"]["f"]
+        meta[p3] = {**row, "fixedLocations": {"f": 2}}
+        if move_app_too:
+            apppage.append(srcpage.pop(srcpage.index("first")))
+            del row["fixedLocations"]["first"]
+            meta[p2] = {**row, "fixedLocations": {"first": 1}}
+    src.set_icon_state = moved
+    result = apply(s)
+    assert result["status"] == "unknown" and s._pending_path.exists() and result["backup"] in s.backups()
+    detail = result["mismatches"]["fixed_position"]
+    assert (detail["owner"], detail["page"], detail["requested_cell"]) == ("folder:f", 1, 7)
+    assert (detail["observed_page"], detail["observed_cell"]) == (3, 2)
+    assert detail["observed"] == {"row": 1, "column": 3}

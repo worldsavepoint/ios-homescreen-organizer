@@ -30,10 +30,15 @@ def pack(lay: Layout, items: list[Node], start_page: int = 0) -> None:
     lay.unpin_pages(start_page)
     kept = lay.pages[:start_page]
     pages: list[list[Node]] = [[]]
+    uniform = True
     for n in items:
-        if pages[-1] and lay.place([*pages[-1], n])[1]:
+        single = lay.dims(n) == (1, 1)
+        if pages[-1] and ((len(pages[-1]) >= lay.grid.slots) if uniform and single
+                         else lay.place([*pages[-1], n])[1]):
             pages.append([])
+            uniform = True
         pages[-1].append(n)
+        uniform = uniform and single
     lay.repack_pages(kept + [p for p in pages if p])
 
 
@@ -43,6 +48,11 @@ def _split(lay: Layout, keep_first_page: bool) -> tuple[int, list[Node], list[No
     fixed = [n for n in nodes if n.kind in ("widget", "folder")]
     loose = [n for n in nodes if n.kind in ("app", "webclip", "other")]
     return start, fixed, loose
+
+
+def color_ids(lay: Layout, keep_first_page: bool) -> list[str]:
+    _, _, loose = _split(lay, keep_first_page)
+    return [node.id for node in loose if node.bundle_id]
 
 
 def by_color(lay: Layout, colors: dict[str, dict[str, Any]], keep_first_page: bool = True) -> None:

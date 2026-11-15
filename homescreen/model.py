@@ -13,17 +13,26 @@ import copy
 import hashlib
 import json
 import plistlib
+import struct
 import uuid
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 # Grid slots a widget takes on an iPhone page (4 columns x 6 rows = 24 slots).
-WIDGET_SLOTS = {"small": 4, "medium": 8, "large": 16, "extralarge": 32}
 WIDGET_DIMS = {"small": (2, 2), "medium": (4, 2), "large": (4, 4), "extralarge": (4, 4)}  # columns, rows
 GRID_COLS, GRID_ROWS = 4, 6
 DEFAULT_PAGE_SLOTS = 24
 DEFAULT_DOCK_SLOTS = 4
 DEFAULT_FOLDER_PAGE_SLOTS = 9
+NAME_MARK = "__nameFromDefault__"  # Older dictionary drafts marked a synthesized folder name.
+
+
+_GridPosition = tuple[int, int, int, int]
+PageCells = dict[str, _GridPosition]
+
+
+LocationMap = dict[str, tuple[str, dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,7 @@ class Node:
     bundle_id: str | None = None
     slots: int = 1
     children: list[list["Node"]] = field(default_factory=list)  # folder pages
+    legacy_dictionary_name: bool = field(default=False, compare=False, repr=False)
 
     def describe(self) -> dict[str, Any]:
         d: dict[str, Any] = {"id": self.id, "kind": self.kind, "name": self.name}
@@ -90,6 +100,19 @@ class Node:
         if self.kind == "folder":
             d["pages"] = [[c.id for c in page] for page in self.children]
         return d
+
+    def exported_folder_pages(self) -> list[list["Node"]]:
+        # A Dock folder with no exported pages has one drop target in the editor.
+        if self.children == [[]] and not self.raw.get("iconLists") and not self.raw.get("listUniqueIdentifiers"):
+            return []
+        return self.children
+
+    def saved_folder_fields(self, *, omit_name: bool = False) -> bytes:
+        fields = {key: self.raw[key] for key in ("displayName", "listUniqueIdentifiers") if key in self.raw}
+        if omit_name:
+            fields.pop("displayName", None)
+        fields["pages"] = [[c.id for c in page] for page in self.exported_folder_pages()]
+        return hashlib.sha256(plistlib.dumps(fields, fmt=plistlib.FMT_BINARY)).digest()
 
 
 def is_widget(raw: dict[str, Any]) -> bool:
@@ -102,7 +125,8 @@ def is_folder(raw: dict[str, Any]) -> bool:
     doesn't make a folder."""
     if raw.get("listType") == "folder":
         return True
-    return "iconLists" in raw and not is_widget(raw) and raw.get("iconType") != "app"
+    return ("iconLists" in raw and not is_widget(raw) and raw.get("iconType") not in ("app", "webClip")
+            and "webClipURL" not in raw)
 
 
 def item_list(value: Any) -> list:
@@ -116,8 +140,10 @@ def _kind(raw: dict[str, Any]) -> str:
         return "widget"
     if is_folder(raw):
         return "folder"
+    if raw.get("iconType") == "app":
+        return "app"
     ident = str(raw.get("displayIdentifier") or raw.get("bundleIdentifier") or "")
-    if "webClipURL" in raw or "webclip" in ident.lower() or raw.get("iconType") == "webClip":
+    if "webClipURL" in raw or raw.get("iconType") == "webClip" or ident.lower().startswith("com.apple.webclip."):
         return "webclip"
     if raw.get("bundleIdentifier") or raw.get("displayIdentifier"):
         return "app"
@@ -141,7 +167,8 @@ def _widget_name(raw: dict[str, Any]) -> str:
 def _slots(raw: dict[str, Any], kind: str) -> int:
     if kind != "widget":
         return 1
-    return WIDGET_SLOTS.get(str(raw.get("gridSize", "small")).lower(), 4)
+    width, height = WIDGET_DIMS.get(str(raw.get("gridSize", "small")).lower(), (2, 2))
+    return width * height
 
 
 class Layout:
@@ -190,6 +217,50 @@ class Layout:
         return Layout(copy.deepcopy(self.source), self.page_slots, self.dock_slots,
                       library=copy.deepcopy(self.source_library),
                       pins=self.source_pins, grid=self.grid, identity=self.source_identity)
+
+    def recover_saved_folders(self, original: "Layout", snapshot: dict) -> None:
+        """Recover fields changed by the former serializer from that folder's independent source."""
+        receipts = snapshot.get("saved_folder_fields", {})
+        if not isinstance(receipts, dict) or any(not isinstance(v, bytes) or len(v) != 32 for v in receipts.values()):
+            raise LayoutError("saved folder evidence is invalid; read the device again")
+        identities = "identity" in snapshot and "source_identity" in snapshot
+        dictionary_read = "source_placement" in snapshot
+        prior = [n for n in original.nodes.values() if n.kind == "folder"]
+        for folder in reversed(self.nodes.values()):
+            if folder.kind != "folder" or receipts.get(folder.id) == folder.saved_folder_fields():
+                continue
+            if identities:
+                owner = original.nodes.get(folder.id)
+                if owner is None or owner.kind != "folder":
+                    continue  # A folder created in this draft.
+            else:
+                # Enumeration IDs can move when the user reorders the layout.
+                candidates = [n for n in prior if n.raw.get("uniqueIdentifier") == folder.raw.get("uniqueIdentifier")]
+                if not folder.raw.get("uniqueIdentifier") or len(candidates) > 1:
+                    def fixed_fields(node):
+                        return {k: v for k, v in node.raw.items()
+                                if k not in ("displayName", "iconLists", "listUniqueIdentifiers", "listMetadata")}
+                    candidates = [n for n in candidates if same_fields(fixed_fields(n), fixed_fields(folder))]
+                if len(candidates) > 1:
+                    children = [node_structure(c) for p in folder.children for c in p]
+                    exact = [n for n in candidates if same_fields(children, [node_structure(c) for p in n.children for c in p])]
+                    if exact:
+                        candidates = exact
+                if len(candidates) != 1:
+                    if any((not dictionary_read and _former_folder_name(folder, n)) or _missing_folder_pages(folder, n)
+                           for n in candidates):
+                        raise LayoutError("saved folder ownership is ambiguous; read the device again")
+                    continue
+                owner = candidates[0]
+            receipt = receipts.get(folder.id)
+            former_name = not dictionary_read and _former_folder_name(folder, owner)
+            _recover_folder_pages(folder, owner, receipt, former_name)
+            if former_name:
+                if receipt != folder.saved_folder_fields(omit_name=True):
+                    raise LayoutError("saved folder name is ambiguous; read the device again")
+                folder.raw = dict(folder.raw)
+                del folder.raw["displayName"]
+                folder.name = owner.name
 
     def identity(self, include_bank: bool = True) -> dict[str, Any]:
         """Local IDs in wire serialization order, separate from untouched device fields."""
@@ -271,6 +342,8 @@ class Layout:
 
     @staticmethod
     def _set_folder_pages(folder: Node, pages: list[list[Node]], origins: list[int]) -> None:
+        if not pages:
+            folder.raw = {**folder.raw, "iconLists": []}
         if "listUniqueIdentifiers" in folder.raw:
             old = folder.raw["listUniqueIdentifiers"]
             ids = [old[i] if 0 <= i < len(old) else str(uuid.uuid4()).upper() for i in origins]
@@ -390,7 +463,15 @@ class Layout:
             self.nodes[node.id] = node
             return node
         kind = _kind(raw)
+        legacy_dictionary_name = kind == "folder" and bool(raw.get(NAME_MARK))
+        if legacy_dictionary_name:
+            raw = dict(raw)
+            raw.pop(NAME_MARK)
+            if raw.get("displayName") == (raw.get("defaultDisplayName") or "Folder"):
+                raw.pop("displayName", None)
         name = str(raw.get("displayName") or raw.get("bundleIdentifier") or raw.get("displayIdentifier") or kind)
+        if kind == "folder":
+            name = str(raw.get("displayName", raw.get("defaultDisplayName", "Folder")))
         if kind == "widget":
             name = _widget_name(raw)
         bundle = raw.get("bundleIdentifier") or raw.get("displayIdentifier")
@@ -405,7 +486,7 @@ class Layout:
             while nid in self.nodes:
                 nid = self._new_id(f"{kind}:")
         node = Node(nid, kind, name, raw, bundle_id=bundle if kind in ("app", "webclip") else None,
-                    slots=_slots(raw, kind))
+                    slots=_slots(raw, kind), legacy_dictionary_name=legacy_dictionary_name)
         self.nodes[nid] = node
         if kind == "folder":
             node.children = [[self._wrap(r, nid) for r in item_list(page)] for page in item_list(raw.get("iconLists"))]
@@ -425,10 +506,7 @@ class Layout:
         if node.kind != "folder":
             return node.raw
         out = dict(node.raw)
-        out["displayName"] = node.name
-        out["iconLists"] = [[Layout._unwrap(c) for c in page] for page in node.children if page]
-        if "listUniqueIdentifiers" in out:
-            out["listUniqueIdentifiers"] = [pid for pid, page in zip(out["listUniqueIdentifiers"], node.children) if page]
+        out["iconLists"] = [[Layout._unwrap(c) for c in page] for page in node.exported_folder_pages()]
         return out
 
     def to_state(self) -> list[Any]:
@@ -511,7 +589,10 @@ class Layout:
                                   "sent there (leaving them out just makes iOS put them back)")
             return self.library
         if target.startswith("page:"):
-            idx = int(target.split(":", 1)[1])
+            try:
+                idx = int(target.split(":", 1)[1])
+            except ValueError:
+                raise LayoutError("pages are numbered from 1") from None
             while idx > len(self.pages):
                 if idx > len(self.pages) + 1:
                     raise LayoutError(f"page {idx} does not exist (there are {len(self.pages)})")
@@ -681,6 +762,8 @@ class Layout:
         del self.nodes[folder_id]
 
     def create_folder(self, name: str, item_ids: list[str], target: str, index: int | None = None) -> str:
+        if not name:
+            raise LayoutError("enter a folder name")
         if not item_ids:
             raise LayoutError("a folder needs at least one item")
         if problem := self._destination_problem("folder", target):
@@ -697,10 +780,13 @@ class Layout:
         return fid
 
     def rename_folder(self, folder_id: str, name: str) -> None:
+        if not name:
+            raise LayoutError("enter a folder name")
         node = self.get(folder_id)
         if node.kind != "folder":
             raise LayoutError(f"{folder_id} is not a folder")
         node.name = name
+        node.raw = {**node.raw, "displayName": name}
 
     def arrange(self, pages: list[list[str]], dock: list[str] | None = None,
                 library: list[str] | None = None) -> None:
@@ -718,9 +804,10 @@ class Layout:
         wanted = dock + [i for p in pages for i in p] + library
         banked = [n.id for n in self.bank]
         current = [n.id for n in self.dock] + [n.id for p in self.pages for n in p] + lib_now + banked
-        dupes = sorted({i for i in wanted if wanted.count(i) > 1})
-        missing = sorted(set(current) - set(wanted) - set(banked))
-        extra = sorted(set(wanted) - set(current))
+        counts = Counter(wanted)
+        dupes = sorted(i for i, count in counts.items() if count > 1)
+        missing = sorted(set(current).difference(counts, banked))
+        extra = sorted(counts.keys() - set(current))
         problems = []
         if dupes:
             problems.append(f"listed twice: {dupes}")
@@ -739,7 +826,7 @@ class Layout:
         self.repack_pages([[self.nodes[i] for i in p] for p in pages])
         if self.library is not None:
             self.library = [self.nodes[i] for i in library]
-        self.bank = [n for n in self.bank if n.id not in set(wanted)]
+        self.bank = [n for n in self.bank if n.id not in counts]
         new_page = {i: k for k, p in enumerate(pages) for i in p}  # a pin survives only on the same page
         self.pins = {k: v for k, v in self.pins.items() if old_page.get(k) == new_page.get(k) is not None}
 
@@ -769,7 +856,8 @@ class Layout:
 
     # ---- checks -----------------------------------------------------------------
 
-    def validate(self, original: "Layout | None" = None) -> list[str]:
+    def validate(self, original: "Layout | None" = None, *,
+                 page_problems: dict[int, list[str]] | None = None) -> list[str]:
         """Problems that would make iOS reflow or drop things. Empty list = OK."""
         errs = []
         if self.bank:
@@ -794,7 +882,8 @@ class Layout:
                 errs.append(f"page {i} needs {used} slots (max {self.page_slots})")
             elif any(n.id in self.pins for n in page) or (
                     shape(page) not in as_read and any(n.kind == "widget" for n in page)):
-                errs += [f"page {i}: {p}" for p in self.place(page)[1]]
+                problems = self.place(page)[1] if page_problems is None else page_problems[i]
+                errs += [f"page {i}: {p}" for p in problems]
         for page in [self.dock, *self.pages]:
             for n in page:
                 if n.kind == "folder":
@@ -862,7 +951,7 @@ class Layout:
 
         def walk(nodes: list[Node], where: str) -> None:
             for i, n in enumerate(nodes, 1):
-                pos[n.id] = f"{where} #{i}"
+                pos[n.id] = where if where == "App Bank" else f"{where} #{i}"
                 if n.kind == "folder":
                     for j, page in enumerate(n.children, 1):
                         suffix = f" [{n.id}]" if n.id in qualified else ""
@@ -873,8 +962,7 @@ class Layout:
             walk(page, f"page {i}")
         for n in self.library or []:
             pos[n.id] = "App Library"
-        for n in self.bank:
-            pos[n.id] = "App Bank"
+        walk(self.bank, "App Bank")
         return pos
 
     def containers(self) -> dict[str, list[str]]:
@@ -894,13 +982,18 @@ class Layout:
         if self.library is not None:
             out["App Library"] = [n.id for n in self.library]
         if self.bank:
-            out["App Bank"] = [n.id for n in self.bank]
+            walk(self.bank, "App Bank")
         return out
 
     def diff(self, original: "Layout | None" = None) -> dict[str, Any]:
-        """Items that really moved: changed container, or broke relative order within one.
-        Icons that only slid over because a neighbor moved don't count."""
-        src = self.original() if original is None else original
+        """Return the changes to review before applying the draft."""
+        result, _, _ = self.review(self.original() if original is None else original)
+        return result
+
+    def review(self, src: "Layout", *, page_cells: dict[int, PageCells] | None = None,
+               page_problems: dict[int, list[str]] | None = None,
+               location_ids: set[str] | None = None) -> tuple[dict[str, Any], LocationMap, LocationMap]:
+        """Compare placement and wire state and resolve the requested presentation locations."""
         qualified = self.qualified_folders(src)
         old, new = src.positions(qualified), self.positions(qualified)
         old_c, new_c = src.containers(), self.containers()
@@ -912,18 +1005,41 @@ class Layout:
             for i in ids:
                 if i in old and i not in keep and not i.startswith(("folder:", "widget:")):
                     moved[i] = f"{old[i]} -> {new[i]}"
-        names = {k: self.nodes[k].name for k in moved}
+        has_changes = _has_changes(self, src)
+        pins = {k for k in self.pins.keys() | self.source_pins.keys() if self.pins.get(k) != self.source_pins.get(k)}
+        old_cells = {}
+        placements = {}
+        if has_changes:
+            if page_cells is None:
+                page_cells = {page: self.place(nodes)[0] for page, nodes in enumerate(self.pages, 1)}
+            old_cells = _original_cells(src, self, page_cells, pins)
+            placements = _placement_changes(self, src, pins, old_cells, page_cells)
+        changed = moved.keys() | placements.keys()
+        wanted = changed | (location_ids or set())
+        physical = set(placements)
+        old_locations = _locations(src, changed, physical, old_cells, qualified) if changed else {}
+        new_locations = _locations(self, wanted, physical, page_cells or {}, qualified) if wanted else {}
+        move_details = {}
+        for nid, node in self.nodes.items():
+            if nid in moved:
+                move_details[f"{node.name} [{nid}]"] = {
+                    "id": nid, "name": node.name, "from": old_locations[nid][1], "to": new_locations[nid][1]}
+        for nid, change in placements.items():
+            change["from"] = old_locations[nid][1] if nid in old_locations else None
+            change["to"] = new_locations[nid][1] if nid in new_locations else None
         return {
             "items_moved": len(moved),
             "pages_before": len(self.source) - 1,
             "pages_after": len(self.pages),
             "to_app_library": sum(1 for v in moved.values() if v.endswith("-> App Library")),
-            "gaps_changed": len({k for k in set(self.pins) | set(self.source_pins)
-                                 if self.pins.get(k) != self.source_pins.get(k)}),
-            "moves": {f"{names[k]} [{k}]": v for k, v in sorted(moved.items(), key=lambda kv: kv[1])},
-            "problems": self.validate(src),
+            "gaps_changed": len(pins),
+            "moves": {f"{self.nodes[k].name} [{k}]": v for k, v in sorted(moved.items(), key=lambda kv: kv[1])},
+            "has_changes": has_changes,
+            "move_details": move_details,
+            "placement_changes": list(placements.values()),
+            "problems": self.validate(src, page_problems=page_problems),
             "apply_token": self.token(),
-        }
+        }, old_locations, new_locations
 
     def library_structure(self) -> list[Any] | None:
         if self.library is None:
@@ -939,6 +1055,194 @@ class Layout:
                                "page_origins": self.page_origins, "page_origins_known": self.page_origins_known},
                               fmt=plistlib.FMT_BINARY, sort_keys=True)
         return "apply-" + hashlib.sha256(blob).hexdigest()[:10]
+
+
+def same_fields(a: Any, b: Any) -> bool:
+    """Python equality merges plist integers, booleans and reals."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(same_fields(value, b[key]) for key, value in a.items())
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same_fields(x, y) for x, y in zip(a, b))
+    if isinstance(a, float):
+        return struct.pack(">d", a) == struct.pack(">d", b)
+    return a == b
+
+
+def _former_folder_name(folder: Node, original: Node) -> bool:
+    former = str(original.raw.get("bundleIdentifier") or original.raw.get("displayIdentifier") or "folder")
+    return (not original.legacy_dictionary_name and not folder.legacy_dictionary_name
+            and "displayName" not in original.raw and folder.raw.get("displayName") == former)
+
+
+def _missing_folder_pages(folder: Node, original: Node) -> list[int]:
+    pages = original.exported_folder_pages()
+    ids = original.raw.get("listUniqueIdentifiers")
+    if ids is not None:
+        current = set(folder.raw.get("listUniqueIdentifiers", []))
+        return [i for i, page in enumerate(pages) if not page and ids[i] not in current]
+    if len(folder.exported_folder_pages()) < len(pages) and all(folder.exported_folder_pages()):
+        return [i for i, page in enumerate(pages) if not page]
+    return []
+
+
+def _recover_folder_pages(folder: Node, original: Node, receipt: bytes | None, former_name: bool) -> None:
+    missing = _missing_folder_pages(folder, original)
+    if not missing:
+        return
+    original_pages = original.exported_folder_pages()
+    current = folder.exported_folder_pages()
+    ids = original.raw.get("listUniqueIdentifiers")
+    metadata_proves_ownership = False
+    if ids is None:
+        if len(current) != sum(bool(page) for page in original_pages):
+            raise LayoutError("saved folder pages are ambiguous; read the device again")
+        remaining = iter(current)
+        children = [next(remaining) if page else [] for page in original_pages]
+    else:
+        before = original.raw.get("listMetadata", {})
+        after = folder.raw.get("listMetadata", {})
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise LayoutError("saved folder page metadata is ambiguous; read the device again")
+        retired = [ids[i] for i in missing]
+        removed = [pid for pid in retired if pid in before and pid not in after]
+        if len(removed) == len(retired):
+            return  # An intentional retirement also discards metadata for those owners.
+        if removed or any(pid in after and (pid not in before or not same_fields(before[pid], after[pid]))
+                          for pid in retired):
+            raise LayoutError("saved folder page metadata is ambiguous; read the device again")
+        saved_ids = folder.raw.get("listUniqueIdentifiers", [])
+        if all(current):
+            omitted = set(retired)
+            projected_ids = [pid for pid in ids if pid not in omitted]
+        else:
+            projected_ids = [pid for pid, page in zip(ids, original_pages) if page]
+        if saved_ids != projected_ids:
+            if any(not page for page in current) and not any(pid in after for pid in retired):
+                return  # The former serializer never kept an empty editable page.
+            raise LayoutError("saved folder page ownership is ambiguous; read the device again")
+        metadata_proves_ownership = all(pid in before and pid in after for pid in retired)
+        saved_pages = dict(zip(saved_ids, current))
+        children = [saved_pages.get(pid, []) for pid in ids]
+
+    raw = {**folder.raw, "iconLists": [[Layout._unwrap(child) for child in page] for page in children]}
+    if ids is not None:
+        raw["listUniqueIdentifiers"] = list(ids)
+    candidate = replace(folder, raw=raw, children=children)
+    if not metadata_proves_ownership and (receipt is None or
+            (receipt != candidate.saved_folder_fields() and
+             not (former_name and receipt == candidate.saved_folder_fields(omit_name=True)))):
+        raise LayoutError("saved folder pages are ambiguous; read the device again")
+    folder.raw, folder.children = raw, children
+
+
+def _has_changes(lay: Layout, original: Layout) -> bool:
+    if (lay.bank or lay.pins != lay.source_pins or lay.page_origins != list(range(len(lay.source) - 1)) or
+            lay.identity()["ids"] != lay.source_identity["ids"] or
+            not same_fields(lay.to_library(), lay.source_library)):
+        return True
+    state = lay.to_state()
+    # Legacy drafts can normalize an imported folder's wire representation.
+    return not same_fields(state, lay.source) and not same_fields(state, original.to_state())
+
+
+def _original_cells(original: Layout, lay: Layout, current_cells: dict[int, PageCells],
+                    pinned: set[str]) -> dict[int, PageCells]:
+    """Reuse current geometry when order, footprints and anchors match the original page."""
+    cells = {}
+    for page, nodes in enumerate(original.pages, 1):
+        if not any(n.kind in ("widget", "folder") or n.id in pinned for n in nodes):
+            continue
+        current = lay.pages[page - 1] if page <= len(lay.pages) else []
+        same = (len(nodes) == len(current) and original.grid == lay.grid and
+                all(old.id == new.id and original.dims(old) == lay.dims(new)
+                    and original.pins.get(old.id) == lay.pins.get(new.id) for old, new in zip(nodes, current)))
+        cells[page] = current_cells[page] if same else original.place(nodes)[0]
+    return cells
+
+
+def _special_positions(
+    lay: Layout, pinned: set[str], cells: dict[int, PageCells]
+) -> dict[str, tuple[str, int, int, _GridPosition | None]]:
+    positions = {}
+    for kind, page, nodes in [("dock", 0, lay.dock), ("bank", 0, lay.bank),
+                              *(("page", p, nodes) for p, nodes in enumerate(lay.pages, 1))]:
+        for index, node in enumerate(nodes, 1):
+            if node.kind in ("folder", "widget") or node.id in pinned:
+                positions[node.id] = (kind, page, index, cells.get(page, {}).get(node.id))
+    return positions
+
+
+def _placement_changes(lay: Layout, original: Layout, pins: set[str], old_cells: dict[int, PageCells],
+                       new_cells: dict[int, PageCells]) -> dict[str, dict[str, Any]]:
+    old = _special_positions(original, pins, old_cells)
+    new = _special_positions(lay, pins, new_cells)
+    changes = {}
+    for nid in sorted(old.keys() | new.keys()):
+        before, after = original.nodes.get(nid), lay.nodes.get(nid)
+        node = after or before
+        reason = None
+        if nid not in old and node.kind in ("folder", "widget"):
+            reason = "added"
+        elif nid not in new and node.kind in ("folder", "widget"):
+            reason = "removed"
+        elif before and after and before.name != after.name:
+            reason = "renamed"
+        elif nid in pins:
+            reason = "pinned" if nid in lay.pins else "unpinned"
+        elif node.kind == "folder" and (
+            [[n.id for n in p] for p in before.children if p] != [[n.id for n in p] for p in after.children if p]
+            or not same_fields(original._unwrap(before), lay._unwrap(after))
+        ):
+            reason = "edited"
+        elif node.kind == "widget" and not same_fields(before.raw, after.raw):
+            reason = "edited"
+        if reason or old.get(nid) != new.get(nid):
+            row = {"id": nid, "kind": node.kind, "name": lay.widget_label(node) if node.kind == "widget" else node.name,
+                   "reason": reason or "moved"}
+            if reason == "renamed":
+                row["before_name"] = before.name
+            changes[nid] = row
+    return changes
+
+
+def _locations(lay: Layout, wanted: set[str], physical: set[str],
+               page_cells: dict[int, PageCells],
+               qualified: set[str]) -> LocationMap:
+    """Only materialize endpoints needed by Review or the visible usage list."""
+    found = {}
+
+    def walk(nodes: list[Node], kind: str, where: str, page: int = 0, name: str = "", folder_id: str = "") -> None:
+        cells = page_cells.get(page, {}) if kind == "page" else {}
+        for index, node in enumerate(nodes, 1):
+            if node.id in wanted:
+                descriptor = {"kind": kind}
+                raw = where
+                if kind not in ("library", "bank"):
+                    descriptor["index"] = index
+                    raw += f" #{index}"
+                if page:
+                    descriptor["page"] = page
+                if kind == "folder":
+                    descriptor["name"] = name
+                    if folder_id in qualified:
+                        descriptor["folder_id"] = folder_id
+                if node.id in physical and node.id in cells:
+                    row, col, _, _ = cells[node.id]
+                    descriptor.update(row=row + 1, column=col + 1)
+                found[node.id] = (raw, descriptor)
+            if node.kind == "folder":
+                for p, children in enumerate(node.children, 1):
+                    suffix = f" [{node.id}]" if node.id in qualified else ""
+                    walk(children, "folder", f"folder {node.name!r}{suffix} p{p}", p, node.name, node.id)
+
+    walk(lay.dock, "dock", "dock")
+    for page, nodes in enumerate(lay.pages, 1):
+        walk(nodes, "page", f"page {page}", page)
+    walk(lay.library or [], "library", "App Library")
+    walk(lay.bank, "bank", "App Bank")
+    return found
 
 
 def _lcs(a: list[str], b: list[str]) -> set[str]:

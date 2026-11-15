@@ -44,9 +44,36 @@ def test_localization_resources_follow_manifest_and_shared_display_names(tmp_pat
     for code in codes:
         assert (resources / f"Localization/{code}.json").read_bytes() == (LOCALES / f"{code}.json").read_bytes()
         display = plistlib.loads((resources / f"{code}.lproj/InfoPlist.strings").read_bytes())
-        expected = {"zh-Hans": "屏幕整理", "zh-Hant": "螢幕整理"}.get(code, "Screen Organizer")
+        expected = json.loads((LOCALES / f"{code}.json").read_bytes())["app.name"]
         assert display == {"CFBundleName": expected, "CFBundleDisplayName": expected}
     assert command("check-localization", app).returncode == 0
+
+
+@pytest.mark.parametrize("code, base, expected", [
+    ("zh-Hant-HK", "zh-Hant", "螢幕整理"), ("zh-Hans-CN", "zh-Hans", "屏幕整理"),
+    ("fr-CA", "fr", "Screen Organizer"),
+])
+def test_regional_display_name_is_validated_and_packaged(tmp_path, code, base, expected):
+    from tools.check_translations import validate
+
+    locales = tmp_path / "locales"
+    shutil.copytree(LOCALES, locales)
+    manifest = json.loads((locales / "manifest.json").read_bytes())
+    registered = {entry["code"] for entry in manifest["languages"]}
+    if code not in registered:
+        manifest["languages"].append({"code": code, "name": code, "aliases": [code]})
+        (locales / "manifest.json").write_text(json.dumps(manifest))
+        shutil.copyfile(locales / f"{base}.json", locales / f"{code}.json")
+    assert validate(locales) == []
+    app = make_app(tmp_path)
+    result = command("localize", app, locales)
+    assert result.returncode == 0, result.stderr
+    names = plistlib.loads((app / f"Contents/Resources/{code}.lproj/InfoPlist.strings").read_bytes())
+    assert names == {"CFBundleDisplayName": expected, "CFBundleName": expected}
+    catalog = locales / f"{code}.json"
+    catalog.write_text(json.dumps({**json.loads(catalog.read_bytes()), "app.name": "Wrong name"}))
+    assert any("app.name" in error for error in validate(locales))
+    assert command("localize", app, locales).returncode != 0
 
 
 @pytest.mark.parametrize("italian_registered,contribution", [

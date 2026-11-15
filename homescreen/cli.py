@@ -101,6 +101,9 @@ def main() -> None:
         return
     try:
         sys.exit(asyncio.run(run(args)))
+    except PermissionError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
     except (LayoutError, ValueError, TimeoutError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)

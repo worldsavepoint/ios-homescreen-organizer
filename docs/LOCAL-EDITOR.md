@@ -9,9 +9,11 @@ API credentials are transmitted in request headers.
 
 `POST /v1/authenticate`
 
-Send `X-Token: <HOMESCREEN_UI_TOKEN>`. A successful request returns
-`{"ok": true}` and sets the `homescreen_session` HttpOnly, SameSite=Strict cookie.
-Browser mutation requests include the matching local `Origin` header.
+Send the launch token in the `X-Token` header. A successful response includes
+`ok` and a `credential` for that editor origin. The browser keeps the credential
+in the tab's session storage across reloads and sends it in `X-Editor-Session`
+on same-origin API and icon requests. Browser mutation requests include the
+matching local `Origin` header. Direct clients can use `X-Token` on API requests.
 The existing `/api/auth` route remains an alias.
 
 ## Backend health [since this fork]

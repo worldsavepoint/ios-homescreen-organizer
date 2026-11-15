@@ -5,16 +5,29 @@
 const t = (key, params) => globalThis.ScreenOrganizerI18n?.t(key, params) || key;
 const number = value => ScreenOrganizerI18n.formatNumber(value);
 
-// Read the launcher credential from the fragment and remove the fragment.
-// Authenticate with /v1/authenticate; reloads reuse the HttpOnly session cookie.
+// A tab keeps its editor credential across reloads at this origin.
+const editorSessionKey = "screenOrganizer.editorSession";
+let editorCredential = "";
+function withTabStorage(action) {
+  try { return action(globalThis.sessionStorage); }
+  catch (_) { /* The current page can use its in-memory credential. */ }
+}
 const authentication = (async () => {
   const token = new URLSearchParams(location.hash.slice(1)).get("token");
   if (location.hash) history.replaceState(null, "", location.pathname + location.search);
-  if (!token) return;
+  if (!token) {
+    editorCredential = withTabStorage(store => store?.getItem(editorSessionKey)) || "";
+    return;
+  }
+  withTabStorage(store => store?.removeItem(editorSessionKey));
   const response = await fetch("/v1/authenticate", {
-    method: "POST", headers: { "X-Token": token }, credentials: "same-origin",
+    method: "POST", headers: { "X-Token": token }, mode: "same-origin", credentials: "omit", redirect: "error",
   });
   if (!response.ok) return {code: "invalid_credentials"};
+  const {credential} = await response.json();
+  if (typeof credential !== "string" || !credential) return {code: "invalid_credentials"};
+  editorCredential = credential;
+  withTabStorage(store => store?.setItem(editorSessionKey, credential));
 })().catch(() => ({code: "invalid_credentials"}));
 
 const $ = (s) => document.querySelector(s);
@@ -63,7 +76,7 @@ function errorKey(message, code) {
   if (code === "read_only" || message === "read-only mode: device writes are disabled") return "editor.readOnly";
   if (code === "invalid_credentials") return "editor.authenticationFailed";
   if (/ (?:doesn't fit|can't be pinned) at row \d+, column \d+$/.test(message)) return "error.position";
-  if (message === "the saved draft changed in another session; reopen it or read the device again") return "error.staleDraft";
+  if (code === "stale_draft" || message === "the saved draft changed in another session; reopen it or read the device again") return "error.staleDraft";
   if (message === "the device placement changed in another session; read the device again" ||
       message === "device grid metrics must be positive integers; read the device again" ||
       message === "exported page grid dimensions are invalid or inconsistent") return "error.readAgain";
@@ -126,8 +139,7 @@ let query = "";
 
 // ---- server ----------------------------------------------------------------------------
 
-async function api(path, body, binding = V?.binding) {
-  await globalThis.ScreenOrganizerOnboarding?.ready;
+async function editorFetch(path, options = {}) {
   const authenticationFailure = await authentication;
   if (authenticationFailure) {
     await globalThis.ScreenOrganizerI18n?.ready;
@@ -135,6 +147,13 @@ async function api(path, body, binding = V?.binding) {
     error.code = authenticationFailure.code;
     throw error;
   }
+  const headers = {...options.headers};
+  if (editorCredential) headers["X-Editor-Session"] = editorCredential;
+  return fetch(path, {...options, headers, mode: "same-origin", credentials: "omit", redirect: "error"});
+}
+
+async function api(path, body, binding = V?.binding) {
+  await globalThis.ScreenOrganizerOnboarding?.ready;
   if (V && V.read_only && ["/api/apply", "/api/restore"].includes(path)) {
     throw Object.assign(new Error(t("editor.readOnly")), {code: "read_only"});
   }
@@ -143,7 +162,7 @@ async function api(path, body, binding = V?.binding) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({...body, binding}),
   };
-  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  const r = await editorFetch(path, opts);
   let data = {};
   try { data = await r.json(); } catch (_) { /* empty body */ }
   if (!r.ok) {
@@ -177,15 +196,111 @@ async function withBusy(text, fn) {
 
 // ---- helpers ---------------------------------------------------------------------------
 
+const iconWork = new Map();
+const pendingIcons = new Map();
+
+function acquireIcon(bundle, revision) {
+  const device = V?.binding?.device ?? V?.device_id;
+  const key = JSON.stringify([device, revision, bundle]);
+  let request = pendingIcons.get(key);
+  if (!request) {
+    request = {controller: new AbortController(), users: 0};
+    pendingIcons.set(key, request);
+    const read = () => editorFetch("/icon?id=" + encodeURIComponent(bundle), {
+      headers: revision ? {"X-Draft-Revision": revision} : {}, signal: request.controller.signal,
+    });
+    request.result = read().then(async response => {
+      // A rejected edit can replace the layout without changing its saved revision.
+      if (response.status === 409 && pendingIcons.get(key) === request &&
+          device === (V?.binding?.device ?? V?.device_id) && revision === V?.binding?.revision) {
+        response = await read();
+      }
+      return {status: response.status, bytes: response.ok ? await response.blob() : null};
+    }).finally(() => {
+      if (pendingIcons.get(key) === request) pendingIcons.delete(key);
+    });
+  }
+  request.users++;
+  return {result: request.result, release() {
+    if (--request.users === 0 && pendingIcons.get(key) === request) {
+      pendingIcons.delete(key);
+      request.controller.abort();
+    }
+  }};
+}
+
+function leaveIconRead(work) {
+  work.interest?.release();
+  work.interest = null;
+}
+
+const visibleIcons = new IntersectionObserver(entries => {
+  for (const {target, isIntersecting} of entries) {
+    const work = iconWork.get(target);
+    if (!work) continue;
+    if (isIntersecting && !work.interest) loadIcon(target, work);
+    if (!isIntersecting && !work.url) leaveIconRead(work);
+  }
+}, {rootMargin: "100px"});
+
+function releaseIcon(img) {
+  const work = iconWork.get(img);
+  if (!work) return;
+  visibleIcons.unobserve(img);
+  leaveIconRead(work);
+  if (work.url) URL.revokeObjectURL(work.url);
+  img.onload = img.onerror = null;
+  iconWork.delete(img);
+}
+
+new MutationObserver(records => {
+  if (!iconWork.size) return;
+  for (const record of records) {
+    for (const node of record.removedNodes) {
+      if (node.nodeType !== 1 || node.isConnected) continue;
+      if (node.tagName === "IMG") releaseIcon(node);
+      node.querySelectorAll("img").forEach(releaseIcon);
+    }
+  }
+}).observe(document, {childList: true, subtree: true});
+
+async function loadIcon(img, work) {
+  const revision = V?.binding?.revision;
+  const interest = acquireIcon(work.bundle, revision);
+  work.interest = interest;
+  const current = () => img.isConnected && iconWork.get(img) === work && work.interest === interest;
+  const failed = () => {
+    if (!current()) return;
+    const wrap = img.parentNode;
+    releaseIcon(img);
+    img.remove();
+    fallback(wrap, work.name);
+  };
+  try {
+    const {status, bytes} = await interest.result;
+    if (!current()) return;
+    if (status === 409 && revision !== V?.binding?.revision) {
+      leaveIconRead(work);
+      return loadIcon(img, work);
+    }
+    if (!bytes) return failed();
+    work.url = URL.createObjectURL(bytes);
+    img.onload = () => releaseIcon(img);
+    img.onerror = failed;
+    img.src = work.url;
+  } catch (_) {
+    failed();
+  }
+}
+
 function iconImg(item, cls) {
   const wrap = el("div", cls || "tile");
   if (item.icon) {
     const img = new Image();
-    img.loading = "lazy";
     img.alt = "";
-    img.src = "/icon?id=" + encodeURIComponent(item.icon);
-    img.onerror = () => { img.remove(); fallback(wrap, item.name); };
     wrap.appendChild(img);
+    iconWork.set(img, {bundle: item.icon, name: item.name});
+    visibleIcons.observe(img);
   } else {
     fallback(wrap, item.name);
   }
@@ -343,21 +458,42 @@ function clearEditor() {
 
 function setView(v) {
   const deviceChanged = V && V.device_id !== v.device_id;
-  if (!v.loaded || deviceChanged) clearEditor();
+  if (!v.loaded || deviceChanged) {
+    clearEditor();
+    for (const img of iconWork.keys()) releaseIcon(img);
+    libraryData = null;
+    libraryRows.clear();
+    $("#library").replaceChildren();
+  }
   V = v;
   movedIds = new Set(v.loaded ? v.moved || [] : []);
   for (const id of [...sel]) if (!findItem(id)) sel.delete(id);
-  if (openFolder && !findItem(openFolder)) openFolder = null;
+  if (openFolder && !findItem(openFolder)) {
+    openFolder = null;
+    folderOpener = null;
+  }
   render(!deviceChanged);
 }
 
-function focusItem(item) {
-  if (!item) return;
-  const controls = [...document.querySelectorAll("[data-focus-context]")].filter(node => !node.disabled);
-  const node = controls.find(node => node.dataset.id === item.id && node.dataset.focusContext === item.context)
-    || controls.find(node => item.id && node.dataset.id === item.id)
-    || controls.find(node => item.page && node.dataset.focusContext.startsWith(`page:${item.page}:`));
-  node?.focus({preventScroll: true});
+function focusItem(item, reveal = false) {
+  if (!item) return false;
+  const controls = [...document.querySelectorAll("[data-focus-context]")];
+  const visible = node => !node.disabled && !node.closest("[inert]")?.inert &&
+    (!node.getClientRects || node.getClientRects().length);
+  const node = controls.find(node => node.dataset.id === item.id && node.dataset.focusContext === item.context && visible(node))
+    || controls.find(node => item.id && node.dataset.id === item.id && visible(node))
+    || controls.find(node => item.page && node.dataset.focusContext.startsWith(`page:${item.page}:`) && visible(node));
+  if (!node) return false;
+  node.focus({preventScroll: !reveal});
+  if (!reveal) return true;
+  const rect = node.getBoundingClientRect();
+  return document.activeElement === node &&
+    node.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2));
+}
+
+function focusEditorContext() {
+  const field = openFolder ? $("#folder-name") : $("#search");
+  (field.disabled ? $("#read") : field).focus();
 }
 
 function render(restoreFocus = true) {
@@ -365,14 +501,30 @@ function render(restoreFocus = true) {
   const focused = active && {id: active.dataset.id, context: active.dataset.focusContext};
   $("#read-only-notice").hidden = !(V && V.read_only);
   const loaded = V && V.loaded;
+  const recovery = $("#draft-recovery");
+  const draftError = !loaded && V?.draft_error;
+  recovery.hidden = !draftError;
+  if (draftError && recovery.querySelector("pre")?.textContent !== draftError) {
+    const notice = localizedEl("p", null, () => t("editor.savedDraftUnavailable"));
+    notice.setAttribute("role", "status");
+    recovery.replaceChildren(notice, diagnostic(draftError));
+  } else if (!draftError && recovery.firstChild) {
+    recovery.replaceChildren();
+  }
   $("#empty").hidden = loaded;
   $("#board").hidden = !loaded;
   $("#library-panel").hidden = !loaded;
   for (const id of ["undo", "redo", "reset", "organize-btn", "search"]) $("#" + id).disabled = !loaded;
   if (!loaded) {
+    if (!$("#organize-menu").hidden) {
+      const focused = $("#organize-menu").contains(document.activeElement);
+      setPopup("organize", false);
+      if (focused) $("#read-empty").focus();
+    }
     $("#device").textContent = V && V.source && V.source !== "phone" ? V.source : (deviceLabel() || t("editor.noDevice"));
     $("#read").textContent = t("editor.readDevice");
     $("#drawer").hidden = true;
+    syncDrawerCoverage();
     $("#folder-pages").replaceChildren();
     $("#folder-name").value = "";
     $("#selection-bar").hidden = true;
@@ -394,7 +546,7 @@ function render(restoreFocus = true) {
   renderSelection();
   renderFooter();
   focusItem(focused);
-  positionOrganizeMenu();
+  positionPopups();
 }
 
 function itemControl(node, item, context) {
@@ -408,11 +560,12 @@ function itemControl(node, item, context) {
     node.setAttribute("aria-expanded", String(openFolder === item.id));
     node.setAttribute("aria-controls", "drawer");
   }
-  node.addEventListener("click", event => onItemClick(event, item, context));
+  const activate = event => onItemClick(event, node.libraryItem || item, context);
+  node.addEventListener("click", activate);
   node.addEventListener("keydown", event => {
     if (!["Enter", " "].includes(event.key)) return;
     event.preventDefault();
-    if (!event.repeat) onItemClick(event, item, context);
+    if (!event.repeat) activate(event);
   });
 }
 
@@ -533,54 +686,60 @@ function renderPages() {
   box.appendChild(add);
 }
 
-let libraryCollator, libraryLocale;
-let libraryData, libraryQuery, libraryMoved, libraryRenderedLocale, librarySelection = new Set();
-const libraryRows = new Map();
+let libraryCollator, libraryLocale, libraryData, libraryOrder = [];
+let libraryRows = new Map();
 function renderLibrary() {
   const list = $("#library");
-  if (libraryData === V.library && libraryQuery === query && libraryMoved === movedIds
-      && libraryRenderedLocale === ScreenOrganizerI18n.locale) {
-    for (const id of new Set([...librarySelection, ...sel])) {
-      const row = libraryRows.get(id);
-      if (!row) continue;
-      row.classList.toggle("selected", sel.has(id));
-      row.setAttribute("aria-pressed", String(sel.has(id)));
-    }
-    librarySelection = new Set([...sel].filter(id => libraryRows.has(id)));
-    return;
-  }
-  libraryData = V.library;
-  libraryQuery = query;
-  libraryMoved = movedIds;
-  libraryRenderedLocale = ScreenOrganizerI18n.locale;
-  libraryRows.clear();
-  librarySelection = new Set();
-  list.replaceChildren();
-  if (V.library === null) {
-    $("#lib-count").textContent = "";
-    list.appendChild(localizedEl("div", "lib-empty", () => t("editor.libraryUnavailable")));
-    return;
-  }
   if (libraryLocale !== ScreenOrganizerI18n.locale) {
     libraryLocale = ScreenOrganizerI18n.locale;
     libraryCollator = new Intl.Collator(libraryLocale);
+    libraryData = null;
+    libraryRows.clear();
+    list.replaceChildren();
   }
-  const items = V.library.filter(matches).sort((a, b) => libraryCollator.compare(a.name, b.name));
-  $("#lib-count").textContent = query ? t("editor.matchCount", {count: number(items.length), total: number(V.library.length)}) : number(V.library.length);
-  if (!items.length) list.appendChild(el("div", "lib-empty", query ? t("editor.noMatches") : t("editor.libraryEmpty")));
-  for (const it of items) {
-    const row = el("div", "lib-row");
-    row.dataset.id = it.id;
-    row.append(iconImg(it), el("span", "n", it.name));
-    row.title = it.id;
-    if (sel.has(it.id)) row.classList.add("selected");
-    if (movedIds.has(it.id)) row.classList.add("moved");
-    itemControl(row, it, "library");
-    wireDrag(row, it, { target: "library" });
-    list.appendChild(row);
-    libraryRows.set(it.id, row);
-    if (sel.has(it.id)) librarySelection.add(it.id);
+  const items = V.library;
+  if (items && (!libraryData || items.length !== libraryData.length || (items !== libraryData &&
+      items.some((item, i) => item.id !== libraryData[i].id || item.name !== libraryData[i].name)))) {
+    libraryOrder = [...items.keys()].sort((a, b) => libraryCollator.compare(items[a].name, items[b].name));
   }
+  libraryData = items;
+  const visible = items ? libraryOrder.map(i => items[i]).filter(matches) : [];
+  $("#lib-count").textContent = !items ? "" : query
+    ? t("editor.matchCount", {count: number(visible.length), total: number(items.length)}) : number(items.length);
+  if (!visible.length) {
+    libraryRows.clear();
+    const key = !items ? "editor.libraryUnavailable" : query ? "editor.noMatches" : "editor.libraryEmpty";
+    list.replaceChildren(localizedEl("div", "lib-empty", () => t(key)));
+    return;
+  }
+  const next = new Map();
+  for (const item of visible) {
+    let row = libraryRows.get(item.id);
+    const old = row?.libraryItem;
+    if (!old || old.name !== item.name || old.icon !== item.icon || old.kind !== item.kind) {
+      row = el("div", "lib-row");
+      row.dataset.id = row.title = item.id;
+      row.append(iconImg(item), el("span", "n", item.name));
+      itemControl(row, item, "library");
+      wireDrag(row, item, {target: "library"});
+    }
+    row.libraryItem = item;
+    setSelected(row, sel.has(item.id));
+    const moved = movedIds.has(item.id);
+    if (row.classList.contains("moved") !== moved) row.classList.toggle("moved", moved);
+    next.set(item.id, row);
+  }
+  if (!libraryRows.size) {
+    list.replaceChildren(...next.values());
+  } else {
+    for (const [id, row] of libraryRows) if (next.get(id) !== row) row.remove();
+    let i = 0;
+    for (const row of next.values()) {
+      if (list.children[i] !== row) list.insertBefore(row, list.children[i] || null);
+      i++;
+    }
+  }
+  libraryRows = next;
 }
 
 function renderBank() {
@@ -642,6 +801,7 @@ function renderUsage() {
 function renderDrawer() {
   const folder = openFolder && findItem(openFolder);
   $("#drawer").hidden = !folder;
+  syncDrawerCoverage();
   if (!folder) return;
   const name = $("#folder-name");
   if (document.activeElement !== name) name.value = folder.name;
@@ -651,7 +811,7 @@ function renderDrawer() {
     const fp = el("div", "fpage");
     fp.appendChild(localizedEl("div", "num", () => t("editor.folderPage", {number: number(i + 1), count: number(page.length), capacity: number(G().folder)})));
     const g = el("div", "fgrid");
-    g.style.setProperty("--fcols", Math.round(Math.sqrt(G().folder)));
+    g.style.setProperty("--fcols", G().folder_columns || Math.round(Math.sqrt(G().folder)));
     const ctx = { target: `${folder.id}:${i + 1}` };
     for (const it of page) g.appendChild(renderItem(it, ctx));
     fp.appendChild(g);
@@ -660,13 +820,57 @@ function renderDrawer() {
   });
 }
 
+function syncDrawerCoverage() {
+  const drawer = $("#drawer"), main = $("#main"), board = $("#board"), library = $("#library-panel");
+  const open = !drawer.hidden;
+  main.classList.toggle("drawer-open", open);
+  let covered = false;
+  if (open) {
+    const grid = board.querySelector(".grid") || $("#dock");
+    const cellWidth = parseFloat(getComputedStyle(grid).gridTemplateColumns);
+    const exposed = drawer.getBoundingClientRect().left - board.getBoundingClientRect().left;
+    const available = Math.min(exposed, $("#pages").getBoundingClientRect().width);
+    covered = !(cellWidth > 0 && available >= cellWidth);
+  }
+  const active = document.activeElement;
+  const redirect = open && (library.contains(active) || (covered && (board.contains(active) || active === main)));
+  board.inert = covered;
+  library.inert = open;
+  if (covered) main.setAttribute("tabindex", "-1");
+  else main.removeAttribute("tabindex");
+  if (redirect && !ScreenOrganizerOnboarding.dialog) $("#folder-name").focus();
+}
+
 function renderSelection() {
   const bar = $("#selection-bar");
   bar.hidden = sel.size === 0;
   $("#sel-count").textContent = t("editor.selected", {count: number(sel.size)});
-  $("#sel-library").disabled = V.library === null;
+  const eligible = selectedApps(sel);
+  $("#sel-folder").disabled = !eligible.length;
+  $("#sel-library").disabled = V.library === null || !eligible.length;
   $("#sel-place").disabled = sel.size !== 1 || !["app", "webclip", "folder"].includes(findItem([...sel][0])?.kind);
   $("#sel-unpin").hidden = ![...sel].some((i) => (findItem(i) || {}).pinned);
+}
+
+function setSelected(node, selected) {
+  if (node.classList.contains("selected") !== selected) node.classList.toggle("selected", selected);
+  if (node.getAttribute("aria-pressed") !== String(selected)) node.setAttribute("aria-pressed", String(selected));
+}
+
+function updateSelection(previous) {
+  for (const id of new Set([...previous, ...sel])) {
+    const selected = sel.has(id);
+    if (previous.has(id) === selected) continue;
+    for (const node of document.querySelectorAll(`[data-id="${CSS.escape(id)}"]`)) setSelected(node, selected);
+  }
+  renderSelection();
+}
+
+function clearSelection() {
+  const previous = new Set(sel);
+  sel.clear();
+  updateSelection(previous);
+  return previous;
 }
 
 function renderFooter() {
@@ -697,8 +901,9 @@ function onItemClick(e, item, context) {
     return;
   }
   if (e.metaKey || e.ctrlKey || e.shiftKey) {
+    const previous = new Set(sel);
     sel.has(item.id) ? sel.delete(item.id) : sel.add(item.id);
-    render();
+    updateSelection(previous);
     return;
   }
   if (item.kind === "folder") {
@@ -709,9 +914,10 @@ function onItemClick(e, item, context) {
     $("#folder-name").focus();
     return;
   }
+  const previous = new Set(sel);
   if (sel.size && !sel.has(item.id)) sel.clear();
   sel.has(item.id) ? sel.delete(item.id) : sel.add(item.id);
-  render();
+  updateSelection(previous);
 }
 
 async function editPlacement(item, context) {
@@ -739,11 +945,21 @@ async function editPlacement(item, context) {
     [`page:${V.pages.length + 1}`, () => t("editor.newPage")], ["dock", () => t("editor.dock")], ["bank", () => t("editor.bank")]];
   if (!widget && item.kind !== "folder") {
     if (V.library !== null) targets.push(["library", () => t("editor.library")]);
+    const options = [], counts = new Map();
     for (const folder of [V.dock, ...V.pages, V.bank].flat().filter(it => it.kind === "folder")) {
+      // HTML option labels strip and collapse ASCII whitespace.
+      const label = folder.name.replace(/[\t\n\f\r ]+/g, " ").replace(/^ | $/g, "");
       for (let page = 1; page <= folder.pages.length + 1; page++) {
-        targets.push([`${folder.id}:${page}`, () => `${folder.name} · ${t("editor.page", {number: number(page)})}`]);
+        const key = JSON.stringify([label, page]);
+        counts.set(key, (counts.get(key) || 0) + 1);
+        options.push({folder, page, key});
         if (!folder.pages[page - 1]?.length) break;
       }
+    }
+    for (const {folder, page, key} of options) {
+      const qualifier = counts.get(key) > 1 ? ` [${folder.id}]` : "";
+      targets.push([`${folder.id}:${page}`, () =>
+        `${folder.name} · ${t("editor.page", {number: number(page)})}${qualifier}`]);
     }
   }
   const target = field(`${prefix}-target`, "editor.destination", targets, context);
@@ -760,12 +976,16 @@ async function editPlacement(item, context) {
   target.onchange = update;
   update();
   const operation = await choice;
+  let destination = context;
   if (operation) {
     const args = operation === "pin" ? {id: item.id, page: Number(target.value.slice(5)), cell: Number(row.value) * grid.cols + Number(column.value)}
       : {id: item.id, target: target.value};
-    await op(operation, args, widget ? undefined : () => sel.clear(), binding);
+    if (await op(operation, args, widget ? undefined : () => sel.clear(), binding)) destination = target.value;
   }
-  focusItem({id: item.id, context: target.value || context});
+  if (ScreenOrganizerOnboarding.dialog || focusItem({id: item.id, context: destination}, true)) return;
+  if (destination.startsWith("folder:") &&
+      focusItem({id: destination.slice(0, destination.lastIndexOf(":"))}, true)) return;
+  focusEditorContext();
 }
 
 function clearMarks() {
@@ -773,10 +993,15 @@ function clearMarks() {
     n.classList.remove("ins-before", "ins-after", "ins-onto", "drop-zone", "drop-cell"));
 }
 
-function zoneOf(e, node, item) {
+function zoneOf(e, node, item, ctx) {
   const r = node.getBoundingClientRect();
   const x = (e.clientX - r.left) / r.width;
-  if (item.kind !== "widget" && x > 0.28 && x < 0.72 && !drag.ids.includes(item.id)) return "onto";
+  if (item.kind !== "widget" && x > 0.28 && x < 0.72 && !drag.ids.includes(item.id)) {
+    if (!ctx.target.startsWith("folder:") || (e.altKey && drag.ids.length === 1)) return "onto";
+    const siblings = [...node.parentElement.children].map(child => child.dataset.id);
+    const from = siblings.findIndex(id => drag.ids.includes(id));
+    return from >= 0 && from < siblings.indexOf(item.id) ? "after" : "before";
+  }
   return x < 0.5 ? "before" : "after";
 }
 
@@ -796,13 +1021,13 @@ function wireDrag(node, item, ctx) {
     e.preventDefault();
     e.stopPropagation();
     clearMarks();
-    node.classList.add("ins-" + zoneOf(e, node, item));
+    node.classList.add("ins-" + zoneOf(e, node, item, ctx));
   });
   node.addEventListener("drop", (e) => {
     if (!drag) return;
     e.preventDefault();
     e.stopPropagation();
-    const zone = zoneOf(e, node, item);
+    const zone = zoneOf(e, node, item, ctx);
     const ids = drag.ids.filter((i) => i !== item.id);
     clearMarks();
     if (!ids.length) return;
@@ -839,7 +1064,7 @@ function wireSlot(slot, page, cell) {
 
 function wireZone(node, ctx) {
   node.addEventListener("dragover", (e) => {
-    if (!drag) return;
+    if (!drag || (ctx.target === "library" && !libraryApps(drag.ids).length)) return;
     e.preventDefault();
     clearMarks();
     node.classList.add("drop-zone");
@@ -855,10 +1080,8 @@ function wireZone(node, ctx) {
 }
 
 async function moveIds(ids, target, before) {
-  if (target === "library") {
-    const bad = ids.map(findItem).filter((it) => it && it.kind !== "app" && it.kind !== "webclip");
-    if (bad.length) return toast(() => t("editor.onlyAppsInLibrary"), "error");
-  }
+  if (target === "library") ids = libraryApps(ids);
+  if (!ids.length) return;
   if (ids.length === 1) return op("move", { id: ids[0], target, before }, () => sel.clear());
   return op("move_many", { ids, target, before }, () => sel.clear());
 }
@@ -884,7 +1107,7 @@ function locateIndex(id, target) {
 
 async function newFolderFromSelection() {
   const binding = V?.binding;
-  const ids = [...sel].filter((i) => { const it = findItem(i); return it && it.kind !== "folder" && it.kind !== "widget"; });
+  const ids = selectedApps(sel);
   if (!ids.length) return;
   const name = await promptText(() => t("editor.newFolder"), () => t("editor.folderFromSelection", {count: number(ids.length)}), t("editor.folderDefault"));
   if (!name) return;
@@ -897,9 +1120,16 @@ async function newFolderFromSelection() {
   await op("create_folder", { name, ids, target, index }, () => sel.clear(), binding);
 }
 
-async function selectionToLibrary() {
-  const ids = [...sel].filter((i) => { const it = findItem(i); return it && (it.kind === "app" || it.kind === "webclip"); });
-  if (ids.length) await moveIds(ids, "library", null);
+function selectedApps(ids) {
+  return [...ids].filter(id => ["app", "webclip"].includes(findItem(id)?.kind));
+}
+
+function libraryApps(ids) {
+  return V?.library == null ? [] : selectedApps(ids);
+}
+
+function selectionToLibrary() {
+  return moveIds([...sel], "library", null);
 }
 
 // ---- devices ------------------------------------------------------------------------------
@@ -919,12 +1149,14 @@ async function loadDevices() {
   button.disabled = !available;
   if (available) {
     button.removeAttribute("tabindex");
-    button.setAttribute("aria-haspopup", "true");
+    button.setAttribute("aria-controls", "device-menu");
+    button.setAttribute("aria-expanded", String(!$("#device-menu").hidden));
     button.setAttribute("data-i18n-title", "editor.chooseDevice");
     button.title = t("editor.chooseDevice");
   } else {
+    setPopup("device", false);
     button.setAttribute("tabindex", "-1");
-    for (const attribute of ["aria-haspopup", "data-i18n-title", "title"]) button.removeAttribute(attribute);
+    for (const attribute of ["aria-controls", "aria-expanded", "data-i18n-title", "title"]) button.removeAttribute(attribute);
   }
   // nothing chosen yet: take the first connected device
   if (DEV.switching && DEV.discovery === "complete" && !DEV.devices.some((d) => d.udid === DEV.current)) {
@@ -937,6 +1169,7 @@ async function loadDevices() {
 
 function renderDeviceMenu() {
   const m = $("#device-menu");
+  const focused = m.contains(document.activeElement) ? document.activeElement.closest("button") : null;
   m.replaceChildren();
   if (DEV.discovery === "unavailable") {
     const note = localizedEl("div", "menu-note", () => t("editor.discoveryUnavailable"));
@@ -947,6 +1180,7 @@ function renderDeviceMenu() {
   }
   for (const d of DEV.devices) {
     const b = el("button", "device-row" + (d.udid === DEV.current ? " current" : ""));
+    b.dataset.deviceId = d.udid;
     const dot = el("i", d.connected === true ? "on" : d.connected === false ? "off" : "unknown");
     const text = el("span", "t");
     text.append(el("b", null, d.name || d.udid),
@@ -954,12 +1188,17 @@ function renderDeviceMenu() {
         d.connected === true ? d.connection : t(d.connected === false ? "editor.notConnected" : "editor.connectionUnknown"),
         d.draft && t("editor.draftSaved")].filter(Boolean).join(" · ")));
     b.append(dot, text);
-    b.onclick = () => { m.hidden = true; if (d.udid !== DEV.current) selectDevice(d.udid); };
+    b.onclick = () => { setPopup("device", false, true); if (d.udid !== DEV.current) selectDevice(d.udid); };
     m.appendChild(b);
   }
   const r = localizedEl("button", "menu-foot", () => t("editor.refreshDevices"));
   r.onclick = (e) => { e.stopPropagation(); return loadDevices(); };
   m.appendChild(r);
+  if (!m.hidden && focused) {
+    const row = [...m.querySelectorAll(".device-row")].find(node => node.dataset.deviceId === focused.dataset.deviceId);
+    (row || r).focus();
+  }
+  positionPopup("device");
 }
 
 async function selectDevice(udid, quiet) {
@@ -979,13 +1218,22 @@ async function selectDevice(udid, quiet) {
 
 async function readDevice() {
   const binding = V?.binding;
-  if (V && V.loaded && (V.diff.has_changes || V.history.undo)) {
-    if (!(await confirmBox(() => t("editor.readAgainTitle"), () => t("editor.readAgainBody", {device: D()}), () => t("editor.read"), true))) return;
+  const savedDraft = !V?.loaded && V?.draft_error;
+  if (savedDraft || (V?.loaded && (V.diff.has_changes || V.history.undo))) {
+    if (!(await confirmBox(() => t("editor.readAgainTitle"), () => savedDraft
+      ? t("editor.replaceSavedDraft") : t("editor.readAgainBody", {device: D()}), () => t("editor.read"), true))) return;
   }
   try {
     const v = await withBusy(() => t("editor.reading", {device: V && V.loaded ? D() : t("editor.device")}), () => api("/api/read", {}, binding));
+    const sameDevice = V?.loaded && V.device_id === v.device_id;
     clearEditor();
     setView(v);
+    if (sameDevice) {
+      for (const row of libraryRows.values()) {
+        const item = row.libraryItem, tile = row.firstChild;
+        if (item.icon && !tile.querySelector("img")) tile.replaceWith(iconImg(item));
+      }
+    }
     toast(() => t("editor.readSuccess"), "ok");
   } catch (e) {
     showError(e);
@@ -1120,22 +1368,29 @@ async function showBackups() {
   const { backups, binding: listed } = await api("/api/backups");
   if (binding?.device !== listed?.device || binding?.revision !== listed?.revision) {
     setView(await api("/api/state"));
-    throw new Error(t("error.staleDraft"));
+    throw Object.assign(new Error("Backup list device or draft revision changed."), {code: "stale_draft"});
   }
   const body = el("div");
   if (!backups.length) body.appendChild(localizedEl("p", null, () => t("editor.noBackups")));
-  for (const name of backups) {
+  for (const [index, name] of backups.entries()) {
     const row = el("div", "backup-row");
+    const label = localizedEl("span", null, () => backupLabel(name));
+    label.id = `backup-label-${index}`;
     const btn = localizedEl("button", null, () => t("editor.restore"));
+    btn.id = `backup-restore-${index}`;
+    btn.setAttribute("aria-labelledby", btn.id + " " + label.id);
     btn.disabled = Boolean(V && V.read_only);
     btn.setAttribute("data-backup", name);
-    row.append(localizedEl("span", null, () => backupLabel(name)), btn);
+    row.append(label, btn);
     body.appendChild(row);
   }
   const name = await modal({ title: () => t("editor.backups"), body, actions: [{ label: () => t("common.close") }] });
   if (!name) return;
   const { review } = await api("/api/backup-review", { name }, binding);
-  if (!(await confirmBox(() => t("editor.restoreTitle"), () => t("editor.restoreBody", {device: D()}), () => t("editor.restore")))) return;
+  const confirmation = el("div");
+  confirmation.append(localizedEl("p", null, () => backupLabel(name)),
+    localizedEl("p", null, () => t("editor.restoreBody", {device: D()})));
+  if (!(await confirmBox(() => t("editor.restoreTitle"), confirmation, () => t("editor.restore")))) return;
   try {
     const res = await withBusy(() => t("editor.restoring"), () => api("/api/restore", { name, review }, binding));
     showWriteOutcome(res, () => t("editor.restored"));
@@ -1144,7 +1399,7 @@ async function showBackups() {
 
 async function organize(name) {
   const binding = V?.binding;
-  $("#organize-menu").hidden = true;
+  setPopup("organize", false, true);
   const keep = $("#keep-first").checked;
   if (name === "group_categories") {
     const ok = await confirmBox(() => t("editor.groupTitle"), () =>
@@ -1169,7 +1424,7 @@ $("#device-btn").onclick = (e) => {
   if (!DEV.switching && DEV.discovery !== "unavailable") return;
   e.stopPropagation();
   const m = $("#device-menu");
-  m.hidden = !m.hidden;
+  setPopup("device", m.hidden);
   if (!m.hidden) loadDevices();
 };
 $("#help").onclick = () => {
@@ -1203,26 +1458,38 @@ $("#reset").onclick = async () => {
 };
 $("#review").onclick = review;
 $("#backups-btn").onclick = () => showBackups().catch((e) => showError(e));
-function positionOrganizeMenu() {
-  const menu = $("#organize-menu");
+function setPopup(name, open, restoreFocus = false) {
+  const menu = $("#" + name + "-menu"), button = $("#" + name + "-btn");
+  const focused = menu.contains(document.activeElement);
+  menu.hidden = !open;
+  if (!button.disabled || name === "organize") button.setAttribute("aria-expanded", String(open));
+  if (open) {
+    const other = name === "device" ? "organize" : "device";
+    if (!$("#" + other + "-menu").hidden) setPopup(other, false);
+    positionPopup(name);
+  } else if (restoreFocus && focused) button.focus();
+}
+function positionPopup(name) {
+  const menu = $("#" + name + "-menu");
   if (menu.hidden) return;
-  const margin = 12, trigger = $("#organize-btn").getBoundingClientRect();
+  const margin = 12, trigger = $("#" + name + "-btn").getBoundingClientRect();
   menu.style.left = `${margin}px`;
   menu.style.top = `${trigger.bottom + 6}px`;
   const {width, height} = menu.getBoundingClientRect();
-  menu.style.left = `${Math.max(margin, Math.min(trigger.right - width, innerWidth - width - margin))}px`;
+  const left = name === "device" ? trigger.left : trigger.right - width;
+  menu.style.left = `${Math.max(margin, Math.min(left, innerWidth - width - margin))}px`;
   menu.style.top = `${Math.max(margin, Math.min(trigger.bottom + 6, innerHeight - height - margin))}px`;
 }
+function positionPopups() { positionPopup("device"); positionPopup("organize"); }
 $("#organize-btn").onclick = (e) => {
   e.stopPropagation();
-  $("#organize-menu").hidden = !$("#organize-menu").hidden;
-  positionOrganizeMenu();
+  setPopup("organize", $("#organize-menu").hidden);
 };
-window.addEventListener("resize", positionOrganizeMenu);
+window.addEventListener("resize", () => { positionPopups(); syncDrawerCoverage(); });
 document.querySelectorAll("#organize-menu [data-op]").forEach((b) => { b.onclick = () => organize(b.dataset.op); });
 document.addEventListener("click", (e) => {
-  if (!$("#organize-menu").contains(e.target)) $("#organize-menu").hidden = true;
-  if (!$("#device-menu").contains(e.target)) $("#device-menu").hidden = true;
+  if (!$("#organize-menu").contains(e.target)) setPopup("organize", false);
+  if (!$("#device-menu").contains(e.target)) setPopup("device", false);
 });
 try { $("#keep-first").checked = localStorage.getItem("hs.keepFirst") !== "0"; } catch (_) {}
 $("#keep-first").onchange = (e) => { try { localStorage.setItem("hs.keepFirst", e.target.checked ? "1" : "0"); } catch (_) {} };
@@ -1237,11 +1504,16 @@ $("#sel-place").onclick = () => {
 };
 $("#sel-library").onclick = selectionToLibrary;
 $("#sel-unpin").onclick = () => op("unpin", { ids: [...sel] }, () => sel.clear());
-$("#sel-clear").onclick = () => { sel.clear(); render(); };
+$("#sel-clear").onclick = () => {
+  if (![...clearSelection()].some(id => focusItem({id}, true))) focusEditorContext();
+};
 function closeFolder() {
+  if (!openFolder) return;
+  const opener = folderOpener;
+  folderOpener = null;
   openFolder = null;
   render();
-  focusItem(folderOpener);
+  focusItem(opener, true);
 }
 $("#drawer-close").onclick = closeFolder;
 $("#folder-name").onchange = (e) => {
@@ -1260,27 +1532,36 @@ $("#folder-dissolve").onclick = async () => {
   const f = findItem(openFolder);
   const binding = V?.binding;
   if (f && await confirmBox(() => t("editor.removeFolderTitle", {name: f.name}), () => t("editor.removeFolderBody"), () => t("editor.removeFolder"), true)) {
-    op("dissolve_folder", { id: f.id }, () => { openFolder = null; }, binding);
+    op("dissolve_folder", { id: f.id }, () => { openFolder = null; folderOpener = null; }, binding);
   }
 };
 $("#board").addEventListener("click", (e) => {
-  if (!e.target.closest(".item, .widget, button") && sel.size) { sel.clear(); render(); }
+  if (!e.target.closest(".item, .widget, button") && sel.size) clearSelection();
 });
 document.addEventListener("keydown", (e) => {
-  if (e.defaultPrevented || !ScreenOrganizerOnboarding.accepted || ScreenOrganizerOnboarding.dialog) return;
+  if (e.defaultPrevented || e.isComposing || !ScreenOrganizerOnboarding.accepted || ScreenOrganizerOnboarding.dialog) return;
   if (e.key === "Escape") {
-    const popup = [["organize-menu", "organize-btn"], ["device-menu", "device-btn"]].find(([menu]) => !$("#" + menu).hidden);
+    const popup = ["organize", "device"].find(name => !$("#" + name + "-menu").hidden);
     if (popup) {
       e.preventDefault();
-      $("#" + popup[0]).hidden = true;
-      $("#" + popup[1]).focus();
+      setPopup(popup, false);
+      $("#" + popup + "-btn").focus();
+      return;
+    }
+    if (openFolder && (e.target === $("#folder-name") || !e.target.matches("input,select,textarea"))) {
+      e.preventDefault();
+      if (e.target === $("#folder-name")) e.target.value = findItem(openFolder).name;
+      sel.clear();
+      closeFolder();
       return;
     }
   }
-  if (e.target.matches("input,select,textarea")) return;
+  if (e.target.isContentEditable || e.target.matches("input,select,textarea")) return;
   const mod = e.metaKey || e.ctrlKey;
-  if (mod && e.key.toLowerCase() === "z") { e.preventDefault(); op(e.shiftKey ? "redo" : "undo"); }
-  else if (e.key === "Escape") { sel.clear(); closeFolder(); }
+  if (Boolean(e.metaKey) !== Boolean(e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "z") {
+    e.preventDefault(); op(e.shiftKey ? "redo" : "undo");
+  }
+  else if (e.key === "Escape" && sel.size) clearSelection();
   else if ((e.key === "Backspace" || e.key === "Delete") && sel.size) { e.preventDefault(); selectionToLibrary(); }
   else if (mod && e.key.toLowerCase() === "f") { e.preventDefault(); $("#search").focus(); }
 });
@@ -1294,6 +1575,6 @@ ScreenOrganizerI18n.onChange(() => {
   if (openFolder) $("#folder-name").value = folderDraft;
   renderDeviceMenu();
   refreshText();
-  positionOrganizeMenu();
+  positionPopups();
 });
 ScreenOrganizerOnboarding.ready.then(() => api("/api/state")).then(setView).catch((e) => { showError(e); setView({ loaded: false }); }).then(loadDevices);
