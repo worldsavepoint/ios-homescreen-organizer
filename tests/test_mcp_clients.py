@@ -1178,6 +1178,19 @@ def test_claude_foreign_postimage_keeps_user_entry_and_journal(native_mcp_binary
     assert [args[1] for args in commands(sandbox)].count("remove") == 1
 
 
+@pytest.mark.parametrize("failure", ["failure", "timeout"])
+def test_claude_failed_remove_recognizes_unchanged_prior_without_compensation(native_mcp_binary, sandbox, tmp_path, failure):
+    store, prior = seed_user(sandbox, custom={"owned": "previous"})
+    env = {**sandbox, "TEST_TIMEOUT": "1", "TEST_FAIL" if failure == "failure" else "TEST_HANG": "remove"}
+    result = execute(native_mcp_binary, env, "register", "claudeCode", fake_client(tmp_path), "/new-engine")
+    assert result["code"] == ("commandFailed" if failure == "failure" else "timedOut")
+    assert result["recovery"] == "restored"
+    assert json.loads(store.read_text()) == prior
+    journal = Path(sandbox["HOME"]) / "Library/Application Support/homescreen-mcp/registration/claudeCode.json"
+    assert not journal.exists()
+    assert [args[1] for args in commands(sandbox)] == ["get", "remove", "get"]
+
+
 @pytest.mark.parametrize("retained", [False, True])
 def test_query_finishes_when_leader_exits_with_idle_pipe_descendant(native_mcp_binary, sandbox, tmp_path, retained):
     seed_user(sandbox)

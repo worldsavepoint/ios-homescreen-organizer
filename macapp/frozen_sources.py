@@ -265,14 +265,16 @@ def finalize_local_record(project, manifest, record, executable):
     relevant = {name.removeprefix("project/") for name in baseline if name.startswith("project/")
                 and (name.removeprefix("project/").startswith(roots) or name.removeprefix("project/") in root_files)}
     paths = {project / name for name in relevant if (project / name).exists() or (project / name).is_symlink()}
-    generated = {"__pycache__", ".build", ".swiftpm", "build", "dist", ".venv"}
+    generated = {project / "macapp/Shell/.build", project / "macapp/Shell/.swiftpm"}
     def collect(directory):
         if not directory.exists():
             return
         for path in directory.iterdir():
-            if path.name in generated or path.name.endswith(".egg-info"):
+            if path in generated:
                 continue
             mode = path.lstat().st_mode
+            if stat.S_ISREG(mode) and path.parent.name == "__pycache__" and path.suffix == ".pyc":
+                continue
             if stat.S_ISDIR(mode):
                 collect(path)
             else:

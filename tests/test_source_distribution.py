@@ -824,6 +824,56 @@ def test_build_recipe_changes_are_recorded_without_git(tmp_path, monkeypatch):
     assert changed["engine"] == "e" * 64
 
 
+@pytest.mark.parametrize("directory", ["Features", "build", "dist", "nested/build", "nested/dist", "__pycache__"])
+def test_added_swift_sources_keep_ordinary_directory_names(tmp_path, monkeypatch, directory):
+    import frozen_sources
+    project = tmp_path / "project"
+    sources = project / "macapp/Shell/Sources/Homescreen"
+    sources.mkdir(parents=True)
+    main = sources / "main.swift"
+    main.write_text('print(Feature.value)\n')
+    package = project / "macapp/Shell/Package.swift"
+    package.write_text('// swift-tools-version:5.9\nimport PackageDescription\n')
+    baseline = {"project/" + path.relative_to(project).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (main, package)}
+    extra = sources / directory / "Feature.swift"
+    extra.parent.mkdir(parents=True)
+    extra.write_text('enum Feature { static let value = "recipient edit" }\n')
+    for name in ("macapp/Shell/.build/debug/Generated.swift", "macapp/Shell/.swiftpm/workspace-state.json",
+                 "macapp/__pycache__/frozen_sources.cpython-312.pyc"):
+        generated = project / name
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_bytes(b"generated build data")
+    manifest = tmp_path / "MANIFEST.json"
+    manifest.write_text(json.dumps({"files": baseline}))
+    record = tmp_path / "LOCAL-BUILD.json"
+    record.write_text(json.dumps({"projectFiles": {}, "engine": "e" * 64}))
+    monkeypatch.setattr(frozen_sources, "launcher_digest", lambda path: "f" * 64)
+    frozen_sources.finalize_local_record(project, manifest, record, tmp_path / "launcher")
+    result = json.loads(record.read_bytes())
+    name = extra.relative_to(project).as_posix()
+    assert result["projectChanges"] == {"modified": {}, "added": {name: hashlib.sha256(extra.read_bytes()).hexdigest()}, "removed": []}
+    assert set(result["projectFiles"]) == {"macapp/Shell/Package.swift", "macapp/Shell/Sources/Homescreen/main.swift", name}
+
+
+@pytest.mark.parametrize("directory", ["build", "dist"])
+def test_added_swift_source_links_are_rejected_in_ordinary_directories(tmp_path, monkeypatch, directory):
+    import frozen_sources
+    project = tmp_path / "project"
+    source = project / "macapp/Shell/Sources/Homescreen" / directory / "Feature.swift"
+    source.parent.mkdir(parents=True)
+    target = tmp_path / "external.swift"
+    target.write_text('print("external input")\n')
+    source.symlink_to(target)
+    manifest = tmp_path / "MANIFEST.json"
+    manifest.write_text(json.dumps({"files": {}}))
+    record = tmp_path / "LOCAL-BUILD.json"
+    record.write_text(json.dumps({"projectFiles": {}}))
+    monkeypatch.setattr(frozen_sources, "launcher_digest", lambda path: "f" * 64)
+    with pytest.raises(ValueError, match="regular local project inputs"):
+        frozen_sources.finalize_local_record(project, manifest, record, tmp_path / "launcher")
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="Uses the native Swift compiler and Mach-O signer")
 def test_swift_only_changes_and_canonical_launcher_are_sealed_into_local_record(tmp_path):
     import plistlib

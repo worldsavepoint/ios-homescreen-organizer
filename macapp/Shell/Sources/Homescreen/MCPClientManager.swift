@@ -647,11 +647,13 @@ struct MCPClientManager {
                     if awaitingPostimage, failure != .recoveryConflict {
                         let post = try await store.read()
                         guard post.file == record.file else { throw MCPClientOperationCode.recoveryConflict }
-                        guard try ownsClaudePostimage(post.entry, record: record) else {
-                            throw MCPClientOperationCode.recoveryConflict
+                        if post.entry != record.prior {
+                            guard try ownsClaudePostimage(post.entry, record: record) else {
+                                throw MCPClientOperationCode.recoveryConflict
+                            }
+                            record.observed = post.entry
+                            try savePhase(.observed, record: &record, journal: journal)
                         }
-                        record.observed = post.entry
-                        try savePhase(.observed, record: &record, journal: journal)
                     }
                     try await restore(&record, journal: journal, store: store)
                 } catch {
