@@ -72,6 +72,7 @@
   "editor.destination": "Куда",
   "editor.row": "Строка",
   "editor.column": "Столбец",
+  "editor.moveItem": "Переместить",
   "editor.moveWidget": "Переместить виджет",
   "editor.placeWidget": "Разместить в ячейке",
   "editor.folderTitle": "{name}: приложений — {count} (нажмите, чтобы открыть)",

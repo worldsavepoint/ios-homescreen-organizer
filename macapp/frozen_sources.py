@@ -4,6 +4,7 @@ from hashlib import sha256 as digest
 from importlib.metadata import distributions, version as package_version
 from pathlib import Path
 import argparse
+import configparser
 import json
 import re
 import shutil
@@ -14,9 +15,10 @@ import sys
 import sysconfig
 import tarfile
 import tempfile
+import tomllib
 import zipfile
 
-from source_inputs import (cache_directory, canonical, fetch, json_bytes, read_locks, relative_name,
+from source_inputs import (HEX, cache_directory, canonical, fetch, json_bytes, read_locks, relative_name,
                            sha256, source_member, source_members)
 
 NOTICE = re.compile(r"^(?:licenses?|licences?|copying|copyright|notice|authors|patents)(?:[._-].*)?$", re.I)
@@ -257,11 +259,103 @@ def launcher_digest(executable):
         raise ValueError("Could not fingerprint the native launcher") from None
 
 
+ROOT_RECIPES = {"pyproject.toml", "LICENSE", "requirements-build.lock", "requirements-build-x86_64.lock",
+                "requirements-cryptography-x86_64.lock", "setup.py", "setup.cfg", "MANIFEST.in"}
+
+
+def project_root_inputs(names, read, expand=lambda pattern: ()):
+    """Select the pinned backend's declared metadata and native recipe inputs."""
+    names = set(names)
+    selected = ROOT_RECIPES & names
+    def content(name):
+        try:
+            return read(name).decode("utf-8") if name in names else ""
+        except FileNotFoundError:
+            return ""
+    config = tomllib.loads(content("pyproject.toml"))
+    project = config.get("project", {})
+    setuptools = config.get("tool", {}).get("setuptools", {})
+    def files(value):
+        if isinstance(value, str):
+            selected.add(relative_name(value))
+        elif isinstance(value, list):
+            for name in value:
+                files(name)
+        elif isinstance(value, dict):
+            if "file" in value:
+                files(value["file"])
+    files(project.get("readme"))
+    license = project.get("license")
+    if isinstance(license, dict):
+        files(license)
+    def dynamic(value):
+        if isinstance(value, dict):
+            files(value)
+            for child in value.values():
+                dynamic(child)
+    dynamic(setuptools.get("dynamic", {}))
+    setup = configparser.ConfigParser(interpolation=None)
+    setup.read_string(content("setup.cfg"))
+    for section in setup.sections():
+        for value in setup[section].values():
+            if value.strip().startswith("file:"):
+                files([name.strip() for name in re.split(r"[,\n]", value.strip()[5:]) if name.strip()])
+    patterns = project.get("license-files", setuptools.get("license-files"))
+    legacy = setup["metadata"].get("license_file") if setup.has_section("metadata") else None
+    if patterns is None and setup.has_section("metadata"):
+        value = setup["metadata"].get("license_files")
+        if value is not None:
+            patterns = [name.strip() for name in re.split(r"[,\n]", value) if name.strip()]
+    if patterns is None:
+        patterns = [] if legacy else ["LICEN[CS]E*", "COPYING*", "NOTICE*", "AUTHORS*"]
+    if legacy:
+        patterns = [*patterns, legacy]
+    for pattern in patterns:
+        relative_name(pattern)
+        selected.update(name for name in names if not name.endswith("~") and Path("/" + name).match("/" + pattern))
+        selected.update(relative_name(name) for name in expand(pattern) if not name.endswith("~"))
+    return selected
+
+
+def local_project_input(project, name):
+    path = project
+    for part in relative_name(name).split("/"):
+        path /= part
+        if path.is_symlink():
+            raise ValueError("Use regular local project inputs")
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError("Use regular local project inputs")
+    return path.read_bytes()
+
+
+def local_root_inputs(project, baseline=()):
+    names = {*baseline, *(path.name for path in project.iterdir() if path.is_file() or path.is_symlink())}
+    return project_root_inputs(names, lambda name: local_project_input(project, name),
+                               lambda pattern: (path.relative_to(project).as_posix() for path in project.glob(pattern)
+                                                if path.is_file() or path.is_symlink()))
+
+
+def captured_root_inputs(manifest, baseline, public):
+    data = json.loads(manifest.read_bytes())
+    name = data.get("architectures", {}).get(public.get("arch"), {}).get("inventory")
+    if name is None:
+        return {}
+    path = manifest.parent / relative_name(name)
+    if sha256(path) != baseline.get(name):
+        raise ValueError("Different original project input inventory")
+    selected = json.loads(path.read_bytes()).get("projectInputs", {})
+    if (not isinstance(selected, dict) or any(not isinstance(value, str) or not HEX.fullmatch(value)
+            or baseline.get("project/" + relative_name(name)) != value for name, value in selected.items())):
+        raise ValueError("Different original project input inventory")
+    return selected
+
+
 def finalize_local_record(project, manifest, record, executable):
     public = json.loads(record.read_bytes())
     baseline = json.loads(manifest.read_bytes())["files"]
     roots = ("homescreen/", "macapp/", "tools/")
-    root_files = {"pyproject.toml", "LICENSE", "requirements-build.lock", "requirements-cryptography-x86_64.lock"}
+    root_files = local_root_inputs(project, (name.removeprefix("project/") for name in baseline if name.startswith("project/")))
+    root_files.update(captured_root_inputs(manifest, baseline, public))
     relevant = {name.removeprefix("project/") for name in baseline if name.startswith("project/")
                 and (name.removeprefix("project/").startswith(roots) or name.removeprefix("project/") in root_files)}
     paths = {project / name for name in relevant if (project / name).exists() or (project / name).is_symlink()}
@@ -289,7 +383,8 @@ def finalize_local_record(project, manifest, record, executable):
             continue
         if not stat.S_ISREG(mode):
             raise ValueError("Use regular local project inputs")
-        inputs[path.relative_to(project).as_posix()] = sha256(path)
+        name = path.relative_to(project).as_posix()
+        inputs[name] = digest(local_project_input(project, name)).hexdigest()
     public["projectFiles"].update(inputs)
     current = public["projectFiles"]
     public["projectChanges"] = {
@@ -443,7 +538,8 @@ def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch
         index = {owner: {"version": item["version"], "license": packages[owner]["license"]}
                  for owner, item in sorted(owners.items())}
         (notices / "components.json").write_bytes(json_bytes(index))
-        public = {"projectCommit": project_commit, "projectFiles": project_files, "engine": sha256(engine_dir / "engine"), "version": version, "arch": arch, "runtime": runtime, "owners": owners, "members": sorted(entries),
+        project_inputs = {name: digest(local_project_input(root, name)).hexdigest() for name in local_root_inputs(root)}
+        public = {"projectCommit": project_commit, "projectFiles": project_files, "projectInputs": project_inputs, "engine": sha256(engine_dir / "engine"), "version": version, "arch": arch, "runtime": runtime, "owners": owners, "members": sorted(entries),
                   "notices": files_below(notices), "overlays": files_below(overlays)}
         notice = distribution_notice(repository, version)
         if local:

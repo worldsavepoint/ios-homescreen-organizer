@@ -86,6 +86,62 @@ def test_filing_feedback_accumulates_apps_for_the_actual_folder(tmp_path, monkey
     assert session.undo() and session.require().snapshot() == before
 
 
+@pytest.mark.parametrize("ids,count", [(["a"], 0), (["a", "a"], 0), (["a", "a", "b"], 2), (["a", "b"], 2)])
+def test_filing_counts_distinct_local_items(tmp_path, monkeypatch, ids, count):
+    source = OrganizeSource()
+    source.state = [[], [app("a", "A"), app("b", "B")]]
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    monkeypatch.setattr(server, "session", lambda: session)
+    result = call("file_into_folders", groups={"Work": ids}, keep_first_page=False)
+    assert result["ok"] and result["count"] == count
+    assert result["filed"] == ({"Work": ["A", "B"]} if count else {})
+    assert sorted(session.require().leaf_ids()) == ["a", "b"]
+
+
+def test_filing_keeps_separate_occurrences_of_same_bundle(tmp_path, monkeypatch):
+    source = OrganizeSource()
+    source.state = [[], [app("a", "A"), app("a", "A")]]
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    ids = [node.id for node in session.require().pages[0]]
+    monkeypatch.setattr(server, "session", lambda: session)
+    result = call("file_into_folders", groups={"Work": ids}, keep_first_page=False)
+    assert result["count"] == 2 and result["filed"] == {"Work": ["A", "A"]}
+    assert sorted(session.require().leaf_ids()) == sorted(ids)
+
+
+@pytest.mark.parametrize("keep_first", [False, True])
+def test_usage_keeps_widget_page_index_identity_and_metadata(tmp_path, monkeypatch, keep_first):
+    from homescreen.device import to_root_archive
+    from test_grid_serialization import ArchiveSource
+    pages = [[app("a", "A")], [app("b", "B")], [widget("Calendar", "small")]]
+    if keep_first:
+        pages.insert(0, [app("first", "First")])
+    source = ArchiveSource(4, 6, "dictionary")
+    source.raw = to_root_archive([[], *pages], [])
+    names = [f"page-{i}" for i in range(1, len(pages) + 1)]
+    metadata = {name: {"opaque": name.encode()} for name in names}
+    source.raw.update(listUniqueIdentifiers=names, listMetadata=metadata)
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    before = session.require().snapshot()
+    session.usage = {"ok": True, "days": 2, "opens": {"a": 20, "b": 10}}
+    monkeypatch.setattr(server, "session", lambda: session)
+    result = call("optimize_by_usage", keep_first_page=keep_first)
+    assert result["ok"] and result["problems"] == []
+    assert len(session.require().pages) == len(pages)
+    assert session.require().pages[-1][0].kind == "widget"
+    assert session.require().page_origins == list(range(len(pages)))
+    after = session.require().snapshot()
+    assert Session(source, session.dir).require().snapshot() == after
+    assert session.undo() and session.require().snapshot() == before
+    assert session.redo() and session.require().snapshot() == after
+    assert asyncio.run(session.apply(session.require().token()))["ok"]
+    assert source.raw["listUniqueIdentifiers"] == names
+    assert source.raw["listMetadata"] == metadata
+
+
 def test_widget_bank_and_pin_keep_configuration_and_supported_destinations(tmp_path):
     source = OrganizeSource()
     item = widget("Weather", "small")

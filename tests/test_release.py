@@ -543,6 +543,82 @@ def test_release_descendant_acls(tmp_path, inherited):
     assert acl(plain) == [] and (plain / "record").read_text() == "existing"
 
 
+def test_release_aborts_when_retained_directory_name_changes(tmp_path, monkeypatch):
+    from macapp.release import install_generation
+    output, staged, outside = (tmp_path / name for name in ("release", "assets", "outside"))
+    for directory in (output, staged, outside):
+        directory.mkdir()
+    retained = output / "notes"
+    retained.mkdir()
+    (retained / "record").write_bytes(b"user notes")
+    retained.chmod(0o750)
+    (retained / "record").chmod(0o640)
+    subprocess.run(["chmod", "+a", "everyone deny write", retained / "record"], check=True)
+    original_acl = subprocess.check_output(["ls", "-lde", retained / "record"], text=True).splitlines()[1:]
+    parked = output / "parked"
+    (outside / "secret").write_bytes(b"outside subtree")
+    (outside / "secret").chmod(0o640)
+    for name in ("archive.zip", "image.dmg", "SHA256SUMS.txt"):
+        (staged / name).write_bytes(b"new verified asset")
+    identity = retained.stat().st_dev, retained.stat().st_ino
+    original_iterdir, original_listdir = Path.iterdir, os.listdir
+    swapped = False
+    def swap():
+        nonlocal swapped
+        if not swapped:
+            retained.rename(parked)
+            retained.symlink_to(outside, target_is_directory=True)
+            swapped = True
+    def iterdir(path):
+        if path == retained:
+            swap()
+        return original_iterdir(path)
+    def listdir(path):
+        if isinstance(path, int) and (os.fstat(path).st_dev, os.fstat(path).st_ino) == identity:
+            swap()
+        return original_listdir(path)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(os, "listdir", listdir)
+    with pytest.raises((OSError, ValueError), match="changed|preserve"):
+        install_generation(staged, output, "arm64")
+    assert swapped and retained.is_symlink() and retained.readlink() == outside
+    assert (parked / "record").read_bytes() == b"user notes"
+    assert (outside / "secret").read_bytes() == b"outside subtree"
+    assert parked.stat().st_mode & 0o777 == 0o750
+    assert (parked / "record").stat().st_mode & 0o777 == 0o640
+    assert (outside / "secret").stat().st_mode & 0o777 == 0o640
+    assert subprocess.check_output(["ls", "-lde", parked / "record"], text=True).splitlines()[1:] == original_acl
+    assert not (output / "archive.zip").exists()
+    assert not (staged / ".generation/notes/secret").exists()
+
+
+def test_release_aborts_if_new_user_entry_appears_after_listing(tmp_path, monkeypatch):
+    from macapp.release import install_generation
+    output, staged = tmp_path / "release", tmp_path / "assets"
+    output.mkdir()
+    staged.mkdir()
+    notes = output / "notes"
+    notes.mkdir()
+    (notes / "original").write_bytes(b"original")
+    (staged / "asset.zip").write_bytes(b"verified")
+    identity = notes.stat().st_dev, notes.stat().st_ino
+    original_listdir = os.listdir
+    added = False
+    def listdir(directory):
+        nonlocal added
+        names = original_listdir(directory)
+        if isinstance(directory, int) and (os.fstat(directory).st_dev, os.fstat(directory).st_ino) == identity and not added:
+            (notes / "new-user-entry").write_bytes(b"retain newly created object")
+            added = True
+        return names
+    monkeypatch.setattr(os, "listdir", listdir)
+    with pytest.raises(OSError, match="changed"):
+        install_generation(staged, output, "arm64")
+    assert added and (notes / "new-user-entry").read_bytes() == b"retain newly created object"
+    assert (notes / "original").read_bytes() == b"original"
+    assert not (output / "asset.zip").exists()
+
+
 def test_first_release_inherits_output_parent_acl(tmp_path):
     from macapp.release import install_generation
 

@@ -141,10 +141,12 @@ def open_private_directory(root, directory=None):
         os.close(fd)
 
 
-def open_private_file(root, path, flags=os.O_RDONLY):
+def open_private_file(root, path, flags=os.O_RDONLY, *, directory_fd=None):
     path = pathlib.Path(path)
-    with open_private_directory(root, path.parent) as directory:
-        fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+    if directory_fd is None:
+        with open_private_directory(root, path.parent) as directory:
+            return open_private_file(root, path, flags, directory_fd=directory)
+    fd = os.open(path.name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory_fd)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():

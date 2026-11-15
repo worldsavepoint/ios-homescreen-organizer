@@ -46,7 +46,7 @@ def intel_notice(inputs, output):
 
 def validate_inventory(data, arch, version, packages, native):
     fields = {"projectCommit", "projectFiles", "engine", "version", "arch", "runtime", "owners", "members", "notices", "overlays"}
-    if (set(data) != fields or not HEX.fullmatch(data["engine"])
+    if (set(data) not in (fields, fields | {"projectInputs"}) or not HEX.fullmatch(data["engine"])
             or data["arch"] != arch or data["version"] != version
             or not re.fullmatch(r"(?:[0-9a-f]{40})?", data["projectCommit"])):
         raise ValueError("Source inputs do not match the release version and architecture")
@@ -73,6 +73,13 @@ def validate_inventory(data, arch, version, packages, native):
     project_paths = {source for _, _, owner, source, _ in data["members"] if owner == "home-screen-organizer"}
     if project_paths != data["projectFiles"].keys() or any(not HEX.fullmatch(x) for x in data["projectFiles"].values()):
         raise ValueError("Incomplete corresponding project source inventory")
+    selected_inputs = data.get("projectInputs", {})
+    if not isinstance(selected_inputs, dict):
+        raise ValueError("Invalid original project input inventory")
+    for name, value in selected_inputs.items():
+        relative_name(name)
+        if not isinstance(value, str) or not HEX.fullmatch(value):
+            raise ValueError("Invalid original project input inventory")
     if used - {"cpython", "home-screen-organizer"} != owners.keys() or not seen:
         raise ValueError("Incomplete frozen component inventory")
     for group in ("notices", "overlays"):
@@ -245,17 +252,21 @@ def trusted_head(root, commit):
 
 
 def verify_release_inputs(folder, root, repository, version, manifest, files, modes, inventories):
-    from frozen_sources import distribution_notice
+    from frozen_sources import distribution_notice, project_root_inputs
     commit = manifest["commit"]
     trusted_head(root, commit)
     packages, native = [json.loads(trusted_file(root, commit, f"macapp/sources/{name}.json"))
                         for name in ("python", "native")]
-    expected = {}
+    expected, project_bytes = {}, {}
     for name, mode, stream, size in project_entries(root, commit):
-        expected[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        data = stream.read()
+        project_bytes[name.removeprefix("project/")] = data
+        expected[name] = hashlib.sha256(data).hexdigest()
         if modes.get(name) != mode:
             raise ValueError("Different corresponding project source file or mode")
     expected["README.md"] = expected["project/macapp/SOURCE.md"]
+    root_inputs = {name: hashlib.sha256(project_bytes[name]).hexdigest()
+                   for name in project_root_inputs(project_bytes, project_bytes.__getitem__) if name in project_bytes}
     pins = {}
     for arch in ARCHES:
         name = f"inventories/{arch}.json"
@@ -263,6 +274,8 @@ def verify_release_inputs(folder, root, repository, version, manifest, files, mo
         validate_inventory(inventory, arch, version, packages, native)
         if any(expected.get("project/" + key) != value for key, value in inventory["projectFiles"].items()):
             raise ValueError("The frozen project source differs from the checked-out release")
+        if "projectInputs" in inventory and inventory["projectInputs"] != root_inputs:
+            raise ValueError("The original project input inventory differs from the checked-out release")
         data = json_bytes(inventory)
         expected[name] = hashlib.sha256(data).hexdigest()
         archive = folder / f"home-screen-organizer-{version}-macos-{arch}.zip"

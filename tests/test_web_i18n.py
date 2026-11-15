@@ -835,6 +835,95 @@ context.Intl.Collator=class extends Intl.Collator{constructor(...args){super(...
 ''')
 
 
+def test_home_selection_retains_library_nodes_and_library_selection_state():
+    browser('''
+const rows=[...$('#library').children],comparisons=context.comparisons;
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+$('#folder-pages').querySelector('[data-id="synthetic.app"]').click();
+assert.equal($('#library').children[0],rows[0]);assert.equal(context.comparisons,comparisons);
+const row=rows[1];row.focus();row.dispatchEvent({type:'keydown',key:'Enter',ctrlKey:true});
+assert.equal($('#library').children[1],row);assert.equal(row.getAttribute('aria-pressed'),'true');
+assert.ok(row.classList.contains('selected'));assert.equal(document.activeElement,row);
+row.dispatchEvent({type:'keydown',key:' ',ctrlKey:true});assert.equal(row.getAttribute('aria-pressed'),'false');
+assert.equal(context.comparisons,comparisons);
+$('#search').value='Alpha';$('#search').dispatchEvent({type:'input'});
+assert.equal($('#library').children.length,1);assert.equal($('#library').children[0].dataset.id,'library.a');
+assert.notEqual($('#library').children[0],rows[0]);
+await i18n.setLocale('fr');assert.equal($('#lib-count').textContent,i18n.t('editor.matchCount',{count:1,total:3}));
+context.setView({...fixture,library:null});assert.ok($('#library').textContent.includes(i18n.t('editor.libraryUnavailable')));
+''', native=True, setup='''
+fixture.library=[{id:'library.a',kind:'app',name:'Alpha'},{id:'library.b',kind:'app',name:'Beta'},{id:'library.c',kind:'app',name:'Gamma'}];
+context.comparisons=0;context.Intl=Object.create(Intl);context.Intl.Collator=class extends Intl.Collator {
+ compare(a,b){context.comparisons++;return super.compare(a,b);}
+};
+''')
+
+
+def test_folder_add_reuses_existing_empty_subpage():
+    browser('''
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+$('#folder-name').value='Unsubmitted name';
+$('#folder-add-page').click();$('#folder-add-page').click();
+assert.equal($('#folder-pages').children.length,2);
+assert.equal(fixture.pages[0][0].pages.length,2);assert.equal($('#folder-name').value,'Unsubmitted name');
+fixture.pages[0][0].pages[1].push({id:'second',kind:'app',name:'Second'});
+$('#folder-add-page').click();assert.equal($('#folder-pages').children.length,3);
+assert.equal(calls.filter(p=>p==='/api/op').length,0);
+''', native=True)
+
+
+def test_keyboard_app_placement_cancels_then_pins_with_reviewed_binding():
+    browser('''
+const operations=context.operations;
+let row=$('#library').firstChild;row.focus();row.dispatchEvent({type:'keydown',key:'Enter'});
+const action=$('#sel-place');assert.ok(action,'selected app has a placement action');assert.equal(action.disabled,false);
+action.focus();action.click();await tick();
+assert.equal($('#modal').hidden,false);assert.equal(document.activeElement,$('#modal-actions').firstChild);
+document.dispatchEvent({type:'keydown',key:'Escape',target:document.activeElement});await tick();
+assert.equal(operations.length,0);assert.equal($('#library').firstChild.getAttribute('aria-pressed'),'true');
+$('#sel-place').click();await tick();
+const targets=$('#item-target').children.map(n=>n.value);
+for(const target of ['page:1','page:2','dock','bank','library','folder:one:1','folder:one:2'])assert.ok(targets.includes(target),target);
+$('#item-target').value='page:1';$('#item-target').dispatchEvent({type:'change'});
+$('#item-row').value='0';$('#item-column').value='2';
+await i18n.setLocale('fr');assert.equal($('#item-column').value,'2');
+$('#modal-actions').lastChild.click();await tick();await tick();
+assert.deepEqual(operations.map(x=>x.op),['pin']);
+assert.deepEqual(operations[0].args,{id:'library.app',page:1,cell:2});
+assert.deepEqual(operations[0].binding,{device:'synthetic',revision:'current'});
+assert.equal($('#selection-bar').hidden,true);assert.equal(document.activeElement.dataset.id,'library.app');
+''', native=True, setup='''
+fixture.pages[0][0].id='folder:one';fixture.library=[{id:'library.app',kind:'app',name:'Installed App'}];
+const operations=context.operations=[];const prior=context.fetch;context.fetch=async(path,opts)=>{
+ if(path!='/api/op')return prior(path,opts);
+ const data=JSON.parse(opts.body);operations.push(data);
+ if(data.op!=='pin')throw Error('Unexpected operation '+data.op);
+ const app=fixture.library[0];fixture.library=[];app.pos=[0,2,1,1];fixture.pages[0].push(app);
+ return {ok:true,json:async()=>fixture};
+};
+''')
+
+
+def test_keyboard_folder_destinations_keep_container_constraints():
+    browser('''
+const operations=context.operations;
+const folder=$('#pages').querySelector('[data-id="synthetic.folder"]');
+folder.dispatchEvent({type:'keydown',key:' ',shiftKey:true});$('#sel-place').click();await tick();
+assert.deepEqual($('#item-target').children.map(n=>n.value),['page:1','page:2','dock','bank']);
+$('#item-target').value='bank';$('#item-target').dispatchEvent({type:'change'});
+assert.equal($('#item-row').disabled,true);assert.equal($('#modal-actions').lastChild.disabled,true);
+$('#modal-actions').children[1].click();await tick();await tick();
+assert.deepEqual(operations[0].args,{id:'synthetic.folder',target:'bank'});
+assert.equal(document.activeElement.dataset.id,'synthetic.folder');
+''', native=True, setup='''
+const operations=context.operations=[];const prior=context.fetch;context.fetch=async(path,opts)=>{
+ if(path!='/api/op')return prior(path,opts);
+ const data=JSON.parse(opts.body);operations.push(data);if(data.op!=='move')throw Error(data.op);
+ fixture.bank=[fixture.pages[0][0]];fixture.pages=[[]];return {ok:true,json:async()=>fixture};
+};
+''')
+
+
 def test_help_and_count_labels_follow_current_editor_options():
     browser('''
 for(const code of i18n.languages.map(l=>l.code)){

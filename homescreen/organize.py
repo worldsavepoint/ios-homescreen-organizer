@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .model import Layout, LayoutError, Node
+from .private_store import ensure_private_directory, open_private_directory, open_private_file
 
 COLOR_ORDER = ["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink",
                "white", "gray", "black", "unknown"]
@@ -80,7 +80,7 @@ def into_folders(lay: Layout, groups: dict[str, list[str]], keep_first_page: boo
     existing = {n.name.lower(): n for p in lay.pages for n in p if n.kind == "folder"}
     filed: dict[str, list[str]] = {}
     for name, ids in groups.items():
-        ids = [i for i in ids if i in allowed]
+        ids = [i for i in dict.fromkeys(ids) if i in allowed]
         folder = existing.get(name.lower())
         if folder is None and len(ids) < min_size:
             continue
@@ -111,36 +111,30 @@ LOOKUP = "https://itunes.apple.com/lookup?"
 def fetch_categories(bundle_ids: list[str], cache: Path, country: str = "us") -> dict[str, str]:
     """Primary App Store genre per bundle id, via Apple's public lookup API. Only bundle ids are
     sent. Results (and misses, as "") are cached so each id is asked about once."""
+    from .session import _private_replace
     bundle_ids = list(dict.fromkeys(bundle_ids))
-    cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    cache.parent.chmod(0o700)
-    try:
-        fd = os.open(cache, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        known: dict[str, str] = {}
-    else:
-        with os.fdopen(fd) as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            known = json.load(stream)
-    todo = [b for b in bundle_ids if b not in known and not b.startswith("com.apple.")]
-    for i in range(0, len(todo), 100):
-        chunk = todo[i:i + 100]
-        url = LOOKUP + urllib.parse.urlencode({"bundleId": ",".join(chunk), "country": country, "entity": "software"})
-        with urllib.request.urlopen(url, timeout=20) as r:
-            data = json.load(r)
-        found = {res.get("bundleId"): res.get("primaryGenreName", "") for res in data.get("results", [])}
-        for b in chunk:
-            known[b] = found.get(b, "")
-    for b in bundle_ids:
-        if b.startswith("com.apple.") and b not in known:
-            known[b] = "Apple"
-    fd, temporary = tempfile.mkstemp(prefix=".categories-", dir=cache.parent)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            stream.write(json.dumps(known, indent=1, sort_keys=True))
-        os.replace(temporary, cache)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    ensure_private_directory(cache.parent)
+    with open_private_directory(cache.parent) as directory:
+        try:
+            fd = open_private_file(cache.parent, cache, directory_fd=directory)
+        except FileNotFoundError:
+            known: dict[str, str] = {}
+        else:
+            with os.fdopen(fd) as stream:
+                known = json.load(stream)
+        todo = [b for b in bundle_ids if b not in known and not b.startswith("com.apple.")]
+        for i in range(0, len(todo), 100):
+            chunk = todo[i:i + 100]
+            url = LOOKUP + urllib.parse.urlencode({"bundleId": ",".join(chunk), "country": country, "entity": "software"})
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = json.load(r)
+            found = {res.get("bundleId"): res.get("primaryGenreName", "") for res in data.get("results", [])}
+            for b in chunk:
+                known[b] = found.get(b, "")
+        for b in bundle_ids:
+            if b.startswith("com.apple.") and b not in known:
+                known[b] = "Apple"
+        _private_replace(cache, json.dumps(known, indent=1, sort_keys=True).encode(), directory_fd=directory)
     return {b: known.get(b, "") for b in bundle_ids}
 
 

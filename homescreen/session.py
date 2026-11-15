@@ -119,9 +119,9 @@ def _unlink_file(path: Path, *, root: Path | None = None, directory_fd: int | No
                 raise
 
 
-def _private_replace(path: Path, data: bytes, *, root: Path | None = None) -> None:
+def _private_replace(path: Path, data: bytes, *, root: Path | None = None, directory_fd: int | None = None) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with _local_directory(path.parent, root) as directory:
+    with _local_directory(path.parent, root, directory_fd) as directory:
         try:
             _exclusive_file(temporary, data, directory_fd=directory)
             with _previous_file(path, directory_fd=directory):

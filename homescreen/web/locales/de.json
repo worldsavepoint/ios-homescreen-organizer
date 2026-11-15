@@ -72,6 +72,7 @@
   "editor.destination": "Ziel",
   "editor.row": "Zeile",
   "editor.column": "Spalte",
+  "editor.moveItem": "Verschieben",
   "editor.moveWidget": "Widget verschieben",
   "editor.placeWidget": "In Zelle platzieren",
   "editor.folderTitle": "{name}: {count} Apps (zum Öffnen klicken)",

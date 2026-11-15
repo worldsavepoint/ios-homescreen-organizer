@@ -533,8 +533,27 @@ function renderPages() {
 }
 
 let libraryCollator, libraryLocale;
+let libraryData, libraryQuery, libraryMoved, libraryRenderedLocale, librarySelection = new Set();
+const libraryRows = new Map();
 function renderLibrary() {
   const list = $("#library");
+  if (libraryData === V.library && libraryQuery === query && libraryMoved === movedIds
+      && libraryRenderedLocale === ScreenOrganizerI18n.locale) {
+    for (const id of new Set([...librarySelection, ...sel])) {
+      const row = libraryRows.get(id);
+      if (!row) continue;
+      row.classList.toggle("selected", sel.has(id));
+      row.setAttribute("aria-pressed", String(sel.has(id)));
+    }
+    librarySelection = new Set([...sel].filter(id => libraryRows.has(id)));
+    return;
+  }
+  libraryData = V.library;
+  libraryQuery = query;
+  libraryMoved = movedIds;
+  libraryRenderedLocale = ScreenOrganizerI18n.locale;
+  libraryRows.clear();
+  librarySelection = new Set();
   list.replaceChildren();
   if (V.library === null) {
     $("#lib-count").textContent = "";
@@ -558,6 +577,8 @@ function renderLibrary() {
     itemControl(row, it, "library");
     wireDrag(row, it, { target: "library" });
     list.appendChild(row);
+    libraryRows.set(it.id, row);
+    if (sel.has(it.id)) librarySelection.add(it.id);
   }
 }
 
@@ -643,6 +664,7 @@ function renderSelection() {
   bar.hidden = sel.size === 0;
   $("#sel-count").textContent = t("editor.selected", {count: number(sel.size)});
   $("#sel-library").disabled = V.library === null;
+  $("#sel-place").disabled = sel.size !== 1 || !["app", "webclip", "folder"].includes(findItem([...sel][0])?.kind);
   $("#sel-unpin").hidden = ![...sel].some((i) => (findItem(i) || {}).pinned);
 }
 
@@ -670,7 +692,7 @@ function renderFooter() {
 function onItemClick(e, item, context) {
   e.stopPropagation();
   if (item.kind === "widget") {
-    if (!e.metaKey && !e.ctrlKey && !e.shiftKey) editWidget(item, context);
+    if (!e.metaKey && !e.ctrlKey && !e.shiftKey) editPlacement(item, context);
     return;
   }
   if (e.metaKey || e.ctrlKey || e.shiftKey) {
@@ -691,8 +713,9 @@ function onItemClick(e, item, context) {
   render();
 }
 
-async function editWidget(item, context) {
+async function editPlacement(item, context) {
   if (ScreenOrganizerOnboarding.dialog) return;
+  const widget = item.kind === "widget", prefix = widget ? "widget" : "item";
   const binding = V?.binding, grid = G();
   const body = el("div", "widget-fields");
   const field = (id, key, options, value) => {
@@ -710,17 +733,28 @@ async function editWidget(item, context) {
     body.appendChild(label);
     return select;
   };
-  const target = field("widget-target", "editor.destination", [["bank", () => t("editor.bank")],
-    ...V.pages.map((_, i) => [`page:${i + 1}`, () => t("editor.page", {number: number(i + 1)})])], context);
-  const row = field("widget-row", "editor.row", Array.from({length: grid.rows}, (_, i) => [String(i), () => number(i + 1)]), String(item.pos?.[0] || 0));
-  const column = field("widget-column", "editor.column", Array.from({length: grid.cols}, (_, i) => [String(i), () => number(i + 1)]), String(item.pos?.[1] || 0));
+  const pages = V.pages.map((_, i) => [`page:${i + 1}`, () => t("editor.page", {number: number(i + 1)})]);
+  const targets = widget ? [["bank", () => t("editor.bank")], ...pages] : [...pages,
+    [`page:${V.pages.length + 1}`, () => t("editor.newPage")], ["dock", () => t("editor.dock")], ["bank", () => t("editor.bank")]];
+  if (!widget && item.kind !== "folder") {
+    if (V.library !== null) targets.push(["library", () => t("editor.library")]);
+    for (const folder of [V.dock, ...V.pages, V.bank].flat().filter(it => it.kind === "folder")) {
+      for (let page = 1; page <= folder.pages.length + 1; page++) {
+        targets.push([`${folder.id}:${page}`, () => `${folder.name} · ${t("editor.page", {number: number(page)})}`]);
+        if (!folder.pages[page - 1]?.length) break;
+      }
+    }
+  }
+  const target = field(`${prefix}-target`, "editor.destination", targets, context);
+  const row = field(`${prefix}-row`, "editor.row", Array.from({length: grid.rows}, (_, i) => [String(i), () => number(i + 1)]), String(item.pos?.[0] || 0));
+  const column = field(`${prefix}-column`, "editor.column", Array.from({length: grid.cols}, (_, i) => [String(i), () => number(i + 1)]), String(item.pos?.[1] || 0));
   const choice = modal({title: () => t("editor.editWidget", {name: item.name}), body, actions: [
     {label: () => t("common.cancel"), value: () => null},
-    {label: () => t("editor.moveWidget"), primary: true, value: () => "move"},
+    {label: () => t(widget ? "editor.moveWidget" : "editor.moveItem"), primary: true, value: () => "move"},
     {label: () => t("editor.placeWidget"), value: () => "pin"},
   ]});
   const update = () => {
-    row.disabled = column.disabled = $("#modal-actions").lastChild.disabled = target.value === "bank";
+    row.disabled = column.disabled = $("#modal-actions").lastChild.disabled = !target.value.startsWith("page:");
   };
   target.onchange = update;
   update();
@@ -728,7 +762,7 @@ async function editWidget(item, context) {
   if (operation) {
     const args = operation === "pin" ? {id: item.id, page: Number(target.value.slice(5)), cell: Number(row.value) * grid.cols + Number(column.value)}
       : {id: item.id, target: target.value};
-    await op(operation, args, undefined, binding);
+    await op(operation, args, widget ? undefined : () => sel.clear(), binding);
   }
   focusItem({id: item.id, context: target.value || context});
 }
@@ -1178,6 +1212,13 @@ try { $("#keep-first").checked = localStorage.getItem("hs.keepFirst") !== "0"; }
 $("#keep-first").onchange = (e) => { try { localStorage.setItem("hs.keepFirst", e.target.checked ? "1" : "0"); } catch (_) {} };
 $("#search").oninput = (e) => { query = e.target.value.trim().toLowerCase(); render(); };
 $("#sel-folder").onclick = newFolderFromSelection;
+$("#sel-place").onclick = () => {
+  if (sel.size !== 1) return;
+  const item = findItem([...sel][0]);
+  if (!item || !["app", "webclip", "folder"].includes(item.kind)) return;
+  const control = [...document.querySelectorAll("[data-focus-context]")].find(node => node.dataset.id === item.id);
+  editPlacement(item, control?.dataset.focusContext || "bank");
+};
 $("#sel-library").onclick = selectionToLibrary;
 $("#sel-unpin").onclick = () => op("unpin", { ids: [...sel] }, () => sel.clear());
 $("#sel-clear").onclick = () => { sel.clear(); render(); };
@@ -1196,7 +1237,7 @@ $("#folder-add-page").onclick = () => {
   const f = findItem(openFolder);
   if (!f) return;
   // an empty folder page appears once something is dropped on it; show a target now
-  f.pages.push([]);
+  if (!f.pages.length || f.pages.at(-1).length) f.pages.push([]);
   renderDrawer();
 };
 $("#folder-dissolve").onclick = async () => {

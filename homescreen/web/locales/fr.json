@@ -72,6 +72,7 @@
   "editor.destination": "Destination",
   "editor.row": "Ligne",
   "editor.column": "Colonne",
+  "editor.moveItem": "Déplacer",
   "editor.moveWidget": "Déplacer le widget",
   "editor.placeWidget": "Placer dans la cellule",
   "editor.folderTitle": "{name} : {count} apps (cliquez pour ouvrir)",

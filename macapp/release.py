@@ -1,6 +1,7 @@
 """Assemble versioned macOS release assets from a completed app build."""
 import argparse
 import ctypes
+from contextlib import ExitStack
 import fcntl
 import hashlib
 import json
@@ -272,25 +273,65 @@ def previous_assets(output, arch):
     return names
 
 
-def preserve_entry(source, destination, libc):
-    if source.is_symlink() or not source.is_dir():
-        os.link(source, destination, follow_symlinks=False)
+def entry_identity(info):
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+
+def check_preserved_entry(parent, name, identity):
+    if entry_identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity:
+        raise OSError("The retained release directory changed")
+
+
+def preserve_entry(name, source_parent, destination_parent, libc, stack, checks, directories):
+    identity = entry_identity(os.stat(name, dir_fd=source_parent, follow_symlinks=False))
+    checks.append((source_parent, name, identity))
+    if identity[2] != stat.S_IFDIR:
+        os.link(name, name, src_dir_fd=source_parent, dst_dir_fd=destination_parent, follow_symlinks=False)
+        check_preserved_entry(destination_parent, name, identity)
         return
-    destination.mkdir()
-    # Retained directories keep their own ACL, including an empty one.
-    subprocess.run(["chmod", "-N", destination], check=True, capture_output=True)
-    for child in source.iterdir():
-        preserve_entry(child, destination / child.name, libc)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    source = os.open(name, flags, dir_fd=source_parent)
+    stack.callback(os.close, source)
+    if entry_identity(os.fstat(source)) != identity:
+        raise OSError("The retained release directory changed")
+    os.mkdir(name, dir_fd=destination_parent)
+    destination = os.open(name, flags, dir_fd=destination_parent)
+    stack.callback(os.close, destination)
+    # New directories receive the retained ACL after their children are linked.
+    acl = libc.acl_init(0)
+    if not acl:
+        raise OSError(ctypes.get_errno(), "Could not preserve the release directory permissions")
+    try:
+        if libc.acl_set_fd_np(destination, acl, 0x100) != 0:  # ACL_TYPE_EXTENDED
+            raise OSError(ctypes.get_errno(), "Could not preserve the release directory permissions")
+    finally:
+        libc.acl_free(acl)
+    children = os.listdir(source)
+    directories.append((source, set(children)))
+    for child in children:
+        preserve_entry(child, source, destination, libc, stack, checks, directories)
+    check_preserved_entry(source_parent, name, identity)
     # Set the directory's own restrictions after copying its existing children.
-    if libc.copyfile(os.fsencode(source), os.fsencode(destination), None, 7) != 0:  # COPYFILE_METADATA
+    if libc.fcopyfile(source, destination, None, 7) != 0:  # COPYFILE_METADATA
         raise OSError(ctypes.get_errno(), "Could not preserve the release directory metadata")
 
 
 def install_generation(staged, output, arch):
     # Lock the parent directory while preserving sibling files and exchanging generations.
-    parent_fd = os.open(output.parent, os.O_RDONLY)
-    try:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    with ExitStack() as stack:
+        parent_fd = os.open(output.parent, flags)
+        stack.callback(os.close, parent_fd)
         fcntl.flock(parent_fd, fcntl.LOCK_EX)
+        staged_fd = os.open(staged, flags)
+        stack.callback(os.close, staged_fd)
+        try:
+            output_fd = os.open(output.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            output_fd = None
+        if output_fd is not None:
+            stack.callback(os.close, output_fd)
+        existing = output_fd is not None
         assets = list(staged.iterdir())
         owned = previous_assets(output, arch)
         if owned:
@@ -302,12 +343,18 @@ def install_generation(staged, output, arch):
         current_names = {asset.name for asset in assets} | owned
         replacement = staged / ".generation"
         libc = ctypes.CDLL(None, use_errno=True)
-        existing = output.exists()
+        libc.acl_init.restype = ctypes.c_void_p
+        libc.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        libc.acl_free.argtypes = [ctypes.c_void_p]
+        checks = []
         if existing:
+            checks.append((parent_fd, output.name, entry_identity(os.fstat(output_fd))))
             replacement.mkdir()
             subprocess.run(["chmod", "-N", replacement], check=True, capture_output=True)
+            replacement_fd = os.open(".generation", flags, dir_fd=staged_fd)
+            stack.callback(os.close, replacement_fd)
             # Darwin COPYFILE_SECURITY copies the directory stat and ACL before its children inherit them.
-            if libc.copyfile(os.fsencode(output), os.fsencode(replacement), None, 3) != 0:
+            if libc.fcopyfile(output_fd, replacement_fd, None, 3) != 0:
                 raise OSError(ctypes.get_errno(), "Could not preserve the release directory permissions")
         else:
             # A new output inherits its parent's ACL before its files are assembled in private.
@@ -319,15 +366,19 @@ def install_generation(staged, output, arch):
         if not existing:
             replacement.rename(output)
             return
-        for entry in output.iterdir():
-            if entry.name in current_names:
+        names = os.listdir(output_fd)
+        directories = [(output_fd, set(names))]
+        for name in names:
+            if name in current_names:
                 continue
-            preserve_entry(entry, replacement / entry.name, libc)
+            preserve_entry(name, output_fd, replacement_fd, libc, stack, checks, directories)
+        for parent, name, identity in checks:
+            check_preserved_entry(parent, name, identity)
+        if any(set(os.listdir(directory)) != names for directory, names in directories):
+            raise OSError("The retained release directory changed")
         # Darwin RENAME_SWAP exchanges two populated directories on the same volume.
-        if libc.renamex_np(os.fsencode(replacement), os.fsencode(output), 2) != 0:
+        if libc.renameatx_np(staged_fd, b".generation", parent_fd, os.fsencode(output.name), 2) != 0:
             raise OSError(ctypes.get_errno(), "Could not install the verified release")
-    finally:
-        os.close(parent_fd)
 
 
 def collect(input_dir, output_dir, version):

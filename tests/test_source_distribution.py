@@ -824,6 +824,197 @@ def test_build_recipe_changes_are_recorded_without_git(tmp_path, monkeypatch):
     assert changed["engine"] == "e" * 64
 
 
+def local_input_record(project, tmp_path, monkeypatch, baseline, selected=None):
+    import frozen_sources
+    files = {"project/" + name: value for name, value in baseline.items()}
+    manifest = {"files": files}
+    if selected is not None:
+        inventory = tmp_path / "inventory.json"
+        inventory.write_text(json.dumps({"projectInputs": {name: baseline[name] for name in selected}}))
+        files["inventory.json"] = hashlib.sha256(inventory.read_bytes()).hexdigest()
+        manifest["architectures"] = {"arm64": {"inventory": "inventory.json"}}
+    manifest_path = tmp_path / "MANIFEST.json"
+    manifest_path.write_text(json.dumps(manifest))
+    record = tmp_path / "LOCAL-BUILD.json"
+    record.write_text(json.dumps({"arch": "arm64", "projectFiles": {}, "engine": "e" * 64}))
+    monkeypatch.setattr(frozen_sources, "launcher_digest", lambda _: "f" * 64)
+    frozen_sources.finalize_local_record(project, manifest_path, record, tmp_path / "launcher")
+    return json.loads(record.read_bytes())
+
+
+@pytest.mark.parametrize("name", ["requirements-build.lock", "requirements-build-x86_64.lock",
+                                    "requirements-cryptography-x86_64.lock", "setup.py", "setup.cfg", "MANIFEST.in", "README.md"])
+@pytest.mark.parametrize("change", ["modified", "removed"])
+def test_local_record_tracks_root_recipe_and_metadata_changes(tmp_path, monkeypatch, name, change):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nreadme="README.md"\nlicense-files=["LICENSE"]\n')
+    (project / name).write_text("# original\n")
+    baseline = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in project.iterdir()}
+    if change == "removed":
+        (project / name).unlink()
+    else:
+        (project / name).write_text("# changed\n")
+    record = local_input_record(project, tmp_path, monkeypatch, baseline)
+    changes = record["projectChanges"]
+    if change == "removed":
+        assert name in changes["removed"] and name not in record["projectFiles"]
+    else:
+        assert changes["modified"][name] == hashlib.sha256((project / name).read_bytes()).hexdigest()
+
+
+def test_local_record_follows_actual_backend_readme_and_license_inputs(tmp_path, monkeypatch):
+    import contextlib
+    import io
+    from setuptools import build_meta
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_bytes((ROOT / "pyproject.toml").read_bytes())
+    (project / "LICENSE").write_bytes((ROOT / "LICENSE").read_bytes())
+    (project / "README.md").write_text("Original readme\n")
+    (project / "homescreen").mkdir()
+    (project / "homescreen/__init__.py").write_text("")
+    baseline = {p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in project.rglob("*") if p.is_file()}
+    monkeypatch.chdir(project)
+    def metadata(name):
+        folder = tmp_path / name
+        folder.mkdir()
+        with contextlib.redirect_stdout(io.StringIO()):
+            dist = build_meta.prepare_metadata_for_build_wheel(str(folder))
+        return {p.relative_to(folder / dist).as_posix(): p.read_bytes() for p in (folder / dist).rglob("*") if p.is_file()}
+    original = metadata("before")
+    (project / "NOTICE").write_text("Unused explicit notice\n")
+    assert metadata("unused") == original
+    normal = local_input_record(project, tmp_path, monkeypatch, baseline)
+    assert "NOTICE" not in normal["projectFiles"]
+    assert normal["projectChanges"] == {"modified": {}, "added": {}, "removed": []}
+    (project / "README.md").write_text("Modified readme\n")
+    assert metadata("readme")["METADATA"] != original["METADATA"]
+    changed = local_input_record(project, tmp_path, monkeypatch, baseline)
+    assert "README.md" in changed["projectChanges"]["modified"]
+    config = (project / "pyproject.toml").read_text().replace('readme = "README.md"', 'readme = "DESCRIPTION.md"')
+    (project / "pyproject.toml").write_text(config.replace('license-files = ["LICENSE"]\n', ''))
+    additions = {"DESCRIPTION.md": "Alternate description\n", "COPYING": "Copy grant\n", "AUTHORS": "Credit\n",
+                 "LICENSE-recipient": "Additional grant\n", "setup.py": "from setuptools import setup\nsetup()\n",
+                 "setup.cfg": "[metadata]\n", "MANIFEST.in": "include homescreen/resource.txt\n"}
+    for name, text in additions.items():
+        (project / name).write_text(text)
+    (project / "homescreen/resource.txt").write_text("Editable resource\n")
+    actual = metadata("defaults")
+    assert b"Alternate description" in actual["METADATA"]
+    for name in ("LICENSE", "LICENSE-recipient", "COPYING", "AUTHORS", "NOTICE"):
+        assert actual["licenses/" + name] == (project / name).read_bytes()
+    changed = local_input_record(project, tmp_path, monkeypatch, baseline)
+    assert set(additions) | {"NOTICE"} <= changed["projectFiles"].keys()
+    assert "homescreen/resource.txt" in changed["projectChanges"]["added"]
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_replaced_readme_deletion_uses_captured_baseline_selection(tmp_path, monkeypatch, captured):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nreadme="README.md"\nlicense-files=[]\n')
+    (project / "README.md").write_text("Original\n")
+    baseline = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in project.iterdir()}
+    (project / "README.md").unlink()
+    (project / "DESCRIPTION.md").write_text("Replacement\n")
+    (project / "pyproject.toml").write_text('[project]\nreadme={file="DESCRIPTION.md",content-type="text/markdown"}\nlicense-files=[]\n')
+    record = local_input_record(project, tmp_path, monkeypatch, baseline, ["README.md", "pyproject.toml"] if captured else None)
+    assert set(record["projectChanges"]["modified"]) == {"pyproject.toml"}
+    assert set(record["projectChanges"]["added"]) == {"DESCRIPTION.md"}
+    assert record["projectChanges"]["removed"] == (["README.md"] if captured else [])
+
+
+def test_declared_dynamic_metadata_files_and_removed_license_globs(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nlicense-files=["grants/*.txt"]\n'
+        '[tool.setuptools.dynamic]\nreadme={file=["INTRO.md", "DETAILS.md"]}\n')
+    (project / "grants").mkdir()
+    for name in ("INTRO.md", "DETAILS.md", "grants/COPY.txt"):
+        (project / name).write_text("Original\n")
+    baseline = {p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in project.rglob("*") if p.is_file()}
+    (project / "grants/COPY.txt").unlink()
+    (project / "DETAILS.md").write_text("Modified details\n")
+    record = local_input_record(project, tmp_path, monkeypatch, baseline)
+    assert record["projectChanges"]["removed"] == ["grants/COPY.txt"]
+    assert set(record["projectChanges"]["modified"]) == {"DETAILS.md"}
+
+
+def test_default_license_inputs_ignore_directories_and_editor_backups(tmp_path):
+    from frozen_sources import local_root_inputs
+    (tmp_path / "pyproject.toml").write_text("[project]\n")
+    (tmp_path / "LICENSE").write_text("Grant\n")
+    (tmp_path / "NOTICE~").write_text("Unused editor backup\n")
+    (tmp_path / "LICENSES").mkdir()
+    assert local_root_inputs(tmp_path) == {"pyproject.toml", "LICENSE"}
+
+
+def test_setup_legacy_license_file_is_recorded_with_explicit_project_grants(tmp_path, monkeypatch):
+    import contextlib
+    import io
+    from setuptools import build_meta
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nname="example"\nversion="1.0"\nlicense="MIT"\n'
+        'license-files=["LICENSE"]\n[tool.setuptools]\npy-modules=["example"]\n')
+    (project / "example.py").write_text("value=1\n")
+    (project / "LICENSE").write_text("Original grant\n")
+    (project / "CREDITS.txt").write_text("Additional credit\n")
+    (project / "setup.cfg").write_text("[metadata]\nlicense_file=CREDITS.txt\n")
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    monkeypatch.chdir(project)
+    with contextlib.redirect_stdout(io.StringIO()):
+        name = build_meta.prepare_metadata_for_build_wheel(str(metadata))
+    assert (metadata / name / "licenses/CREDITS.txt").read_bytes() == b"Additional credit\n"
+    record = local_input_record(project, tmp_path, monkeypatch, {})
+    assert record["projectChanges"]["added"]["CREDITS.txt"] == hashlib.sha256(b"Additional credit\n").hexdigest()
+
+
+def test_captured_root_map_is_validated_against_trusted_project(tmp_path):
+    import io
+    import tarfile
+    import zipfile
+    from source_fixture import release_source
+    from source_archive import payload_tar, verify_tar
+    from source_inputs import json_bytes, sha256
+    release, checkout = tmp_path / "release", tmp_path / "checkout"
+    release.mkdir()
+    commit = release_source(release, "1.3.0", checkout)
+    archive = next(release.glob("*-source.tar.gz"))
+    with tarfile.open(archive) as source:
+        entries = {member.name: source.extractfile(member).read() for member in source}
+    manifest = json.loads(entries.pop("MANIFEST.json"))
+    expected = {name: sha256(checkout / name) for name in ("LICENSE", "pyproject.toml")}
+    def write(selected):
+        for arch in ("arm64", "x86_64"):
+            name = "inventories/" + arch + ".json"
+            volume = json.loads(entries[name])
+            volume["projectInputs"] = selected
+            entries[name] = json_bytes(volume)
+            native = release / f"home-screen-organizer-1.3.0-macos-{arch}.zip"
+            with zipfile.ZipFile(native) as source:
+                records = [(info, source.read(info)) for info in source.infolist()]
+            with zipfile.ZipFile(native, "w") as output:
+                for info, data in records:
+                    output.writestr(info, entries[name] if info.filename.endswith("/SourceInventory.json") else data)
+            manifest["architectures"][arch]["zip"] = sha256(native)
+        payload_tar(archive, ((name, 0o644, io.BytesIO(data), len(data)) for name, data in sorted(entries.items())),
+                    {key: value for key, value in manifest.items() if key != "files"})
+    write(expected)
+    verify_tar(archive, "1.3.0", commit, release=True, root=checkout, repository="example/project")
+    write({**expected, "LICENSE": "f" * 64})
+    with pytest.raises(ValueError, match="project input inventory differs"):
+        verify_tar(archive, "1.3.0", commit, release=True, root=checkout, repository="example/project")
+    for malformed in ([], {"LICENSE": None}):
+        write(malformed)
+        with pytest.raises(ValueError, match="project input inventory"):
+            verify_tar(archive, "1.3.0", commit, release=True, root=checkout, repository="example/project")
+
+
 @pytest.mark.parametrize("directory", ["Features", "build", "dist", "nested/build", "nested/dist", "__pycache__"])
 def test_added_swift_sources_keep_ordinary_directory_names(tmp_path, monkeypatch, directory):
     import frozen_sources

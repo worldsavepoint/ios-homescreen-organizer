@@ -201,10 +201,12 @@ def optimize(lay: Layout, opens: dict[str, int], keep_first_page: bool = False) 
     movable = sorted((x for p in pages for x in p if x.kind != "widget"), key=lambda n: -score(n))
     out: list[list[Node]] = []
     i = 0
+    last_widget = max((k for k, page in enumerate(widgets) if page), default=-1)
     for k in range(max(len(pages), 1)):
         page = list(widgets[k]) if k < len(widgets) else []
         used = sum(x.slots for x in page)
-        while i < len(movable) and used + movable[i].slots <= lay.page_slots:
+        reserve = sum(not widgets[j] for j in range(k + 1, last_widget + 1))
+        while len(movable) - i > reserve and used + movable[i].slots <= lay.page_slots:
             page.append(movable[i])
             used += movable[i].slots
             i += 1
@@ -216,5 +218,7 @@ def optimize(lay: Layout, opens: dict[str, int], keep_first_page: bool = False) 
             used += movable[i].slots
             i += 1
         out.append(page)
-    lay.repack_pages(lay.pages[:start] + [p for p in out if p])
+    while out and not out[-1]:
+        out.pop()
+    lay.repack_pages(lay.pages[:start] + out)
     return {"swipes_before": before, "swipes_after": swipes(lay, opens)}
