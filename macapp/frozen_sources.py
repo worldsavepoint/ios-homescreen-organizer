@@ -1,6 +1,7 @@
 """Identify and preserve editable inputs of a completed PyInstaller freeze."""
 from collections import defaultdict
 from fnmatch import fnmatchcase
+from glob import iglob
 from hashlib import sha256 as digest
 from importlib.metadata import distributions, version as package_version
 from pathlib import Path
@@ -348,8 +349,8 @@ def local_project_input(project, name):
 def local_root_inputs(project, baseline=()):
     names = {*baseline, *(path.name for path in project.iterdir() if path.is_file() or path.is_symlink())}
     return project_root_inputs(names, lambda name: local_project_input(project, name),
-                               lambda pattern: (path.relative_to(project).as_posix() for path in project.glob(pattern)
-                                                if path.is_file() or path.is_symlink()))
+                               lambda pattern: (name for name in iglob(pattern, root_dir=project, recursive=True)
+                                                if (project / name).is_file() or (project / name).is_symlink()))
 
 
 def captured_root_inputs(manifest, baseline, public):

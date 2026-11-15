@@ -762,6 +762,146 @@ def test_retained_generation_survives_callers_temporary_directory_cleanup(tmp_pa
     assert (output / "notes/original").read_bytes() == b"original notes"
 
 
+@pytest.mark.parametrize("target,change", [("zip", "none"), ("zip", "before"), ("zip", "replace"),
+    ("zip", "inplace"), ("dmg", "replace"), ("dmg", "inplace"),
+    ("manifest", "replace"), ("manifest", "inplace"), ("zip", "after_claim"), ("zip", "during_validation")])
+def test_public_package_binds_retirement_to_verified_ownership(tmp_path, monkeypatch, capsys, target, change):
+    import ctypes
+    import build_paths
+    import check_package_paths
+    from macapp import release as publisher
+    build, output = tmp_path / "build", tmp_path / "published"
+    app = build / "Screen Organizer.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "1.3.0",
+                                                            "HomeScreenOrganizerArchitecture": "arm64"}))
+    (build / "home-screen-organizer-1.3.0.dmg").write_bytes(b"synthetic image")
+    (output / "notes").mkdir(parents=True)
+    (output / "notes/keep").write_bytes(b"existing user notes")
+    old = {kind: output / f"home-screen-organizer-1.2.0-macos-arm64.{kind}" for kind in ("zip", "dmg")}
+    rows = []
+    for kind, path in old.items():
+        data = ("owned previous " + kind).encode().ljust(64, b".")
+        path.write_bytes(data)
+        path.chmod(0o640)
+        rows.append(hashlib.sha256(data).hexdigest() + "  " + path.name + "\n")
+    old["manifest"] = output / "SHA256SUMS.txt"
+    old["manifest"].write_text("".join(rows))
+    old["manifest"].chmod(0o640)
+    path = old[target]
+    original = path.stat()
+    payload = b"user document after verification".ljust(64, b"!")
+    def edit():
+        if change == "replace":
+            pending = output / "user-save.pending"
+            pending.write_bytes(payload)
+            pending.chmod(0o640)
+            os.replace(pending, path)
+            assert path.stat().st_ino != original.st_ino
+        else:
+            path.write_bytes(payload)
+            assert path.stat().st_ino == original.st_ino
+    if change == "before":
+        edit()
+    previous = publisher.previous_assets
+    def validated(folder, arch):
+        result = previous(folder, arch)
+        if change in ("replace", "inplace"):
+            edit()
+        return result
+    monkeypatch.setattr(publisher, "previous_assets", validated)
+    monkeypatch.setattr(build_paths, "read_roots", lambda _: [])
+    monkeypatch.setattr(publisher, "verify_image", lambda *args: None)
+    monkeypatch.setattr(check_package_paths, "check_archive", lambda *args: None)
+    if change == "during_validation":
+        file_digest = hashlib.file_digest
+        def digest(stream, *args, **kwargs):
+            result = file_digest(stream, *args, **kwargs)
+            if os.fstat(stream.fileno()).st_ino == original.st_ino:
+                edit()
+            return result
+        monkeypatch.setattr(publisher.hashlib, "file_digest", digest)
+    held = None
+    if change == "after_claim":
+        held = os.open(path, os.O_RDWR)
+        cdll = ctypes.CDLL
+        class Library:
+            def __init__(self):
+                self.real = cdll(None, use_errno=True)
+            def __getattr__(self, name):
+                if name == "renameatx_np":
+                    def rename(*args):
+                        result = self.real.renameatx_np(*args)
+                        if result == 0 and args[-1] == 4 and args[1] == os.fsencode(path.name):
+                            os.lseek(held, 0, os.SEEK_SET)
+                            os.write(held, payload)
+                            os.ftruncate(held, len(payload))
+                            os.utime(held, ns=(original.st_atime_ns, original.st_mtime_ns))
+                        return result
+                    return rename
+                return getattr(self.real, name)
+        monkeypatch.setattr(publisher.ctypes, "CDLL", lambda *args, **kwargs: Library())
+    try:
+        if change in ("before", "during_validation"):
+            with pytest.raises(ValueError, match="previous native release manifest"):
+                publisher.package(build, output, "1.3.0", "arm64")
+        else:
+            publisher.package(build, output, "1.3.0", "arm64")
+    finally:
+        if held is not None:
+            os.close(held)
+    assert (output / "notes/keep").read_bytes() == b"existing user notes"
+    published = output / "home-screen-organizer-1.3.0-macos-arm64.zip"
+    assert published.is_file() == (change not in ("before", "during_validation"))
+    copies = [item for item in tmp_path.rglob("*") if item.is_file() and item.read_bytes() == payload]
+    retained = list(tmp_path.glob(".native-release-*"))
+    message = capsys.readouterr().err
+    if change == "none":
+        assert not copies and not retained and not message
+        assert not old["zip"].exists() and not old["dmg"].exists()
+    else:
+        assert copies, "unverified replacement or observed edit must survive public package cleanup"
+        assert all(item.stat().st_mode & 0o777 == 0o640 for item in copies)
+        if change in ("before", "during_validation"):
+            assert not retained and not message
+        else:
+            assert "Release installed" in message and "retained" in message
+            assert any(str(folder) in message for folder in retained)
+            assert all(folder.stat().st_mode & 0o777 == 0o700 for folder in retained)
+
+
+@pytest.mark.parametrize("target", ["manifest", "zip"])
+def test_previous_asset_validation_rejects_pipes_without_waiting_for_writer(tmp_path, target):
+    import sys
+    old_zip = tmp_path / "home-screen-organizer-1.2.0-macos-arm64.zip"
+    old_dmg = old_zip.with_suffix(".dmg")
+    rows = []
+    for path in (old_zip, old_dmg):
+        path.write_bytes(b"owned archive")
+        rows.append(hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.name + "\n")
+    manifest = tmp_path / "SHA256SUMS.txt"
+    manifest.write_text("".join(rows))
+    path = manifest if target == "manifest" else old_zip
+    path.unlink()
+    os.mkfifo(path)
+    script = '''
+from pathlib import Path
+import sys
+from macapp.release import previous_assets
+try:
+    previous_assets(Path(sys.argv[1]), "arm64")
+except ValueError:
+    pass
+else:
+    raise AssertionError("Only regular previous assets can establish ownership")
+'''
+    try:
+        result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=1)
+    except subprocess.TimeoutExpired:
+        pytest.fail("Previous asset validation must reject a pipe without waiting for its writer")
+    assert result.returncode == 0, result.stderr
+
+
 def test_first_release_inherits_output_parent_acl(tmp_path):
     from macapp.release import install_generation
 

@@ -247,34 +247,58 @@ def verify_image(image, archive, folder):
         subprocess.run(["hdiutil", "detach", mount], check=True, capture_output=True)
 
 
+class _VerifiedAssets(set):
+    def __init__(self, names=(), verified=None):
+        super().__init__(names)
+        self.verified = verified or {}
+
+
+def asset_state(info):
+    return info.st_mode, info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 def previous_assets(output, arch):
-    manifest = output / "SHA256SUMS.txt"
-    if not manifest.exists() and not manifest.is_symlink():
-        return set()
     error = "Check the previous native release manifest"
-    if manifest.is_symlink() or not manifest.is_file():
-        raise ValueError(error)
     pattern = re.compile(r"(home-screen-organizer-" + RELEASE_VERSION + r"-macos-" + arch + r")\.(zip|dmg)")
-    names = set()
-    bases = set()
-    for row in manifest.read_text().splitlines():
-        checksum, separator, name = row.partition("  ")
-        match = pattern.fullmatch(name)
-        if not separator or not match or not re.fullmatch(r"[0-9a-f]{64}", checksum):
-            raise ValueError(error)
-        path = output / name
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(error)
-        with path.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != checksum:
+    names, bases, verified = set(), set(), {}
+    try:
+        directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return _VerifiedAssets()
+    try:
+        def read(name, checksum=None, *, contents=False):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise ValueError(error)
+                os.set_blocking(stream.fileno(), True)
+                data = stream.read() if contents else None
+                value = hashlib.sha256(data).hexdigest() if contents else hashlib.file_digest(stream, "sha256").hexdigest()
+                after = os.fstat(stream.fileno())
+                if asset_state(before) != asset_state(after) or checksum is not None and value != checksum:
+                    raise ValueError(error)
+                verified[name] = {"identity": entry_identity(after), "verified_state": asset_state(after), "sha256": value}
+                return data
+        try:
+            manifest = read("SHA256SUMS.txt", contents=True)
+        except FileNotFoundError:
+            return _VerifiedAssets()
+        for row in manifest.decode("utf-8").splitlines():
+            checksum, separator, name = row.partition("  ")
+            match = pattern.fullmatch(name)
+            if not separator or not match or not re.fullmatch(r"[0-9a-f]{64}", checksum) or name in names:
                 raise ValueError(error)
-        if name in names:
+            read(name, checksum)
+            names.add(name)
+            bases.add(match[1])
+        if len(names) != 2 or len(bases) != 1:
             raise ValueError(error)
-        names.add(name)
-        bases.add(match[1])
-    if len(names) != 2 or len(bases) != 1:
-        raise ValueError(error)
-    return names
+        return _VerifiedAssets(names, verified)
+    except (OSError, UnicodeError):
+        raise ValueError(error) from None
+    finally:
+        os.close(directory)
 
 
 def entry_identity(info):
@@ -326,6 +350,13 @@ def preserve_entry(name, source_parent, destination_parent, libc, stack, checks,
 def retire_entry(parent, name, expected, libc):
     if expected is None:
         return
+    if "verified_state" in expected:
+        try:
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError:
+            return
+        if entry_identity(current) != expected["identity"] or asset_state(current) != expected["verified_state"]:
+            return
     claimed = os.fsencode(".retired-" + uuid.uuid4().hex)
     name = os.fsencode(name)
     if libc.renameatx_np(parent, name, parent, claimed, 4) != 0:  # RENAME_EXCL
@@ -335,6 +366,18 @@ def retire_entry(parent, name, expected, libc):
         if entry_identity(info) != expected["identity"]:
             return
         if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            if "sha256" in expected:
+                fd = os.open(claimed, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(fd, "rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    # Claiming changes ctime; content and the other verified fields must still match.
+                    if (entry_identity(before) != expected["identity"]
+                            or asset_state(before)[:-1] != expected["verified_state"][:-1]):
+                        return
+                    os.set_blocking(stream.fileno(), True)
+                    value = hashlib.file_digest(stream, "sha256").hexdigest()
+                    if value != expected["sha256"] or asset_state(before) != asset_state(os.fstat(stream.fileno())):
+                        return
             os.unlink(claimed, dir_fd=parent)
         elif stat.S_ISDIR(info.st_mode) and "children" in expected:
             directory = os.open(claimed, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
@@ -409,8 +452,7 @@ def install_generation(staged, output, arch, *, publication=None):
             return
         names = os.listdir(output_fd)
         directories = [(output_fd, set(names))]
-        retired = {name: {"identity": entry_identity(os.stat(name, dir_fd=output_fd, follow_symlinks=False))}
-                   for name in names}
+        retired = {name: getattr(owned, "verified", {}).get(name) for name in names}
         for name in names:
             if name in current_names:
                 continue
