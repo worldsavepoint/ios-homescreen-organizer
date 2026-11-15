@@ -18,6 +18,7 @@ import tempfile
 import tarfile
 import zipfile
 import tomllib
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 ARCHITECTURES = ("arm64", "x86_64")
@@ -147,7 +148,7 @@ def package(build_dir, output_dir, version, arch):
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     basename = f"home-screen-organizer-{version}-macos-{arch}"
     folder = private_transaction(output_dir.parent)
-    committed = False
+    publication = {}
     try:
         staged = folder / "assets"
         staged.mkdir()
@@ -165,16 +166,19 @@ def package(build_dir, output_dir, version, arch):
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
             lines.append(f"{digest}  {asset.name}\n")
         (staged / "SHA256SUMS.txt").write_text("".join(lines))
-        install_generation(staged, output_dir, arch)
-        committed = True
+        install_generation(staged, output_dir, arch, publication=publication)
     finally:
         # Retained entries can share an inode with the live generation and with another hardlink.
         # Ordinary unlink never resets an ACL or mode to force retirement.
-        try:
-            shutil.rmtree(folder)
-        except OSError:
-            if committed:
-                print("Release installed. A protected previous file was retained privately.", file=sys.stderr)
+        retained = publication.get("retained")
+        if retained is None or not retained.is_relative_to(folder):
+            try:
+                shutil.rmtree(folder)
+            except OSError:
+                if publication.get("installed") and retained is None:
+                    retained = folder
+        if publication.get("installed") and retained is not None:
+            print(f"Release installed. Previous files were retained in {retained}.", file=sys.stderr)
 
 
 def app_contents(app):
@@ -284,11 +288,12 @@ def check_preserved_entry(parent, name, identity):
 
 def preserve_entry(name, source_parent, destination_parent, libc, stack, checks, directories):
     identity = entry_identity(os.stat(name, dir_fd=source_parent, follow_symlinks=False))
+    entry = {"identity": identity}
     checks.append((source_parent, name, identity))
     if identity[2] != stat.S_IFDIR:
         os.link(name, name, src_dir_fd=source_parent, dst_dir_fd=destination_parent, follow_symlinks=False)
         check_preserved_entry(destination_parent, name, identity)
-        return
+        return entry
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     source = os.open(name, flags, dir_fd=source_parent)
     stack.callback(os.close, source)
@@ -308,16 +313,51 @@ def preserve_entry(name, source_parent, destination_parent, libc, stack, checks,
         libc.acl_free(acl)
     children = os.listdir(source)
     directories.append((source, set(children)))
+    entry["children"] = {}
     for child in children:
-        preserve_entry(child, source, destination, libc, stack, checks, directories)
+        entry["children"][child] = preserve_entry(child, source, destination, libc, stack, checks, directories)
     check_preserved_entry(source_parent, name, identity)
     # Set the directory's own restrictions after copying its existing children.
     if libc.fcopyfile(source, destination, None, 7) != 0:  # COPYFILE_METADATA
         raise OSError(ctypes.get_errno(), "Could not preserve the release directory metadata")
+    return entry
 
 
-def install_generation(staged, output, arch):
+def retire_entry(parent, name, expected, libc):
+    if expected is None:
+        return
+    claimed = os.fsencode(".retired-" + uuid.uuid4().hex)
+    name = os.fsencode(name)
+    if libc.renameatx_np(parent, name, parent, claimed, 4) != 0:  # RENAME_EXCL
+        return
+    try:
+        info = os.stat(claimed, dir_fd=parent, follow_symlinks=False)
+        if entry_identity(info) != expected["identity"]:
+            return
+        if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            os.unlink(claimed, dir_fd=parent)
+        elif stat.S_ISDIR(info.st_mode) and "children" in expected:
+            directory = os.open(claimed, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+            try:
+                if entry_identity(os.fstat(directory)) != expected["identity"]:
+                    return
+                for child in os.listdir(directory):
+                    retire_entry(directory, child, expected["children"].get(child), libc)
+            finally:
+                os.close(directory)
+            # A child saved at the final syscall boundary prevents removal.
+            os.rmdir(claimed, dir_fd=parent)
+    except OSError:
+        pass
+    finally:
+        # A changed or protected object keeps its original private name when available.
+        libc.renameatx_np(parent, claimed, parent, name, 4)
+
+
+def install_generation(staged, output, arch, *, publication=None):
     # Lock the parent directory while preserving sibling files and exchanging generations.
+    publication = publication if publication is not None else {}
+    publication.update(installed=False, retained=None)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     with ExitStack() as stack:
         parent_fd = os.open(output.parent, flags)
@@ -365,13 +405,16 @@ def install_generation(staged, output, arch):
             shutil.copyfile(asset, replacement / asset.name)
         if not existing:
             replacement.rename(output)
+            publication["installed"] = True
             return
         names = os.listdir(output_fd)
         directories = [(output_fd, set(names))]
+        retired = {name: {"identity": entry_identity(os.stat(name, dir_fd=output_fd, follow_symlinks=False))}
+                   for name in names}
         for name in names:
             if name in current_names:
                 continue
-            preserve_entry(name, output_fd, replacement_fd, libc, stack, checks, directories)
+            retired[name] = preserve_entry(name, output_fd, replacement_fd, libc, stack, checks, directories)
         for parent, name, identity in checks:
             check_preserved_entry(parent, name, identity)
         if any(set(os.listdir(directory)) != names for directory, names in directories):
@@ -379,6 +422,25 @@ def install_generation(staged, output, arch):
         # Darwin RENAME_SWAP exchanges two populated directories on the same volume.
         if libc.renameatx_np(staged_fd, b".generation", parent_fd, os.fsencode(output.name), 2) != 0:
             raise OSError(ctypes.get_errno(), "Could not install the verified release")
+        publication.update(installed=True, retained=replacement)
+        try:
+            for name in os.listdir(output_fd):
+                retire_entry(output_fd, name, retired.get(name), libc)
+            os.rmdir(".generation", dir_fd=staged_fd)
+            publication["retained"] = None
+        except OSError:
+            # Keep protected data outside any caller-owned temporary cleanup envelope.
+            try:
+                protected = private_transaction(output.parent)
+                protected_fd = os.open(protected, flags)
+                try:
+                    os.rename(".generation", "previous", src_dir_fd=staged_fd, dst_dir_fd=protected_fd)
+                    publication["retained"] = protected
+                finally:
+                    os.close(protected_fd)
+            except OSError:
+                # Publication completed; the original private container remains protected.
+                pass
 
 
 def collect(input_dir, output_dir, version):

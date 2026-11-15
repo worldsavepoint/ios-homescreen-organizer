@@ -619,6 +619,149 @@ def test_release_aborts_if_new_user_entry_appears_after_listing(tmp_path, monkey
     assert not (output / "asset.zip").exists()
 
 
+@pytest.mark.parametrize("save_at", ["none", "exchange", "replace", "cleanup", "rmdir", "parking_failure", "parking_move_failure", "pre_exchange_failure"])
+def test_public_package_preserves_successful_saves_during_retirement(tmp_path, monkeypatch, capsys, save_at):
+    import ctypes
+    import build_paths
+    import check_package_paths
+    from macapp import release as publisher
+    build, output = tmp_path / "build", tmp_path / "published"
+    app = build / "Screen Organizer.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "1.3.0",
+                                                            "HomeScreenOrganizerArchitecture": "arm64"}))
+    (build / "home-screen-organizer-1.3.0.dmg").write_bytes(b"synthetic image")
+    notes = output / "notes"
+    notes.mkdir(parents=True, mode=0o750)
+    original = notes / "original.txt"
+    original.write_bytes(b"existing user notes")
+    original.chmod(0o640)
+    outside = tmp_path / "external-hardlink"
+    os.link(original, outside)
+    subprocess.run(["chmod", "+a", "everyone deny write", outside], check=True)
+    acl = subprocess.check_output(["ls", "-lde", outside], text=True).splitlines()[1:]
+    old_notes = os.open(notes, os.O_RDONLY | os.O_DIRECTORY)
+    identity = notes.stat().st_dev, notes.stat().st_ino
+    saved = False
+    payload = b"newly saved user document"
+    def save(replace=False):
+        nonlocal saved
+        if saved:
+            return
+        try:
+            fd = os.open("new-user-document.txt", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640, dir_fd=old_notes)
+        except FileNotFoundError:
+            return  # An already retired empty directory cannot accept a successful save.
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+        if replace:
+            os.replace("new-user-document.txt", "original.txt", src_dir_fd=old_notes, dst_dir_fd=old_notes)
+        saved = True
+    cdll, rmtree, rmdir = ctypes.CDLL, shutil.rmtree, os.rmdir
+    class Library:
+        def __init__(self):
+            self.real = cdll(None, use_errno=True)
+        def __getattr__(self, name):
+            if name == "renameatx_np":
+                def rename(*arguments):
+                    if arguments[-1] == 2 and save_at == "pre_exchange_failure":
+                        ctypes.set_errno(5)
+                        return -1
+                    if arguments[-1] == 2 and save_at in ("exchange", "replace", "parking_failure", "parking_move_failure"):
+                        save(save_at == "replace")
+                    return self.real.renameatx_np(*arguments)
+                return rename
+            return getattr(self.real, name)
+    def cleanup(folder, *args, **kwargs):
+        if save_at == "cleanup":
+            save()
+        return rmtree(folder, *args, **kwargs)
+    def remove_directory(name, *, dir_fd=None):
+        if save_at == "rmdir":
+            info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) == identity:
+                save()
+        return rmdir(name, dir_fd=dir_fd)
+    monkeypatch.setattr(publisher.ctypes, "CDLL", lambda *args, **kwargs: Library())
+    monkeypatch.setattr(publisher.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(publisher.os, "rmdir", remove_directory)
+    monkeypatch.setattr(build_paths, "read_roots", lambda _: [])
+    monkeypatch.setattr(publisher, "verify_image", lambda *args: None)
+    monkeypatch.setattr(check_package_paths, "check_archive", lambda *args: None)
+    if save_at == "parking_failure":
+        transaction = publisher.private_transaction
+        calls = 0
+        def private_transaction(parent):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise OSError("private parking unavailable")
+            return transaction(parent)
+        monkeypatch.setattr(publisher, "private_transaction", private_transaction)
+    if save_at == "parking_move_failure":
+        rename = os.rename
+        def move(source, destination, **kwargs):
+            if destination == "previous":
+                raise OSError("private parking move unavailable")
+            return rename(source, destination, **kwargs)
+        monkeypatch.setattr(publisher.os, "rename", move)
+    try:
+        if save_at == "pre_exchange_failure":
+            with pytest.raises(OSError, match="Could not install"):
+                publisher.package(build, output, "1.3.0", "arm64")
+        else:
+            publisher.package(build, output, "1.3.0", "arm64")
+    finally:
+        os.close(old_notes)
+    assert (output / "home-screen-organizer-1.3.0-macos-arm64.zip").is_file() == (save_at != "pre_exchange_failure")
+    assert original.samefile(outside) and outside.read_bytes() == b"existing user notes"
+    assert outside.stat().st_mode & 0o777 == 0o640
+    assert subprocess.check_output(["ls", "-lde", outside], text=True).splitlines()[1:] == acl
+    retained = list(tmp_path.glob(".native-release-*"))
+    message = capsys.readouterr().err
+    if saved:
+        copies = [path for path in tmp_path.rglob("*") if path.is_file() and path.read_bytes() == payload]
+        assert copies, "successful user save must survive the complete public retirement"
+        assert "Release installed" in message and "retained" in message
+        assert any(str(folder) in message for folder in retained)
+        assert all(folder.stat().st_mode & 0o777 == 0o700 for folder in retained)
+        assert all(path.stat().st_mode & 0o777 == 0o640 for path in copies)
+    else:
+        assert retained == [] and message == ""
+
+
+def test_retained_generation_survives_callers_temporary_directory_cleanup(tmp_path, monkeypatch):
+    import ctypes
+    import tempfile
+    from macapp import release as publisher
+    output = tmp_path / "published"
+    notes = output / "notes"
+    notes.mkdir(parents=True)
+    (notes / "original").write_bytes(b"original notes")
+    cdll = ctypes.CDLL
+    class Library:
+        def __init__(self):
+            self.real = cdll(None, use_errno=True)
+        def __getattr__(self, name):
+            if name == "renameatx_np":
+                def exchange(*args):
+                    if args[-1] == 2:
+                        (notes / "late-document").write_bytes(b"saved at publication")
+                    return self.real.renameatx_np(*args)
+                return exchange
+            return getattr(self.real, name)
+    monkeypatch.setattr(publisher.ctypes, "CDLL", lambda *args, **kwargs: Library())
+    with tempfile.TemporaryDirectory(dir=tmp_path) as temporary:
+        staged = Path(temporary) / "assets"
+        staged.mkdir()
+        (staged / "asset.zip").write_bytes(b"verified")
+        assert publisher.install_generation(staged, output, "arm64") is None
+    assert not Path(temporary).exists()
+    copies = [path for folder in tmp_path.glob(".native-release-*") for path in folder.rglob("late-document")]
+    assert len(copies) == 1 and copies[0].read_bytes() == b"saved at publication"
+    assert (output / "notes/original").read_bytes() == b"original notes"
+
+
 def test_first_release_inherits_output_parent_acl(tmp_path):
     from macapp.release import install_generation
 

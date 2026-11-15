@@ -926,10 +926,11 @@ def test_replaced_readme_deletion_uses_captured_baseline_selection(tmp_path, mon
     assert record["projectChanges"]["removed"] == (["README.md"] if captured else [])
 
 
-def test_declared_dynamic_metadata_files_and_removed_license_globs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pattern", ["grants/*.txt", "grants/**/*.txt"])
+def test_declared_dynamic_metadata_files_and_removed_license_globs(tmp_path, monkeypatch, pattern):
     project = tmp_path / "project"
     project.mkdir()
-    (project / "pyproject.toml").write_text('[project]\nlicense-files=["grants/*.txt"]\n'
+    (project / "pyproject.toml").write_text('[project]\nlicense-files=["' + pattern + '"]\n'
         '[tool.setuptools.dynamic]\nreadme={file=["INTRO.md", "DETAILS.md"]}\n')
     (project / "grants").mkdir()
     for name in ("INTRO.md", "DETAILS.md", "grants/COPY.txt"):
@@ -941,6 +942,103 @@ def test_declared_dynamic_metadata_files_and_removed_license_globs(tmp_path, mon
     record = local_input_record(project, tmp_path, monkeypatch, baseline)
     assert record["projectChanges"]["removed"] == ["grants/COPY.txt"]
     assert set(record["projectChanges"]["modified"]) == {"DETAILS.md"}
+
+
+def test_recursive_input_selection_matches_real_backend_and_legacy_removal(tmp_path, monkeypatch):
+    import contextlib
+    import io
+    from setuptools import build_meta
+    from frozen_sources import local_root_inputs, project_root_inputs
+    project = tmp_path / "project"
+    project.mkdir()
+    config = b'[project]\nname="example"\nversion="1.0"\nlicense="MIT"\nlicense-files=["grants/**/*.txt"]\n[tool.setuptools]\npy-modules=["example"]\n'
+    files = {"pyproject.toml": config, "example.py": b"value=1\n", "grants/direct.txt": b"direct grant\n",
+             "grants/deep/nested.txt": b"nested grant\n", "grants/.hidden.txt": b"hidden grant\n",
+             "grants/.private/hidden.txt": b"hidden subtree\n", "grants/unused.txt~": b"editor backup\n"}
+    for name, data in files.items():
+        path = project / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    output = tmp_path / "metadata"
+    output.mkdir()
+    monkeypatch.chdir(project)
+    with contextlib.redirect_stdout(io.StringIO()):
+        dist = build_meta.prepare_metadata_for_build_wheel(str(output))
+    licenses = output / dist / "licenses"
+    actual = {path.relative_to(licenses).as_posix(): path.read_bytes() for path in licenses.rglob("*") if path.is_file()}
+    assert actual == {name: files[name] for name in ("grants/direct.txt", "grants/deep/nested.txt")}
+    expected = {"pyproject.toml", "grants/direct.txt", "grants/deep/nested.txt"}
+    assert local_root_inputs(project) == expected
+    assert project_root_inputs(files, files.__getitem__) == expected
+    baseline = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+    (project / "grants/direct.txt").unlink()
+    record = local_input_record(project, tmp_path, monkeypatch, baseline)
+    assert record["projectChanges"]["removed"] == ["grants/direct.txt"]
+
+
+@pytest.mark.parametrize("pattern,expected", [
+    ("**/*.txt", {"root.txt", "grants/direct.txt", "grants/deep/nested.txt"}),
+    ("grants/**/**/*.txt", {"grants/direct.txt", "grants/deep/nested.txt"}),
+    ("grants/**/n?sted.[t]xt", {"grants/deep/nested.txt"}),
+    ("grants/**/.hidden.txt", {"grants/.hidden.txt"}),
+    ("grants/.private/**/*.txt", {"grants/.private/secret.txt"}),
+    ("grants/[.]private/*.txt", set()),
+])
+def test_trusted_recursive_patterns_keep_component_and_hidden_rules(pattern, expected):
+    from frozen_sources import project_root_inputs
+    names = {"root.txt", "grants/direct.txt", "grants/deep/nested.txt", "grants/.hidden.txt", "grants/.private/secret.txt"}
+    files = {name: b"grant\n" for name in names}
+    files["pyproject.toml"] = ('[project]\nlicense-files=["' + pattern + '"]\n').encode()
+    assert project_root_inputs(files, files.__getitem__) == expected | {"pyproject.toml"}
+
+
+@pytest.mark.parametrize("recursive", [False, True])
+def test_source_verifier_accepts_real_recursive_capture(tmp_path, monkeypatch, recursive):
+    import io
+    import subprocess
+    import tarfile
+    import zipfile
+    import source_fixture
+    from frozen_sources import local_root_inputs
+    from source_archive import payload_tar, verify_tar
+    from source_inputs import json_bytes, sha256
+    original = source_fixture.fixture_checkout
+    def checkout(root, version):
+        _, inputs, assets, runtime = original(root, version)
+        pattern = "grants/**/*.txt" if recursive else "grants/*.txt"
+        (root / "pyproject.toml").write_text('[project]\nversion="' + version + '"\nlicense-files=["' + pattern + '"]\n')
+        (root / "grants/deep").mkdir(parents=True)
+        (root / "grants/direct.txt").write_bytes(b"direct grant\n")
+        (root / "grants/deep/nested.txt").write_bytes(b"nested grant\n")
+        subprocess.run(["git", "-C", root, "add", "--", "pyproject.toml", "grants"], check=True)
+        subprocess.run(["git", "-C", root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                        "-c", "commit.gpgsign=false", "commit", "-qm", "Configure fixture grants"], check=True)
+        commit = subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip()
+        return commit, inputs, assets, runtime
+    monkeypatch.setattr(source_fixture, "fixture_checkout", checkout)
+    release, root = tmp_path / "release", tmp_path / "trusted"
+    release.mkdir()
+    commit = source_fixture.release_source(release, "1.3.0", root)
+    archive = next(release.glob("*-source.tar.gz"))
+    with tarfile.open(archive) as source:
+        entries = {member.name: source.extractfile(member).read() for member in source}
+    manifest = json.loads(entries.pop("MANIFEST.json"))
+    captured = {name: sha256(root / name) for name in local_root_inputs(root)}
+    for arch in ("arm64", "x86_64"):
+        name = "inventories/" + arch + ".json"
+        volume = json.loads(entries[name])
+        volume["projectInputs"] = captured
+        entries[name] = json_bytes(volume)
+        native = release / f"home-screen-organizer-1.3.0-macos-{arch}.zip"
+        with zipfile.ZipFile(native) as source:
+            records = [(info, source.read(info)) for info in source.infolist()]
+        with zipfile.ZipFile(native, "w") as output:
+            for info, data in records:
+                output.writestr(info, entries[name] if info.filename.endswith("/SourceInventory.json") else data)
+        manifest["architectures"][arch]["zip"] = sha256(native)
+    payload_tar(archive, ((name, 0o644, io.BytesIO(data), len(data)) for name, data in sorted(entries.items())),
+                {key: value for key, value in manifest.items() if key != "files"})
+    verify_tar(archive, "1.3.0", commit, release=True, root=root, repository="example/project")
 
 
 def test_default_license_inputs_ignore_directories_and_editor_backups(tmp_path):

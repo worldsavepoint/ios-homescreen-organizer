@@ -48,6 +48,7 @@ class Element {
  get layoutHidden(){for(let n=this;n;n=n.parent)if(n.hidden)return true;return false;}
  get scrollHeight(){return this.layoutHidden?0:this._scrollHeight;}set scrollHeight(v){this._scrollHeight=v;}
  get clientHeight(){return this.layoutHidden?0:this._clientHeight;}set clientHeight(v){this._clientHeight=v;}
+ getBoundingClientRect(){return this.rect||{left:12,right:272,top:20,bottom:80,width:260,height:60};}
  set className(v){this.attrs.class=v;}get className(){return this.attrs.class||'';}
  set textContent(v){this._text=String(v);this.children=[];}get textContent(){return this._text+this.children.map(n=>n.textContent).join('');}
  get id(){return this.attrs.id||'';}set id(v){this.attrs.id=v;}
@@ -80,7 +81,7 @@ const item={id:'synthetic.app',kind:'app',name:'Synthetic Notes',slots:1};
 const fixture={loaded:true,read_only:true,binding:{device:'synthetic',revision:'current'},source:'phone',device:{DeviceName:'Synthetic iPhone',ProductVersion:'18.0',ProductType:'iPhone'},
  dock:[],pages:[[{id:'synthetic.folder',kind:'folder',name:'My Folder',pos:[0,0,1,1],pages:[[item]]}]],library:[],bank:[],moved:['synthetic.app'],history:{undo:true,redo:false},
  grid:{cols:4,rows:6,dock:4,folder:9},slots:{page:24},diff:{has_changes:true,apply_token:"reviewed",placement_changes:[],items_moved:1,pages_before:1,pages_after:1,gaps_changed:0,to_app_library:0,problems:[]},moves:{},usage:null};
-const context={document,console,URL,URLSearchParams,Intl,Date,Set,Map,Promise,setTimeout:()=>0,clearTimeout(){},requestAnimationFrame:f=>f(),
+const context={document,console,URL,URLSearchParams,Intl,Date,Set,Map,Promise,innerWidth:1280,innerHeight:900,setTimeout:()=>0,clearTimeout(){},requestAnimationFrame:f=>f(),
  location:{hash:'',pathname:'/',search:''},history:{replaceState(){}},navigator:{languages:['en'],clipboard:{writeText:async t=>copied.push(t)}},
  localStorage:{getItem:k=>stored.get(k)||null,setItem:(k,v)=>stored.set(k,v)},Image:class extends Element{constructor(){super('img');}},
  Event:class{constructor(type){this.type=type;}},CustomEvent:class{constructor(type){this.type=type;}},
@@ -869,6 +870,22 @@ assert.equal(fixture.pages[0][0].pages.length,2);assert.equal($('#folder-name').
 fixture.pages[0][0].pages[1].push({id:'second',kind:'app',name:'Second'});
 $('#folder-add-page').click();assert.equal($('#folder-pages').children.length,3);
 assert.equal(calls.filter(p=>p==='/api/op').length,0);
+''', native=True)
+
+
+def test_organize_popup_tracks_measured_viewport_resize_and_locale():
+    browser('''
+const button=$('#organize-btn'),menu=$('#organize-menu');
+context.innerWidth=640;context.innerHeight=800;
+button.rect={left:20,right:76,top:90,bottom:126,width:56,height:36};
+menu.rect={left:-184,right:76,top:132,bottom:400,width:260,height:268};
+button.click();assert.equal(menu.style.left,'12px');assert.equal(menu.style.top,'132px');
+context.innerWidth=800;button.rect.right=600;document.dispatchEvent({type:'resize'});
+assert.equal(menu.style.left,'340px');
+menu.rect.width=500;await i18n.setLocale('fr');assert.equal(menu.style.left,'100px');
+context.innerWidth=360;menu.rect.width=336;document.dispatchEvent({type:'resize'});assert.equal(menu.style.left,'12px');
+document.dispatchEvent({type:'keydown',key:'Escape',target:button});
+assert.equal(menu.hidden,true);assert.equal(document.activeElement,button);
 ''', native=True)
 
 

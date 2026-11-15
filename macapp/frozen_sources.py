@@ -1,5 +1,6 @@
 """Identify and preserve editable inputs of a completed PyInstaller freeze."""
 from collections import defaultdict
+from fnmatch import fnmatchcase
 from hashlib import sha256 as digest
 from importlib.metadata import distributions, version as package_version
 from pathlib import Path
@@ -263,6 +264,22 @@ ROOT_RECIPES = {"pyproject.toml", "LICENSE", "requirements-build.lock", "require
                 "requirements-cryptography-x86_64.lock", "setup.py", "setup.cfg", "MANIFEST.in"}
 
 
+def source_glob_matches(name, pattern):
+    """Match standard recursive glob components without accessing a filesystem."""
+    names = name.split("/")
+    reachable = {0}
+    for component in pattern.split("/"):
+        if component == "**":
+            for index, value in enumerate(names):
+                if index in reachable and not value.startswith("."):
+                    reachable.add(index + 1)
+        else:
+            reachable = {index + 1 for index in reachable if index < len(names)
+                         and (not names[index].startswith(".") or component.startswith("."))
+                         and fnmatchcase(names[index], component)}
+    return len(names) in reachable
+
+
 def project_root_inputs(names, read, expand=lambda pattern: ()):
     """Select the pinned backend's declared metadata and native recipe inputs."""
     names = set(names)
@@ -312,8 +329,8 @@ def project_root_inputs(names, read, expand=lambda pattern: ()):
         patterns = [*patterns, legacy]
     for pattern in patterns:
         relative_name(pattern)
-        selected.update(name for name in names if not name.endswith("~") and Path("/" + name).match("/" + pattern))
-        selected.update(relative_name(name) for name in expand(pattern) if not name.endswith("~"))
+        selected.update(relative_name(name) for name in names.union(expand(pattern))
+                        if not name.endswith("~") and source_glob_matches(name, pattern))
     return selected
 
 

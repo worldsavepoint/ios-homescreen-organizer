@@ -394,6 +394,7 @@ function render(restoreFocus = true) {
   renderSelection();
   renderFooter();
   focusItem(focused);
+  positionOrganizeMenu();
 }
 
 function itemControl(node, item, context) {
@@ -1202,7 +1203,22 @@ $("#reset").onclick = async () => {
 };
 $("#review").onclick = review;
 $("#backups-btn").onclick = () => showBackups().catch((e) => showError(e));
-$("#organize-btn").onclick = (e) => { e.stopPropagation(); $("#organize-menu").hidden = !$("#organize-menu").hidden; };
+function positionOrganizeMenu() {
+  const menu = $("#organize-menu");
+  if (menu.hidden) return;
+  const margin = 12, trigger = $("#organize-btn").getBoundingClientRect();
+  menu.style.left = `${margin}px`;
+  menu.style.top = `${trigger.bottom + 6}px`;
+  const {width, height} = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(margin, Math.min(trigger.right - width, innerWidth - width - margin))}px`;
+  menu.style.top = `${Math.max(margin, Math.min(trigger.bottom + 6, innerHeight - height - margin))}px`;
+}
+$("#organize-btn").onclick = (e) => {
+  e.stopPropagation();
+  $("#organize-menu").hidden = !$("#organize-menu").hidden;
+  positionOrganizeMenu();
+};
+window.addEventListener("resize", positionOrganizeMenu);
 document.querySelectorAll("#organize-menu [data-op]").forEach((b) => { b.onclick = () => organize(b.dataset.op); });
 document.addEventListener("click", (e) => {
   if (!$("#organize-menu").contains(e.target)) $("#organize-menu").hidden = true;
@@ -1278,5 +1294,6 @@ ScreenOrganizerI18n.onChange(() => {
   if (openFolder) $("#folder-name").value = folderDraft;
   renderDeviceMenu();
   refreshText();
+  positionOrganizeMenu();
 });
 ScreenOrganizerOnboarding.ready.then(() => api("/api/state")).then(setView).catch((e) => { showError(e); setView({ loaded: false }); }).then(loadDevices);
