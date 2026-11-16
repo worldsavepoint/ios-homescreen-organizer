@@ -686,6 +686,25 @@ function renderPages() {
   box.appendChild(add);
 }
 
+function renderSearch() {
+  if (!V?.loaded) return;
+  const items = new Map();
+  for (const pool of [V.dock, ...V.pages, V.library || [], V.bank || []]) {
+    for (const item of pool) {
+      items.set(item.id, item);
+      for (const page of item.pages || []) for (const child of page) items.set(child.id, child);
+    }
+  }
+  for (const node of document.querySelectorAll(".item[data-id]")) {
+    if (node.closest("#folder-pages") && !openFolder) continue;
+    const item = items.get(node.dataset.id);
+    const hit = matches(item) || (item.pages || []).flat().some(matches);
+    node.classList.toggle("hit", Boolean(query) && hit);
+    node.classList.toggle("dim", Boolean(query) && !hit);
+  }
+  renderLibrary();
+}
+
 let libraryCollator, libraryLocale, libraryData, libraryOrder = [];
 let libraryRows = new Map();
 function renderLibrary() {
@@ -1493,7 +1512,7 @@ document.addEventListener("click", (e) => {
 });
 try { $("#keep-first").checked = localStorage.getItem("hs.keepFirst") !== "0"; } catch (_) {}
 $("#keep-first").onchange = (e) => { try { localStorage.setItem("hs.keepFirst", e.target.checked ? "1" : "0"); } catch (_) {} };
-$("#search").oninput = (e) => { query = e.target.value.trim().toLowerCase(); render(); };
+$("#search").oninput = (e) => { query = e.target.value.trim().toLowerCase(); renderSearch(); };
 $("#sel-folder").onclick = newFolderFromSelection;
 $("#sel-place").onclick = () => {
   if (sel.size !== 1) return;

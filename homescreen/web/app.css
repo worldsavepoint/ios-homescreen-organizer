@@ -244,8 +244,12 @@ footer.bar { grid-column: 1; grid-row: 3; }
 .toast:has(details) { max-height: calc(100vh - 82px); overflow: auto; overflow-wrap: anywhere; }
 .toast[inert] { visibility: hidden; }
 .toast .pending-result { margin-top: 10px; border-top: 1px solid currentColor; padding-top: 10px; }
-.toast.error { background: var(--danger); color: #fff; }
+.toast.error { background: #a32620; color: #fff; }
+.toast.error .diagnostic { color: inherit; }
+.toast.error button { color: var(--fg); }
 .toast.ok { background: var(--ok); color: #003d14; }
+.toast.ok .diagnostic { color: inherit; }
+.toast.ok button { color: var(--fg); }
 .busy { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 70; display: grid; place-items: center; align-content: center; gap: 14px; color: #fff; font-weight: 600; }
 .spinner { width: 34px; height: 34px; border: 3px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

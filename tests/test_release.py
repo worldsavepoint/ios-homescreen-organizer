@@ -1328,7 +1328,8 @@ def test_publication_reports_failure_to_recover_removed_permissions(tmp_path, mo
 
 
 @pytest.mark.parametrize("reservation", ["ordinary", "occupied", "stable", "unnamed", "changed-after-save",
-                                         "changed-before-report"])
+                                         "changed-before-report",
+                                         "acl-parent-before-report", "acl-record-before-report", "acl-error-before-report"])
 def test_package_reports_only_owned_recovery_names(tmp_path, monkeypatch, capsys, reservation):
     import build_paths
     import check_package_paths
@@ -1377,11 +1378,21 @@ def test_package_reports_only_owned_recovery_names(tmp_path, monkeypatch, capsys
             save(change, stream)
             edit_saved_record()
         monkeypatch.setattr(release._RemovedDirectoryChanged, "save", save_then_edit)
-    if reservation == "changed-before-report":
+    if reservation == "changed-before-report" or reservation.startswith("acl-"):
         cleanup = shutil.rmtree
         def cleanup_then_edit(folder):
             cleanup(folder)
-            edit_saved_record()
+            if reservation == "changed-before-report":
+                edit_saved_record()
+            elif reservation == "acl-error-before-report":
+                from homescreen import private_store
+                def unreadable(fd):
+                    raise OSError("fixture ACL inspection failed")
+                monkeypatch.setattr(private_store, "_check_darwin_acl", unreadable)
+            else:
+                target = protected if reservation == "acl-parent-before-report" else protected / name
+                grant = "everyone allow list,search,readattr,readsecurity" if target == protected else "everyone allow read,readattr,readsecurity"
+                subprocess.run(["/bin/chmod", "+a", grant, target], check=True, capture_output=True)
         monkeypatch.setattr(shutil, "rmtree", cleanup_then_edit)
     inspect = release._DirectoryCopy.check_removed
     def inspect_removed(directory, libc):
@@ -1391,13 +1402,19 @@ def test_package_reports_only_owned_recovery_names(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(release._DirectoryCopy, "check_removed", inspect_removed)
     monkeypatch.setattr(sys, "argv", ["release.py", "package", "--arch", "arm64", "--build-dir", str(build),
                                      "--output-dir", str(output)])
-    if reservation.startswith("changed-"):
+    if reservation.startswith(("changed-", "acl-")):
         with pytest.raises(SystemExit) as status:
             release.main()
         result = capsys.readouterr()
         assert status.value.code == 1 and not result.out
         assert "Release installed." in result.err and "Could not verify the saved directory permissions." in result.err
-        assert "permissions were saved in" not in result.err and (protected / name).read_bytes().startswith(b"!")
+        assert "permissions were saved in" not in result.err
+        if reservation.startswith("changed-"):
+            assert (protected / name).read_bytes().startswith(b"!")
+        else:
+            assert json.loads((protected / name).read_bytes())["mode"] == 0o1700
+            assert protected.stat().st_mode & 0o777 == 0o700
+            assert (protected / name).stat().st_mode & 0o777 == 0o600
         assert (output / f"home-screen-organizer-{VERSION}-macos-arm64.zip").is_file() and note.samefile(outside)
         return
     release.main()
@@ -1704,3 +1721,52 @@ def test_image_error_note_normalizes_ansi_before_matching_known_root():
     assert all(character.isprintable() for character in note) and len(note) <= 560
     assert error.cmd == ["hdiutil", "attach"] and error.returncode == 1
     assert error.output == b"native stdout" and error.stderr is reason
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin ACL contract")
+@pytest.mark.parametrize("where,accepted", [("private", True), ("parent", False), ("record", False),
+                                            ("deny-only", True), ("inspection-error", False)])
+@pytest.mark.parametrize("check_payload", [False, True])
+def test_recovery_record_checks_darwin_acls(tmp_path, monkeypatch, where, accepted, check_payload):
+    from macapp import release
+    from homescreen import private_store
+    parent = release.private_transaction(tmp_path)
+    record = parent / "record"
+    payload = b"saved permissions\n"
+    record.write_bytes(payload)
+    record.chmod(0o600)
+    if where in ("parent", "record", "deny-only"):
+        target = record if where == "record" else parent
+        grant = {"parent": "everyone allow list,search,readattr,readsecurity",
+                 "record": "everyone allow read,readattr,readsecurity", "deny-only": "everyone deny delete"}[where]
+        subprocess.run(["/bin/chmod", "+a", grant, target], check=True, capture_output=True)
+    elif where == "inspection-error":
+        def unreadable(fd):
+            raise OSError("fixture ACL inspection failed")
+        monkeypatch.setattr(private_store, "_check_darwin_acl", unreadable)
+    binding = release.entry_identity(parent.lstat()), release.entry_identity(record.lstat())
+    assert release._recovery_still_named(record, *binding, private_record=True,
+                                         payload=payload if check_payload else None) is accepted
+    assert record.read_bytes() == payload
+    assert release._recovery_still_named(record, *binding, payload=payload)
+
+
+def test_recovery_record_binds_the_open_parent(tmp_path, monkeypatch):
+    from macapp import release
+    parent = release.private_transaction(tmp_path)
+    record = parent / "record"
+    record.write_bytes(b"saved permissions")
+    record.chmod(0o600)
+    binding = release.entry_identity(parent.lstat()), release.entry_identity(record.lstat())
+    opened = os.open
+    retained = tmp_path / "retained"
+    def replace_parent(path, flags, *args, **kwargs):
+        if path == parent:
+            parent.rename(retained)
+            parent.mkdir(mode=0o700)
+            (parent / "record").write_bytes(b"saved permissions")
+            (parent / "record").chmod(0o600)
+        return opened(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", replace_parent)
+    assert not release._recovery_still_named(record, *binding, private_record=True, payload=b"saved permissions")
+    assert (retained / "record").read_bytes() == b"saved permissions"

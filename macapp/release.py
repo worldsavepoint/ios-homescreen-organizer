@@ -349,28 +349,48 @@ def _recovery_still_named(path, parent_identity, identity, *, private_record=Fal
         return stat.S_IMODE(info.st_mode) == 0o700 and info.st_uid == os.geteuid()
 
     try:
-        parent, entry = path.parent.lstat(), path.lstat()
-        if entry_identity(parent) != parent_identity or entry_identity(entry) != identity:
-            return False
-        if private_record and (not private_parent(parent) or stat.S_IMODE(entry.st_mode) != 0o600
-                               or entry.st_nlink != 1 or entry.st_uid != os.geteuid()):
-            return False
-        if payload is None:
-            return True
-        if entry.st_size != len(payload):
-            return False
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-        with os.fdopen(fd, "rb", buffering=0) as stream:
+        with ExitStack() as stack:
+            parent, entry = path.parent.lstat(), path.lstat()
+            if entry_identity(parent) != parent_identity or entry_identity(entry) != identity:
+                return False
+            if private_record and (not private_parent(parent) or not stat.S_ISREG(entry.st_mode)
+                                   or stat.S_IMODE(entry.st_mode) != 0o600
+                                   or entry.st_nlink != 1 or entry.st_uid != os.geteuid()):
+                return False
+            if payload is None and not private_record:
+                return True
+            if payload is not None and entry.st_size != len(payload):
+                return False
+            directory = None
+            if private_record:
+                directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                stack.callback(os.close, directory)
+                opened_parent = os.fstat(directory)
+                if not os.path.samestat(opened_parent, parent) or not private_parent(opened_parent):
+                    return False
+            fd = os.open(path.name if private_record else path,
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+            stream = stack.enter_context(os.fdopen(fd, "rb", buffering=0))
             opened = os.fstat(fd)
             if entry_identity(opened) != identity or asset_state(opened) != asset_state(entry):
                 return False
-            if stream.read(len(payload) + 1) != payload:
+            if payload is not None and stream.read(len(payload) + 1) != payload:
                 return False
+            if private_record and sys.platform == "darwin":
+                from homescreen.private_store import _check_darwin_acl
+                _check_darwin_acl(directory)
+                _check_darwin_acl(fd)
             named = path.lstat()
-            if not os.path.samestat(named, opened) or asset_state(named) != asset_state(opened):
+            if (not os.path.samestat(named, opened) or asset_state(named) != asset_state(opened)
+                    or asset_state(os.fstat(fd)) != asset_state(opened)):
                 return False
             final_parent = path.parent.lstat()
-            return os.path.samestat(final_parent, parent) and (not private_record or private_parent(final_parent))
+            final_open_parent = os.fstat(directory) if private_record else None
+            return (os.path.samestat(final_parent, parent)
+                    and (not private_record or private_parent(final_parent)
+                         and os.path.samestat(final_parent, final_open_parent)
+                         and private_parent(final_open_parent)
+                         and asset_state(final_open_parent) == asset_state(opened_parent)))
     except OSError:
         return False
 

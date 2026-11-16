@@ -1,15 +1,40 @@
 """Export the exact tracked project inputs used for an official native build."""
 import argparse
+import hashlib
+import os
 from pathlib import Path
 import subprocess
 from source_inputs import relative_name
 
 
+def git_environment():
+    return {**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 def tracked_blobs(root, commit):
-    records = subprocess.check_output(["git", "-C", root, "ls-tree", "-rzl", "--full-tree", commit]).split(b"\0")
-    child = subprocess.Popen(["git", "-C", root, "cat-file", "--batch"], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    yield from _tracked_blobs(root, commit)
+
+
+def tracked_blob(root, commit, name):
+    relative_name(name)
+    entries = _tracked_blobs(root, commit, name)
+    try:
+        _, _, data = next(entries)
+        next(entries, None)
+        return data
+    finally:
+        entries.close()
+
+
+def _tracked_blobs(root, commit, name=None):
     error = "Could not verify the requested Git blob"
+    paths = [] if name is None else ["--", name]
+    records = subprocess.check_output(["git", "-C", root, "ls-tree", "-rzl", "--full-tree", commit, *paths],
+                                      env=git_environment()).split(b"\0")
+    if name is not None and (len(records) != 2 or records[0].partition(b"\t")[2] != name.encode()):
+        raise ValueError(error)
+    child = subprocess.Popen(["git", "-C", root, "cat-file", "--batch"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_environment())
     try:
         for row in records:
             if not row:
@@ -25,7 +50,10 @@ def tracked_blobs(root, commit):
             if child.stdout.readline(256) != object_id + b" blob " + str(size).encode() + b"\n":
                 raise ValueError(error)
             data = child.stdout.read(size)
-            if len(data) != size or child.stdout.read(1) != b"\n":
+            digest = hashlib.new("sha1" if len(object_id) == 40 else "sha256")
+            digest.update(b"blob " + str(size).encode() + b"\0")
+            digest.update(data)
+            if len(data) != size or child.stdout.read(1) != b"\n" or digest.hexdigest().encode() != object_id:
                 raise ValueError(error)
             yield name, int(mode, 8) & 0o777, data
         child.stdin.close()
@@ -52,8 +80,8 @@ def tracked_blobs(root, commit):
 
 
 def export_project(root, target):
-    commit = subprocess.check_output(["git", "-C", root, "rev-parse", "--verify", "HEAD"], text=True).strip()
-    if subprocess.check_output(["git", "-C", root, "status", "--porcelain", "--untracked-files=all"]):
+    commit = subprocess.check_output(["git", "-C", root, "rev-parse", "--verify", "HEAD"], text=True, env=git_environment()).strip()
+    if subprocess.check_output(["git", "-C", root, "status", "--porcelain", "--untracked-files=all"], env=git_environment()):
         raise ValueError("Use a clean release checkout or a local source rebuild")
     target.mkdir()
     for name, mode, data in tracked_blobs(root, commit):

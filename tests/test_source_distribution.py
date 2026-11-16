@@ -666,7 +666,7 @@ def test_git_export_streams_verified_blobs_through_one_child_and_reaps_early_exi
     assert len(children) == 2 and children[-1][1].poll() is not None
 
 
-@pytest.mark.parametrize("damage", ["missing", "id", "type", "size", "truncated", "separator", "trailing", "exit"])
+@pytest.mark.parametrize("damage", ["missing", "id", "type", "size", "content", "truncated", "separator", "trailing", "exit"])
 def test_git_export_rejects_invalid_batch_frames(tmp_path, monkeypatch, damage):
     import subprocess
     import source_checkout
@@ -684,6 +684,8 @@ while request := sys.stdin.buffer.readline():
         identity = b"0" * len(oid) if damage == "id" else oid
         kind = b"tree" if damage == "type" else b"blob"
         payload = values[oid]
+        if damage == "content" and payload:
+            payload = bytes([payload[0] ^ 1]) + payload[1:]
         size = str(len(payload) + (1 if damage == "size" else 0)).encode()
         sys.stdout.buffer.write(identity + b" " + kind + b" " + size + b"\\n")
         if damage == "truncated":
@@ -1713,3 +1715,160 @@ def test_native_compiler_keeps_supplied_rust_flags_and_remaps_tool_roots(tmp_pat
     assert selected["ARCHFLAGS"] == "-arch x86_64"
     monkeypatch.setenv("CARGO_ENCODED_RUSTFLAGS", "")
     assert compiler_environment([tmp_path], "x86_64")["CARGO_ENCODED_RUSTFLAGS"].startswith("--remap-path-prefix=")
+
+
+@pytest.mark.parametrize("replacement", ["blob", "tree", "commit"])
+def test_exact_commit_readers_ignore_replacement_objects(tmp_path, monkeypatch, replacement):
+    import subprocess
+    from source_checkout import export_project, tracked_blobs
+    from source_archive import trusted_file, trusted_head, project_entries
+
+    root = tmp_path / "repository"
+    root.mkdir()
+    original, alternate = b"VERSION = 1\n", b"VERSION = 2\n"
+    (root / "payload.py").write_bytes(original)
+    (root / "alternate.py").write_bytes(alternate)
+    def git(*args):
+        return subprocess.check_output(["git", "-C", root, *args], text=True).strip()
+    git("init", "-q")
+    git("add", ".")
+    def commit():
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+            "-c", "commit.gpgsign=false", "commit", "-qm", "Fixture")
+        return git("rev-parse", "HEAD")
+    original_commit = commit()
+    original_tree = git("rev-parse", "HEAD^{tree}")
+    original_blob = git("rev-parse", "HEAD:payload.py")
+    alternate_blob = git("rev-parse", "HEAD:alternate.py")
+    assert export_project(root, tmp_path / "normal") == original_commit
+    assert (tmp_path / "normal/payload.py").read_bytes() == original
+    if replacement == "blob":
+        replaced, substitute = original_blob, alternate_blob
+    else:
+        (root / "payload.py").write_bytes(alternate)
+        git("add", ".")
+        alternate_commit = commit()
+        alternate_tree = git("rev-parse", "HEAD^{tree}")
+        (root / ".git/HEAD").write_text(original_commit + "\n")
+        (root / "payload.py").write_bytes(original)
+        git("add", ".")
+        replaced, substitute = ((original_tree, alternate_tree) if replacement == "tree"
+                               else (original_commit, alternate_commit))
+    refs = root / ".git/refs/replace"
+    refs.mkdir()
+    (refs / replaced).write_text(substitute + "\n")
+    monkeypatch.delenv("GIT_NO_REPLACE_OBJECTS", raising=False)
+    assert git("show", original_commit + ":payload.py").encode() == alternate.rstrip()
+    assert export_project(root, tmp_path / "export") == original_commit
+    assert (tmp_path / "export/payload.py").read_bytes() == original
+    trusted_head(root, original_commit)
+    assert trusted_file(root, original_commit, "payload.py") == original
+    assert {name: data for name, _, data in tracked_blobs(root, original_commit)}["payload.py"] == original
+    assert {name: stream.read() for name, _, stream, _ in project_entries(root, original_commit)}["project/payload.py"] == original
+    monkeypatch.setenv("GIT_NO_REPLACE_OBJECTS", "0")
+    assert trusted_file(root, original_commit, "payload.py") == original
+
+
+def test_trusted_file_reads_only_the_exact_requested_blob(tmp_path, monkeypatch):
+    import subprocess
+    from source_archive import trusted_file
+    commit, files = git_blob_tree(tmp_path)
+    original = subprocess.Popen
+    reads = []
+    def started(args, *a, **kw):
+        process = original(args, *a, **kw)
+        if "cat-file" in args:
+            write = process.stdin.write
+            def requested(data):
+                reads.append(data)
+                return write(data)
+            monkeypatch.setattr(process.stdin, "write", requested)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", started)
+    assert trusted_file(tmp_path, commit, "space name") == files["space name"][0]
+    assert len(reads) == 1
+    with pytest.raises(ValueError, match="Git blob"):
+        trusted_file(tmp_path, commit, "missing")
+
+
+def component_archive_with_excluded_entries(tmp_path, kind, excluded_count):
+    import io
+    import stat
+    import tarfile
+    import zipfile
+    archive = tmp_path / ("component." + kind)
+    if kind == "zip":
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as package:
+            for number in range(excluded_count):
+                package.writestr(f"project/.git/{number}/", b"")
+            selected = zipfile.ZipInfo("project/tool")
+            selected.external_attr = (stat.S_IFREG | 0o755) << 16
+            package.writestr(selected, b"ok")
+    else:
+        with tarfile.open(archive, "w:gz", compresslevel=1) as package:
+            for number in range(excluded_count):
+                ignored = tarfile.TarInfo(f"project/.git/{number}")
+                package.addfile(ignored)
+            selected = tarfile.TarInfo("project/tool")
+            selected.mode, selected.size = 0o755, 2
+            package.addfile(selected, io.BytesIO(b"ok"))
+    return archive
+
+
+@pytest.mark.parametrize("kind", ["zip", "tar.gz"])
+@pytest.mark.parametrize("raw_count", [150000, 150001])
+def test_component_entry_budget_counts_excluded_git_metadata(tmp_path, kind, raw_count):
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    archive = component_archive_with_excluded_entries(tmp_path, kind, raw_count - 1)
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    if raw_count > 150000:
+        with pytest.raises(ValueError, match="ZIP member|archive bounds"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert list(output.iterdir()) == [output / "tool"]
+        assert (output / "tool").read_bytes() == b"ok"
+        assert (output / "tool").stat().st_mode & 0o777 == 0o755
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("kind", ["zip", "tar.gz"])
+@pytest.mark.parametrize("extra", [0, 1])
+def test_component_byte_budget_counts_excluded_declared_sizes(tmp_path, monkeypatch, kind, extra):
+    import tarfile
+    import zipfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    archive = component_archive_with_excluded_entries(tmp_path, kind, 1)
+    original = sha256(archive)
+    declared = 2 * 1024**3 - 2 + extra
+    # Supply declared metadata without decompressing a multi-GiB excluded payload.
+    if kind == "zip":
+        infolist = zipfile.ZipFile.infolist
+        def declared_entries(package):
+            entries = infolist(package)
+            entries[0].file_size = declared
+            return entries
+        monkeypatch.setattr(zipfile.ZipFile, "infolist", declared_entries)
+    else:
+        next_member = tarfile.TarFile.next
+        def declared_entry(package):
+            item = next_member(package)
+            if item is not None and item.name.startswith("project/.git/"):
+                item.size = declared
+            return item
+        monkeypatch.setattr(tarfile.TarFile, "next", declared_entry)
+    output = tmp_path / "editable"
+    if extra:
+        with pytest.raises(ValueError, match="ZIP member|archive bounds"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert list(output.iterdir()) == [output / "tool"]
+        assert (output / "tool").read_bytes() == b"ok"
+        assert (output / "tool").stat().st_mode & 0o777 == 0o755
+    assert sha256(archive) == original

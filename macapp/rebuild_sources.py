@@ -28,12 +28,14 @@ def unpack_source(archive, output):
             with zipfile.ZipFile(archive) as zipped:
                 size = 0
                 seen = set()
-                for info in zipped.infolist():
+                for count, info in enumerate(zipped.infolist(), 1):
+                    size += info.file_size
+                    if size > 2 * 1024**3 or count > 150000:
+                        raise ValueError("Unsupported upstream ZIP member")
                     if ".git" in PurePosixPath(info.filename).parts:
                         continue
                     name = relative_name(info.filename.rstrip("/"))
-                    size += info.file_size
-                    if (name in seen or size > 2 * 1024**3 or len(seen) > 150000
+                    if (name in seen
                             or stat.S_IFMT(info.external_attr >> 16) not in (0, stat.S_IFDIR, stat.S_IFREG)):
                         raise ValueError("Unsupported upstream ZIP member")
                     seen.add(name)
@@ -47,14 +49,16 @@ def unpack_source(archive, output):
         else:
             with tarfile.open(archive) as tar:
                 members, seen, size = [], set(), 0
-                for item in tar:
+                for count, item in enumerate(tar, 1):
+                    size += item.size
+                    if size > 2 * 1024**3 or count > 150000:
+                        raise ValueError("Unexpected upstream archive bounds")
                     if ".git" in PurePosixPath(item.name).parts:
                         continue
                     name = relative_name(item.name.rstrip("/"))
                     if not (item.isfile() or item.isdir() or item.issym() or item.islnk()):
                         raise ValueError("Unsupported upstream source member")
-                    size += item.size
-                    if name in seen or size > 2 * 1024**3 or len(seen) > 150000:
+                    if name in seen:
                         raise ValueError("Unexpected upstream archive bounds")
                     seen.add(name)
                     members.append(item)

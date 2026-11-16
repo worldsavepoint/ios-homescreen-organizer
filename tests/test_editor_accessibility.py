@@ -1,5 +1,96 @@
 """Keyboard, recovery and rendering contracts for the editor."""
+import re
+
+import pytest
+
 from test_web_i18n import browser
+from test_web_i18n import WEB
+
+
+@pytest.mark.parametrize("drawer", [False, True])
+def test_search_retains_layout_controls_images_and_folder_name_draft(drawer):
+    browser("""
+$('#pages').querySelector('[data-id="synthetic.folder"]').click();
+if(!DRAWER)$('#drawer-close').click();
+const folder=$('#pages').querySelector('[data-id="synthetic.folder"]');
+const items=[...document.querySelectorAll('.item[data-id]')];
+const widgets=[...document.querySelectorAll('.widget[data-id]')];
+const images=[...document.querySelectorAll('img')];
+const rows=[...$('#library').children];
+const before=JSON.stringify(vm.runInContext('V',context));
+const first=$('#dock').firstChild;first.dispatchEvent({type:'click',shiftKey:true});
+$('#folder-name').value='Draft 雪 {name}';$('#folder-name').focus();
+for(const raw of ['  ALPHA ', 'alpha', '']) {
+  $('#search').value=raw;$('#search').dispatchEvent({type:'input'});
+  for(const [selector,expected] of [['.item[data-id]',items],['.widget[data-id]',widgets],['img',images]]) {
+    const actual=document.querySelectorAll(selector);
+    assert.equal(actual.length,expected.length);
+    assert.ok(actual.every((node,i)=>node===expected[i]),selector+' identity');
+  }
+  assert.ok($('#library').children.every((node,i)=>node===rows[i]));
+  assert.equal(first.getAttribute('aria-pressed'),'true');
+  assert.equal($('#search').value,raw);
+  assert.equal($('#folder-name').value,'Draft 雪 {name}');
+  assert.equal(document.activeElement,$('#folder-name'));
+  assert.equal(JSON.stringify(vm.runInContext('V',context)),before);
+  assert.equal(folder.classList.contains('hit'),Boolean(raw));
+  assert.equal($('#bank').firstChild.classList.contains('dim'),Boolean(raw));
+  for(const node of widgets) {
+    assert.equal(node.classList.contains('hit'),false);
+    assert.equal(node.classList.contains('dim'),false);
+  }
+  const child=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
+  assert.equal(child.classList.contains('hit'),Boolean(raw)&&DRAWER);
+}
+""".replace("DRAWER", str(drawer).lower()), native=True, setup="""
+fixture.pages[0][0].pages[0][0].name='Alpha child';
+fixture.pages[0].push({id:'synthetic.widget',kind:'widget',name:'Alpha widget',size:'small',icon:'widget.icon',config:{opaque:['雪',17]}});
+fixture.dock=[{id:'dock.alpha',name:'Alpha dock',kind:'app',icon:'dock.icon'}];
+fixture.bank=[{id:'bank.other',name:'Other',kind:'app',icon:'bank.icon'}];
+fixture.library=[{id:'lib.alpha',name:'Alpha library',kind:'app',icon:'lib.icon'}];
+""")
+
+
+@pytest.mark.parametrize("kind", ["error", "ok"])
+@pytest.mark.parametrize("dark", [False, True])
+def test_toast_diagnostic_and_neutral_button_contrast(dark, kind):
+    css = (WEB / "app.css").read_text()
+
+    def declarations(selector):
+        matches = re.findall(r"(?m)^" + re.escape(selector) + r"\s*\{([^{}]*)\}", css)
+        return dict(re.findall(r"([\w-]+)\s*:\s*([^;]+)", ";".join(matches)))
+
+    roots = re.findall(r":root\s*\{([^{}]*)\}", css)
+    colors = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+)", roots[0]))
+    if dark:
+        colors.update(re.findall(r"(--[\w-]+)\s*:\s*([^;]+)", roots[1]))
+
+    def resolve(value, inherited):
+        value = value.strip()
+        if value == "inherit":
+            return inherited
+        return colors[value[4:-1]] if value.startswith("var(") else value
+
+    def luminance(color):
+        color = color.lstrip("#")
+        if len(color) == 3:
+            color = "".join(c * 2 for c in color)
+        rgb = [int(color[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        rgb = [c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4 for c in rgb]
+        return sum(c * weight for c, weight in zip(rgb, (.2126, .7152, .0722)))
+
+    def ratio(a, b):
+        a, b = sorted((luminance(a), luminance(b)))
+        return (b + .05) / (a + .05)
+
+    error = declarations(".toast." + kind)
+    background = resolve(error["background"], colors["--fg"])
+    foreground = resolve(error["color"], colors["--bg"])
+    detail = declarations(".diagnostic") | declarations(".toast." + kind + " .diagnostic")
+    button = declarations("button") | declarations(".toast." + kind + " button")
+    assert ratio(foreground, background) >= 4.5
+    assert ratio(resolve(detail["color"], foreground), background) >= 4.5
+    assert ratio(resolve(button["color"], foreground), resolve(button["background"], background)) >= 4.5
 
 
 def test_unloaded_saved_draft_requires_reviewed_read():

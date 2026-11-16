@@ -17,7 +17,7 @@ import tomllib
 import zipfile
 
 from native_sources import selected_assets
-from source_checkout import tracked_blobs
+from source_checkout import git_environment, tracked_blob, tracked_blobs
 from source_tar import canonical_members
 from source_inputs import (HEX, INVENTORY_LIMIT, cache_directory, fetch, json_bytes, pin_name, read_locks,
                            relative_name, sha256, source_member)
@@ -242,12 +242,12 @@ def project_entries(root, commit):
 
 
 def trusted_file(root, commit, name):
-    return subprocess.check_output(["git", "-C", root, "show", commit + ":" + name])
+    return tracked_blob(root, commit, name)
 
 
 def trusted_head(root, commit):
     if (not re.fullmatch(r"[0-9a-f]{40}", commit)
-            or subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True).strip() != commit):
+            or subprocess.check_output(["git", "-C", root, "rev-parse", "HEAD"], text=True, env=git_environment()).strip() != commit):
         raise ValueError("Build source assets from the exact release commit")
 
 
@@ -303,8 +303,8 @@ def verify_release_inputs(folder, root, repository, version, manifest, files, mo
 def assemble(input_dir, release, version, commit, repository, root=ROOT):
     trusted_head(root, commit)
     for flag in ([], ["--cached"]):
-        subprocess.run(["git", "-C", root, "diff", "--quiet", *flag, commit, "--"], check=True)
-    project = tomllib.loads(subprocess.check_output(["git", "-C", root, "show", f"{commit}:pyproject.toml"], text=True))
+        subprocess.run(["git", "-C", root, "diff", "--quiet", *flag, commit, "--"], check=True, env=git_environment())
+    project = tomllib.loads(trusted_file(root, commit, "pyproject.toml").decode())
     if project["project"]["version"] != version:
         raise ValueError("Different project source version")
     packages, native = read_locks()
