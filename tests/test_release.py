@@ -1772,3 +1772,40 @@ def test_recovery_record_binds_the_open_parent(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "open", replace_parent)
     assert not release._recovery_still_named(record, *binding, private_record=True, payload=b"saved permissions")
     assert (retained / "record").read_bytes() == b"saved permissions"
+
+
+@pytest.mark.parametrize("failures, attempts, succeeds", [
+    ([], 1, True),
+    (["Resource busy"], 2, True),
+    (["Resource busy"] * 3, 3, False),
+    (["No space left on device"], 1, False),
+])
+def test_create_image_retries_only_when_the_resource_is_busy(
+        tmp_path, monkeypatch, failures, attempts, succeeds):
+    from macapp import release
+    stage = tmp_path / "staged files"
+    stage.mkdir()
+    image = tmp_path / "Screen Organizer.dmg"
+    runs = []
+
+    def run(argv, **kwargs):
+        runs.append(argv)
+        if len(runs) <= len(failures):
+            raise subprocess.CalledProcessError(
+                1, argv, stderr=f"hdiutil: create failed - {failures[len(runs) - 1]}\n"
+            )
+        Path(argv[-1]).write_bytes(b"disk image")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    if succeeds:
+        release.create_image(stage, image)
+        assert image.read_bytes() == b"disk image"
+    else:
+        with pytest.raises(subprocess.CalledProcessError) as caught:
+            release.create_image(stage, image)
+        assert failures[-1] in caught.value.stderr
+        assert not image.exists()
+    assert runs == [["hdiutil", "create", "-volname", "Screen Organizer", "-srcfolder",
+                     stage, "-ov", "-format", "UDZO", image]] * attempts

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import time
 import zipfile
 import tomllib
 import uuid
@@ -247,6 +248,28 @@ def image_error_note(error, image, mount):
     detail = re.sub(r"(?m)(?:[A-Za-z]:[\\/]|/)[^\r\n]*", "<path>", detail)
     detail = " ".join(detail.split())[:512]
     return "Image attachment failed. hdiutil stderr: " + (detail or "<empty>")
+
+
+def create_image(stage, image):
+    command = ["hdiutil", "create", "-volname", "Screen Organizer", "-srcfolder",
+               stage, "-ov", "-format", "UDZO", image]
+    environment = {**os.environ, "LC_ALL": "C"}
+    for delay in (3, 8, 0):
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True, env=environment)
+        except subprocess.CalledProcessError as error:
+            if error.stderr:
+                print(error.stderr, end="", file=sys.stderr)
+            if delay == 0 or "hdiutil: create failed - Resource busy" not in (error.stderr or "").splitlines():
+                raise
+            print(f"Retrying disk image creation in {delay} seconds.", file=sys.stderr)
+            time.sleep(delay)
+        else:
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="", file=sys.stderr)
+            return
 
 
 def verify_image(image, archive, folder):
@@ -891,13 +914,18 @@ def main():
         localization_command = commands.add_parser(action, help="Assemble or check native language resources")
         localization_command.add_argument("--app", type=Path, required=True)
         localization_command.add_argument("--locales", type=Path, default=ROOT / "homescreen/web/locales")
+    image_command = commands.add_parser("create-image", help="Create the native installer image")
+    image_command.add_argument("--stage", type=Path, required=True)
+    image_command.add_argument("--image", type=Path, required=True)
     copy_command = commands.add_parser("clean-copy", help="Stage an app without filesystem provenance metadata")
     copy_command.add_argument("--app", type=Path, required=True)
     copy_command.add_argument("--destination", type=Path, required=True)
     args = parser.parse_args()
     try:
         version = project_version(getattr(args, "tag", None))
-        if args.command == "clean-copy":
+        if args.command == "create-image":
+            create_image(args.stage, args.image)
+        elif args.command == "clean-copy":
             clean_copy(args.app, args.destination)
         elif args.command in ("localize", "check-localization"):
             localize(args.app, args.locales, check=args.command == "check-localization")
