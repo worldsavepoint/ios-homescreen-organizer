@@ -292,3 +292,23 @@ def test_malformed_remembered_draft_preserves_public_device_discovery(tmp_path, 
             assert {path.name: path.read_bytes() for path in drafts.iterdir()} == before
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("device", [7, ["old-device"], "old-device"])
+def test_adopt_shared_draft_uses_string_device_ids(tmp_path, monkeypatch, device):
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    shared = root / "draft.plist"
+    data = plistlib.dumps({"device": device})
+    shared.write_bytes(data)
+    shared.chmod(0o600)
+    monkeypatch.setattr(config, "DATA", root)
+
+    config._adopt_shared_draft()
+
+    assert shared.read_bytes() == data
+    target = root / "drafts" / "old-device.plist"
+    if isinstance(device, str):
+        assert target.read_bytes() == data
+    else:
+        assert not (root / "drafts").exists()

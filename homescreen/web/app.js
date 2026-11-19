@@ -857,6 +857,20 @@ function renderDrawer() {
   });
 }
 
+function showFolder(id) {
+  for (const folderId of new Set([openFolder, id])) {
+    if (folderId === null) continue;
+    for (const control of document.querySelectorAll(`[data-id="${CSS.escape(folderId)}"]`)) {
+      if (control.getAttribute("aria-controls") === "drawer") {
+        control.setAttribute("aria-expanded", String(folderId === id));
+      }
+    }
+  }
+  openFolder = id;
+  renderDrawer();
+  positionPopups();
+}
+
 function syncDrawerCoverage() {
   const drawer = $("#drawer"), main = $("#main"), board = $("#board"), library = $("#library-panel");
   const open = !drawer.hidden;
@@ -944,10 +958,9 @@ function onItemClick(e, item, context) {
     return;
   }
   if (item.kind === "folder") {
-    openFolder = item.id;
     folderOpener = {id: item.id, context};
-    sel.clear();
-    render();
+    clearSelection();
+    showFolder(item.id);
     $("#folder-name").focus();
     return;
   }
@@ -1548,8 +1561,7 @@ function closeFolder() {
   if (!openFolder) return;
   const opener = folderOpener;
   folderOpener = null;
-  openFolder = null;
-  render();
+  showFolder(null);
   focusItem(opener, true);
 }
 $("#drawer-close").onclick = closeFolder;
@@ -1588,7 +1600,7 @@ document.addEventListener("keydown", (e) => {
     if (openFolder && (e.target === $("#folder-name") || !e.target.matches("input,select,textarea"))) {
       e.preventDefault();
       if (e.target === $("#folder-name")) e.target.value = findItem(openFolder).name;
-      sel.clear();
+      clearSelection();
       closeFolder();
       return;
     }

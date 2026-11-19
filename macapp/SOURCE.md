@@ -4,20 +4,14 @@ The combined Python engine is distributed under GPL version 3 or later. The orig
 
 Use the source archive from the same release as your app or MCPB. Verify the archive against that release’s `SHA256SUMS.txt`, then extract it into a new directory. The commands below run from that directory with a Python 3.12 bootstrap interpreter. `MANIFEST.json` identifies the release commit, the native ZIP hashes and the original source archives. `inventories/arm64.json` and `inventories/x86_64.json` map the frozen modules, native files and notices to those inputs.
 
-## Edit a library
+## Prepare the build environment
 
 Use a native Mac of the target architecture, macOS 14 or later, the Xcode Command Line Tools, Python 3.12 and Node.js. The build uses Node.js to validate the browser translations. Intel builds of cryptography also require Perl, Rust 1.95.0 and the matching Intel OpenSSL build. The source helper checks each selected input before opening it.
 
 ```sh
 ARCH=$(uname -m)
-python3.12 project/macapp/rebuild_sources.py component pylzss --arch "$ARCH" --output editable-pylzss
-```
-
-Edit `editable-pylzss/src/pylzss.c`. To build a matching native extension, use the release interpreter, install the locked build tools, and build a wheel from the edited source directory.
-
-```sh
 export HOMESCREEN_SOURCE_CACHE="$PWD/sources"
-mkdir -p release-tools local-wheels
+mkdir -p release-tools
 python3.12 project/macapp/native_sources.py --arch "$ARCH" --destination "$PWD/release-tools/python"
 release-tools/python/bin/python3.12 -m venv release-tools/venv
 PYTHON="$PWD/release-tools/venv/bin/python"
@@ -29,16 +23,34 @@ if [ "$ARCH" = x86_64 ]; then
 else
   "$PYTHON" -m pip install --require-hashes --only-binary=:all: -r "$LOCK"
 fi
+```
+
+## Refreeze project changes
+
+After [preparing the build environment](#prepare-the-build-environment), edit the project’s Python, Swift or web sources in `project/`. Build the app in a new output directory.
+
+```sh
+"$PYTHON" project/macapp/rebuild_sources.py refreeze --arch "$ARCH" --output "$PWD/modified-build"
+```
+
+## Edit and refreeze a library
+
+After [preparing the build environment](#prepare-the-build-environment), extract the component.
+
+```sh
+"$PYTHON" project/macapp/rebuild_sources.py component pylzss --arch "$ARCH" --output editable-pylzss
+```
+
+Edit `editable-pylzss/src/pylzss.c` and build the replacement wheel.
+
+```sh
+mkdir -p local-wheels
 "$PYTHON" project/macapp/rebuild_sources.py wheel --arch "$ARCH" --source editable-pylzss --wheelhouse local-wheels --output local-requirements.lock
 "$PYTHON" -m pip install --no-deps --force-reinstall local-wheels/pylzss-*.whl
 "$PYTHON" -c 'import lzss; assert lzss.decompress(lzss.compress(b"Hello")) == b"Hello"'
 ```
 
 The generated `local-requirements.lock` selects your edited wheel by its local file URI and hash, and retains the original requirements for unchanged components, including the pure-Python chardet wheel. Keep the wheel directory in place and install the lock into a fresh virtual environment with `pip install --require-hashes --only-binary=:all: --find-links local-wheels -r local-requirements.lock`. On Intel also pass the directory containing the prepared cryptography wheel. Use this environment to run the editable project, its command line tools and the PyInstaller and Swift build steps described in `project/macapp/BUILDING.md`. Refreeze can also use authenticated wheels from `local-wheels` or `PIP_FIND_LINKS`. The lock embedded in a signed local app retains filenames and hashes with download locations removed.
-
-## Refreeze a modified Python package
-
-For an edit to the project’s own Python, Swift or web sources, run `"$PYTHON" project/macapp/rebuild_sources.py refreeze --arch "$ARCH" --output "$PWD/modified-build"`. This also builds the original project from the unpacked source archive.
 
 For a pure-Python component such as h11, run the `component` command with `h11`, edit its Python source, then run the same `wheel` command with that editable directory. Refreeze the engine and Swift app using the resulting local lock.
 

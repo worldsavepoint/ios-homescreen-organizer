@@ -1424,7 +1424,9 @@ def test_package_reports_only_owned_recovery_names(tmp_path, monkeypatch, capsys
         assert not protected.exists() and not result.err
     elif reservation == "occupied":
         assert (protected / name).samefile(marker) and marker.stat().st_nlink == 2
-        assert os.path.samestat((protected / "previous").stat(), identity) and str(protected) in result.err
+        previous = protected / "previous"
+        assert os.path.samestat(previous.stat(), identity)
+        assert f"Previous files were retained in {previous}." in result.err
         assert "permissions were saved" not in result.err
     else:
         saved = Path(result.err.partition("Previous directory permissions were saved in ")[2].rstrip(".\n"))

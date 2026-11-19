@@ -191,13 +191,14 @@ def package(build_dir, output_dir, version, arch):
             messages = []
             record = publication.get("permissions_record")
             if retained is not None:
-                if not _recovery_still_named(*publication["retained_binding"]):
+                previous, *binding = publication["retained_binding"]
+                if not _recovery_still_named(previous, *binding):
                     messages.append("Could not confirm the location of the remaining previous directory.")
                     retirement_error = retirement_error or _RetirementError("Release installed. Recovery is incomplete.")
                 elif record:
-                    messages.append(f"The remaining previous directory was retained in {retained}.")
+                    messages.append(f"The remaining previous directory was retained in {previous}.")
                 else:
-                    messages.append(f"Previous files were retained in {retained}.")
+                    messages.append(f"Previous files were retained in {previous}.")
             if record:
                 if _recovery_still_named(record, *publication["permissions_binding"], private_record=True,
                                          payload=publication["permissions_payload"]):

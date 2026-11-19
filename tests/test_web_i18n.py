@@ -760,8 +760,13 @@ def test_keyboard_item_controls_preserve_selection_modifiers_and_focus():
 const key=(node,key,extra={})=>node.dispatchEvent({type:'keydown',key,...extra});
 let folder=$('#pages').querySelector('[data-id="synthetic.folder"]');
 assert.equal(folder.getAttribute('role'),'button');assert.equal(folder.getAttribute('aria-expanded'),'false');
-folder.focus();key(folder,'Enter');
+folder.focus();key(folder,'Enter',{ctrlKey:true});
+assert.equal(folder.getAttribute('aria-pressed'),'true');
+key(folder,'Enter');
 assert.equal($('#drawer').hidden,false);
+assert.equal($('#pages').querySelector('[data-id="synthetic.folder"]'),folder);
+assert.equal(folder.getAttribute('aria-expanded'),'true');
+assert.equal(folder.getAttribute('aria-pressed'),'false');
 let item=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
 assert.equal(item.getAttribute('aria-label'),'Synthetic Notes');
 item.focus();key(item,' ');
@@ -772,8 +777,20 @@ item=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
 assert.equal(item.getAttribute('aria-pressed'),'false');assert.equal(document.activeElement,item);
 await i18n.setLocale('fr');
 assert.equal(document.activeElement,$('#folder-pages').querySelector('[data-id="synthetic.app"]'));
+folder=$('#pages').querySelector('[data-id="synthetic.folder"]');
 $('#drawer-close').click();
-assert.equal(document.activeElement,$('#pages').querySelector('[data-id="synthetic.folder"]'));
+assert.equal($('#pages').querySelector('[data-id="synthetic.folder"]'),folder);
+assert.equal(folder.getAttribute('aria-expanded'),'false');
+assert.equal(document.activeElement,folder);
+key(folder,'Enter');
+item=$('#folder-pages').querySelector('[data-id="synthetic.app"]');
+item.focus();key(item,' ');
+assert.equal($('#selection-bar').hidden,false);
+document.dispatchEvent({type:'keydown',key:'Escape',target:item});
+assert.equal($('#drawer').hidden,true);
+assert.equal($('#selection-bar').hidden,true);
+assert.equal(item.getAttribute('aria-pressed'),'false');
+assert.equal(document.activeElement,folder);
 assert.equal($('#pages').querySelector('.add-page').tagName,'button');
 ''', native=True)
 

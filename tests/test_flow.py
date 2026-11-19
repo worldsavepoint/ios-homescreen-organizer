@@ -157,7 +157,7 @@ def test_single_move_counts_once(phone):
     assert lay.diff()["items_moved"] == 1
 
 
-IOS27 = Path(__file__).parent / "fixtures" / "ios27.2-sim-IconState.plist"
+IOS27 = Path(__file__).parent / "fixtures" / "ios27-layout.plist"
 
 
 def test_ios27_dict_format_round_trips():
@@ -216,21 +216,20 @@ def test_arrange_with_library(tmp_path):
         lay.arrange([keep], library=["com.apple.Preview"])  # TV Remote dropped
 
 
-def test_real_phone_item_shapes():
-    """Shapes seen on an iOS 27.0.1 phone over USB: widgets and some apps carry an empty
-    iconLists, web clips have a UUID displayIdentifier and a webClipURL."""
-    widget = {"bundleIdentifier": "com.apple.weather.widget", "containerBundleIdentifier": "com.apple.weather",
-              "displayIdentifier": "3150CE23", "elementType": "widget", "gridSize": "small",
-              "iconLists": [], "iconType": "custom", "widgetIdentifier": "com.apple.weather"}
-    odd_app = {"bundleIdentifier": "com.zimride.instant", "displayIdentifier": "138B31A6",
+def test_empty_icon_lists_preserve_item_kinds():
+    """Widgets and apps can carry empty iconLists. Web clips use a display identifier and URL."""
+    widget = {"bundleIdentifier": "com.example.fixture.widget", "containerBundleIdentifier": "com.example.fixture",
+              "displayIdentifier": "F1000001", "elementType": "widget", "gridSize": "small",
+              "iconLists": [], "iconType": "custom", "widgetIdentifier": "com.example.fixture"}
+    odd_app = {"bundleIdentifier": "com.example.fixture.app", "displayIdentifier": "F1000002",
                "iconLists": [], "iconType": "app"}
-    clip = {"displayIdentifier": "9F1E", "displayName": "Router", "webClipURL": "http://192.168.1.1"}
-    folder = {"displayName": "Travel", "listType": "folder", "iconLists": [[app("com.a.b", "B"), odd_app]]}
+    clip = {"displayIdentifier": "F103", "displayName": "Fixture Clip", "webClipURL": "https://example.invalid/clip"}
+    folder = {"displayName": "Fixture Folder", "listType": "folder", "iconLists": [[app("com.a.b", "B"), odd_app]]}
     state = [[app("com.apple.mobilesafari", "Safari")], [widget, clip, folder]]
     lay = Layout(state)
     kinds = {n.id: n.kind for n in lay.nodes.values()}
-    assert kinds["widget:3150CE23"] == "widget" and kinds["9F1E"] == "webclip" and kinds["folder:1"] == "folder"
-    assert kinds["com.zimride.instant"] == "app"
+    assert kinds["widget:F1000001"] == "widget" and kinds["F103"] == "webclip" and kinds["folder:1"] == "folder"
+    assert kinds["com.example.fixture.app"] == "app"
     assert lay.pages[0][0].slots == 4
     assert lay.to_state() == state
 
@@ -240,8 +239,8 @@ def test_root_archive_for_phone_write():
     from homescreen.device import library_from_installed, to_root_archive
     widget = {"bundleIdentifier": "com.apple.weather.widget", "elementType": "widget", "gridSize": "small",
               "iconLists": [], "iconType": "custom", "displayIdentifier": "W1"}
-    clip = {"displayIdentifier": "9F1E", "displayName": "Router", "webClipURL": "/"}
-    folder = {"displayName": "Travel", "listType": "folder", "iconLists": [[app("com.a.b", "B")], []]}
+    clip = {"displayIdentifier": "F103", "displayName": "Fixture Clip", "webClipURL": "/"}
+    folder = {"displayName": "Fixture Folder", "listType": "folder", "iconLists": [[app("com.a.b", "B")], []]}
     state = [[app("com.apple.mobilesafari", "Safari")], [widget, clip, folder, app("com.x.y", "Y")]]
     installed = {"com.apple.mobilesafari": {}, "com.a.b": {}, "com.x.y": {}, "com.lib.app": {"CFBundleDisplayName": "Lib"},
                  "com.hidden": {"SBAppTags": ["hidden"]}, "com.apple.TVRemoteApp": {}}
@@ -251,8 +250,8 @@ def test_root_archive_for_phone_write():
     assert out["buttonBar"] == ["com.apple.mobilesafari"]
     page = out["iconLists"][0]
     assert "iconLists" not in page[0] and page[0]["gridSize"] == "small"
-    assert page[1] == "9F1E" and page[3] == "com.x.y"
-    assert page[2]["iconLists"] == [["com.a.b"], []] and page[2]["displayName"] == "Travel"
+    assert page[1] == "F103" and page[3] == "com.x.y"
+    assert page[2]["iconLists"] == [["com.a.b"], []] and page[2]["displayName"] == "Fixture Folder"
     assert out["ignored"] == ["com.lib.app"]
 
 

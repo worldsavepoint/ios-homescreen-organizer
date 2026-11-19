@@ -70,7 +70,7 @@ def _adopt_shared_draft() -> None:
         dev = plistlib.loads(data).get("device")
     except Exception:
         return
-    if dev and dev != "unselected":
+    if isinstance(dev, str) and dev and dev != "unselected":
         target = DATA / "drafts" / f"{''.join(c if c.isalnum() or c in '-._' else '_' for c in dev)}.plist"
         try:
             _publish_exclusive(target, data, root=DATA)

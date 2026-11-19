@@ -48,9 +48,10 @@ input:focus { border-color: var(--accent); }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; }
 .brand svg { width: 22px; height: 22px; }
 .device-btn { display: flex; align-items: center; gap: 6px; background: none; border-color: transparent; color: var(--muted);
-  margin-left: 2px; padding: 5px 9px; }
+  max-width: 100%; margin-left: 2px; padding: 5px 9px; text-align: start; white-space: normal; }
+#device { min-width: 0; overflow-wrap: anywhere; }
 .device-btn:hover { background: var(--panel-2); color: var(--fg); }
-.device-btn svg { width: 11px; height: 11px; }
+.device-btn svg { width: 11px; height: 11px; flex: none; }
 .device-btn.static { cursor: default; pointer-events: none; }
 .device-btn.static svg { display: none; }
 .device-menu .device-row .t { min-width: 0; }
@@ -68,6 +69,7 @@ input:focus { border-color: var(--accent); }
 .group { display: flex; gap: 4px; }
 
 .menu-wrap { position: relative; }
+.menu-wrap:has(> .device-btn) { min-width: 0; max-width: 100%; }
 .menu { position: absolute; right: 0; top: calc(100% + 6px); background: var(--panel); border: 1px solid var(--line);
   border-radius: 10px; box-shadow: var(--shadow); padding: 6px; min-width: 260px; z-index: 30; display: grid; gap: 2px; }
 .menu button { text-align: left; background: none; border: 0; padding: 8px 10px; border-radius: 6px; }
@@ -264,6 +266,9 @@ footer.bar { grid-column: 1; grid-row: 3; }
   .dock-row { flex-direction: column; align-items: stretch; gap: 4px; }
   .dock { min-width: 0; }
   main:not(.drawer-open) .dock { grid-template-columns: repeat(var(--dock-cols, 4), minmax(0, 1fr)); }
+  main:not(.drawer-open) :is(.grid, .dock) > .item { min-width: 0; }
+  main:not(.drawer-open) :is(.grid, .dock) > .item .tile { max-width: 100%; height: auto; aspect-ratio: 1; }
+  main:not(.drawer-open) .grid > .item .name { max-width: min(72px, 100%); }
   .dock .name { max-width: 100%; }
 }
 

@@ -205,7 +205,7 @@ def test_widget_configuration_ids_survive_writes(tmp_path):
 # ---- gaps ---------------------------------------------------------------------------------
 
 from pathlib import Path
-IOS27 = Path(__file__).parent / "fixtures" / "ios27.2-sim-IconState.plist"
+IOS27 = Path(__file__).parent / "fixtures" / "ios27-layout.plist"
 
 def _gap_layout():
     from fake_phone import app as mkapp, widget
