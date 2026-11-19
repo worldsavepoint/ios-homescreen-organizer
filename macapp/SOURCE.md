@@ -6,7 +6,7 @@ Use the source archive from the same release as your app or MCPB. Verify the arc
 
 ## Prepare the build environment
 
-Use a native Mac of the target architecture, macOS 14 or later, the Xcode Command Line Tools, Python 3.12 and Node.js. The build uses Node.js to validate the browser translations. Intel builds of cryptography also require Perl, Rust 1.95.0 and the matching Intel OpenSSL build. The source helper checks each selected input before opening it.
+Use a native Mac of the target architecture, macOS 14 or later, the Xcode Command Line Tools, Python 3.12 and Node.js. The build uses Node.js to validate the browser translations. On Intel, install Perl and `rustup`. The preparation script installs Rust 1.95.0 and builds the matching OpenSSL input. The source helper checks each selected input before opening it.
 
 ```sh
 ARCH=$(uname -m)
