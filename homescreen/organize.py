@@ -75,8 +75,9 @@ def alphabetical(lay: Layout, keep_first_page: bool = True, folders_first: bool 
 
 def sort_folder_contents(lay: Layout) -> None:
     """A-Z inside every folder, refilled in full folder pages."""
+    placed = {x.id for p in lay.pages for x in p} | {x.id for x in lay.dock}
     for n in list(lay.nodes.values()):
-        if n.kind == "folder" and n.id in {x.id for p in lay.pages for x in p} | {x.id for x in lay.dock}:
+        if n.kind == "folder" and n.id in placed:
             items = sorted((c for p in n.children for c in p), key=lambda c: c.name.lower())
             lay.refold(n, items)
 

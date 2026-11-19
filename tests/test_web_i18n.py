@@ -866,6 +866,111 @@ context.comparisons=0;context.Intl=Object.create(Intl);context.Intl.Collator=cla
 ''')
 
 
+def test_selection_refresh_bounds_owner_lookup_work():
+    browser('''
+const view=vm.runInContext('V',context), owners=[view.dock[0],...view.library];
+let reads=0;
+for(const owner of owners){const id=owner.id;Object.defineProperty(owner,'id',{
+ enumerable:true,configurable:true,get(){reads++;return id;}});}
+const select=ids=>{context.ids=ids;vm.runInContext('sel.clear();for(const id of ids)sel.add(id)',context);};
+for(const count of [90,0,1,10,180]){
+ const ids=count===1?['early']:Array.from({length:count},(_,i)=>'large.'+(2000-count+i));
+ select(ids);reads=0;vm.runInContext('renderSelection()',context);
+ assert.ok(reads<=(count<=1?count:2001),`selection ${count}: ${reads} owner ID reads`);
+ reads=0;const apps=vm.runInContext('selectedApps(sel)',context);
+ assert.deepEqual(Array.from(apps),ids);
+ assert.ok(reads<=(count<=1?count:2001),`selected apps ${count}: ${reads} owner ID reads`);
+}
+''', native=True, setup='''
+fixture.dock=[{id:'early',kind:'app',name:'Early'}];fixture.pages=[[]];
+fixture.library=Array.from({length:2000},(_,i)=>({id:'large.'+i,kind:'app',name:'App '+i}));
+''')
+
+
+def test_selection_view_normalization_bounds_owner_lookup_work():
+    browser('''
+const view=vm.runInContext('V',context);let reads=0;
+for(const owner of view.library){const id=owner.id;Object.defineProperty(owner,'id',{
+ enumerable:true,configurable:true,get(){reads++;return id;}});}
+const ids=Array.from({length:90},(_,i)=>'large.'+(1999-i));
+context.ids=[...ids,'missing'];vm.runInContext('for(const id of ids)sel.add(id)',context);
+const before=JSON.stringify(view),rows=[...$('#library').children],binding=view.binding;
+$('#search').focus();reads=0;vm.runInContext('setView(V)',context);const work=reads;
+assert.deepEqual(Array.from(vm.runInContext('sel',context)),ids);
+assert.equal(JSON.stringify(view),before);assert.equal(view.binding,binding);
+rows.forEach((row,i)=>assert.equal($('#library').children[i],row));
+assert.equal(document.activeElement,$('#search'));
+assert.ok(work<100000,`normalization and render: ${work} owner ID reads`);
+''', native=True, setup='''
+fixture.pages=[[]];fixture.library=Array.from({length:2000},(_,i)=>({id:'large.'+i,kind:'app',name:'App '+i}));
+''')
+
+
+def test_selection_refresh_preserves_first_owners_and_complete_outputs():
+    browser('''
+// The unchanged single-owner lookup supplies a control for the complete refresh.
+vm.runInContext(`function selectionControl(){
+ const bar=$("#selection-bar");bar.hidden=sel.size===0;
+ $("#sel-count").textContent=t("editor.selected",{count:number(sel.size)});
+ const eligible=[...sel].filter(id=>["app","webclip"].includes(findItem(id)?.kind));
+ $("#sel-folder").disabled=!eligible.length;
+ $("#sel-library").disabled=V.library===null||!eligible.length;
+ $("#sel-place").disabled=sel.size!==1||!["app","webclip","folder"].includes(findItem([...sel][0])?.kind);
+ $("#sel-unpin").hidden=![...sel].some(id=>findItem(id)?.pinned);
+}`,context);
+const tree=n=>({tag:n.tagName,attrs:{...n.attrs},dataset:{...n.dataset},text:n._text,
+ hidden:n.hidden,disabled:n.disabled,value:n.value,checked:n.checked,selected:n.classList.contains('selected'),
+ children:n.children.map(tree)});
+const snapshot=()=>({view:JSON.stringify(vm.runInContext('V',context)),
+ selection:Array.from(vm.runInContext('sel',context)),dom:tree(document),calls:[...calls],
+ moved:Array.from(vm.runInContext('movedIds',context)),query:vm.runInContext('query',context)});
+const allNodes=n=>[n,...n.children.flatMap(allNodes)];
+$('#search').value='Raw 雪';$('#search').focus();
+const cases=[
+ [[],true,true,true,true], [['early'],false,false,false,true],
+ [['folder'],true,true,false,false], [['child'],false,false,false,true],
+ [['dock-child'],false,false,false,false], [['bank-child'],false,false,false,true],
+ [['library-child'],false,false,false,true], [['widget'],true,true,true,false],
+ [['pin'],true,true,true,false], [['bank'],false,false,false,true],
+ [['duplicate'],true,true,true,true], [['child-duplicate'],true,true,true,true],
+ [['missing'],true,true,true,true], [['bank','early','missing'],false,false,true,true]
+];
+for(const locale of ['en','zh-Hans','zh-Hant','es','de','fr','ru','pt']){
+ await i18n.setLocale(locale);const rows=[...$('#library').children];
+ for(const [ids,folder,library,place,unpin] of cases){
+  context.ids=ids;vm.runInContext('sel.clear();for(const id of ids)sel.add(id);selectionControl()',context);
+  const expected=snapshot(),nodes=allNodes(document),active=document.activeElement;
+  const icons=Array.from(vm.runInContext('iconWork',context));
+  vm.runInContext('renderSelection()',context);
+  assert.deepEqual(snapshot(),expected);assert.deepEqual(allNodes(document),nodes);
+  assert.equal(document.activeElement,active);
+  assert.deepEqual(Array.from(vm.runInContext('iconWork',context)),icons);
+  assert.deepEqual([$('#sel-folder').disabled,$('#sel-library').disabled,$('#sel-place').disabled,$('#sel-unpin').hidden],
+   [folder,library,place,unpin],`${locale}: ${ids}`);
+  rows.forEach((row,i)=>assert.equal($('#library').children[i],row));
+ }
+}
+// The map must be rebuilt for a new view, preserving order and dropping stale IDs.
+vm.runInContext("sel.clear();sel.add('bank');sel.add('child');sel.add('missing');setView({...V,bank:[]})",context);
+assert.deepEqual(Array.from(vm.runInContext('sel',context)),['child']);
+vm.runInContext("sel.clear();sel.add('child');V.library=null;renderSelection()",context);
+assert.equal($('#sel-library').disabled,true);
+vm.runInContext('setView({...V,loaded:false})',context);
+assert.equal($('#selection-bar').hidden,true);
+assert.equal(vm.runInContext('sel.size',context),0);
+''', native=True, setup='''
+const app=id=>({id,kind:'app',name:id,icon:'fixture.icon'});
+fixture.dock=[app('early'),{id:'dock-folder',kind:'folder',name:'Dock',pages:[[{...app('dock-child'),pinned:true}]]},
+ {id:'duplicate',kind:'widget',name:'First duplicate',slots:1},
+ {id:'child-duplicate-container',kind:'folder',name:'Duplicates',pages:[[{id:'child-duplicate',kind:'widget',name:'First child',slots:1}]]}];
+fixture.pages=[[{id:'folder',kind:'folder',name:'Folder',pinned:true,pages:[[app('child')]]},
+ {id:'widget',kind:'widget',name:'Widget',slots:1,pinned:true},
+ {id:'pin',kind:'pin',name:'Pin',slots:1,pinned:true},app('duplicate'),app('child-duplicate')]];
+fixture.library=[app('library'),{id:'library-folder',kind:'folder',name:'Library folder',pages:[[app('library-child')]]}];
+fixture.bank=[app('bank'),{id:'bank-folder',kind:'folder',name:'Bank folder',pages:[[app('bank-child')]]}];
+''')
+
+
 def test_folder_add_reuses_existing_empty_subpage():
     browser('''
 $('#pages').querySelector('[data-id="synthetic.folder"]').click();

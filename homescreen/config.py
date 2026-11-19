@@ -108,10 +108,14 @@ def known_devices() -> dict[str, dict]:
             blob = plistlib.loads(_read_private(f))
         except Exception:
             continue
+        if not isinstance(blob, dict):
+            continue
+        device = blob.get("device")
         info = blob.get("info", {})
-        if blob.get("device"):
-            out[blob["device"]] = {"name": info.get("DeviceName"), "version": info.get("ProductVersion"),
-                                   "model": info.get("ProductType")}
+        if not isinstance(device, str) or not device or not isinstance(info, dict):
+            continue
+        out[device] = {"name": info.get("DeviceName"), "version": info.get("ProductVersion"),
+                       "model": info.get("ProductType")}
     return out
 
 

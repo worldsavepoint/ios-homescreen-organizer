@@ -333,6 +333,23 @@ function findItem(id) {
   return null;
 }
 
+function findItems(ids) {
+  const wanted = new Set(ids), found = new Map();
+  if (!V?.loaded || !wanted.size) return found;
+  const visit = item => {
+    const id = item.id;
+    if (wanted.delete(id)) found.set(id, item);
+    return !wanted.size;
+  };
+  for (const pool of [V.dock, ...V.pages, V.library || [], V.bank || []]) {
+    for (const item of pool) {
+      if (visit(item)) return found;
+      for (const page of item.pages || []) for (const child of page) if (visit(child)) return found;
+    }
+  }
+  return found;
+}
+
 let pendingDiagnostic = null;
 function toast(message, kind = "", detail, backup, result) {
   const latest = {message, kind, detail, backup, result};
@@ -467,12 +484,13 @@ function setView(v) {
   }
   V = v;
   movedIds = new Set(v.loaded ? v.moved || [] : []);
-  for (const id of [...sel]) if (!findItem(id)) sel.delete(id);
+  const selected = findItems(sel);
+  for (const id of [...sel]) if (!selected.has(id)) sel.delete(id);
   if (openFolder && !findItem(openFolder)) {
     openFolder = null;
     folderOpener = null;
   }
-  render(!deviceChanged);
+  render(!deviceChanged, selected);
 }
 
 function focusItem(item, reveal = false) {
@@ -496,7 +514,7 @@ function focusEditorContext() {
   (field.disabled ? $("#read") : field).focus();
 }
 
-function render(restoreFocus = true) {
+function render(restoreFocus = true, selected) {
   const active = restoreFocus && document.activeElement?.closest("[data-focus-context]");
   const focused = active && {id: active.dataset.id, context: active.dataset.focusContext};
   $("#read-only-notice").hidden = !(V && V.read_only);
@@ -543,7 +561,7 @@ function render(restoreFocus = true) {
   renderBank();
   renderUsage();
   renderDrawer();
-  renderSelection();
+  renderSelection(selected);
   renderFooter();
   focusItem(focused);
   positionPopups();
@@ -860,15 +878,15 @@ function syncDrawerCoverage() {
   if (redirect && !ScreenOrganizerOnboarding.dialog) $("#folder-name").focus();
 }
 
-function renderSelection() {
+function renderSelection(selected = findItems(sel)) {
   const bar = $("#selection-bar");
   bar.hidden = sel.size === 0;
   $("#sel-count").textContent = t("editor.selected", {count: number(sel.size)});
-  const eligible = selectedApps(sel);
+  const eligible = selectedApps(sel, selected);
   $("#sel-folder").disabled = !eligible.length;
   $("#sel-library").disabled = V.library === null || !eligible.length;
-  $("#sel-place").disabled = sel.size !== 1 || !["app", "webclip", "folder"].includes(findItem([...sel][0])?.kind);
-  $("#sel-unpin").hidden = ![...sel].some((i) => (findItem(i) || {}).pinned);
+  $("#sel-place").disabled = sel.size !== 1 || !["app", "webclip", "folder"].includes(selected.get([...sel][0])?.kind);
+  $("#sel-unpin").hidden = ![...sel].some((i) => selected.get(i)?.pinned);
 }
 
 function setSelected(node, selected) {
@@ -1139,8 +1157,8 @@ async function newFolderFromSelection() {
   await op("create_folder", { name, ids, target, index }, () => sel.clear(), binding);
 }
 
-function selectedApps(ids) {
-  return [...ids].filter(id => ["app", "webclip"].includes(findItem(id)?.kind));
+function selectedApps(ids, selected = findItems(ids)) {
+  return [...ids].filter(id => ["app", "webclip"].includes(selected.get(id)?.kind));
 }
 
 function libraryApps(ids) {

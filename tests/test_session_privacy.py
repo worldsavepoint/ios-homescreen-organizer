@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import os
+import plistlib
 from pathlib import Path
 import subprocess
 import sys
@@ -231,3 +232,63 @@ def test_private_file_validates_nonblocking_descriptor_before_use(tmp_path, monk
     _, flags, parent = opened[0]
     required = os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     assert parent is not None and flags & required == required
+
+
+@pytest.mark.parametrize("malformed", [
+    [], "scalar", {"device": "broken", "info": []}, {"device": "broken", "info": "scalar"},
+    {"device": ["broken"]}, {"device": {"id": "broken"}}, {"device": 7}, {"device": True},
+    {"device": ""}, {"info": {}},
+], ids=["root-list", "root-scalar", "info-list", "info-scalar", "device-list", "device-dict",
+        "device-int", "device-bool", "device-empty", "device-missing"])
+def test_malformed_remembered_draft_preserves_public_device_discovery(tmp_path, monkeypatch, malformed):
+    import httpx
+    from homescreen import ui
+
+    root = tmp_path / "data"
+    selected = Session(MemorySource(), root, device="valid-device")
+    monkeypatch.setattr(config, "DATA", root)
+    monkeypatch.setattr(config, "_switching", True)
+    monkeypatch.setattr(config, "_current", "valid-device")
+    monkeypatch.setattr(ui, "session", lambda: selected)
+    monkeypatch.setattr(ui, "_names", {})
+
+    async def connected():
+        return {"connected-device": {"name": "Connected fixture"}}
+
+    monkeypatch.setattr(ui, "_connected", connected)
+    drafts = root / "drafts"
+    neighbors = {
+        "valid.plist": {"device": "valid-device", "info": {
+            "DeviceName": "Valid fixture", "ProductVersion": "18.0", "ProductType": "iPhone-fixture"},
+            "futureField": {"retained": True}},
+        "legacy.plist": {"device": "legacy identity / unrestricted", "futureField": [1, 2]},
+    }
+    for name, blob in neighbors.items():
+        (drafts / name).write_bytes(plistlib.dumps(blob))
+    damaged = drafts / "damaged.plist"
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=ui.app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1",
+                                     headers={"x-token": ui.TOKEN}) as client:
+            normal = await client.get("/api/devices")
+            assert normal.status_code == 200
+            assert normal.json() == {"switching": True, "current": "valid-device", "discovery": "complete",
+                "devices": [
+                    {"udid": "connected-device", "name": "Connected fixture", "connected": True, "draft": False},
+                    {"udid": "legacy identity / unrestricted", "name": None, "version": None,
+                     "model": None, "connected": False, "draft": True},
+                    {"udid": "valid-device", "name": "Valid fixture", "version": "18.0",
+                     "model": "iPhone-fixture", "connected": False, "draft": True},
+                ]}
+            damaged.write_bytes(b"undecodable plist")
+            undecodable = await client.get("/api/devices")
+            assert undecodable.status_code == 200 and undecodable.json() == normal.json()
+            damaged.write_bytes(plistlib.dumps(malformed))
+            before = {path.name: path.read_bytes() for path in drafts.iterdir()}
+            response = await client.get("/api/devices")
+            assert response.status_code == 200
+            assert response.json() == normal.json()
+            assert {path.name: path.read_bytes() for path in drafts.iterdir()} == before
+
+    asyncio.run(scenario())

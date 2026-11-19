@@ -1872,3 +1872,474 @@ def test_component_byte_budget_counts_excluded_declared_sizes(tmp_path, monkeypa
         assert (output / "tool").read_bytes() == b"ok"
         assert (output / "tool").stat().st_mode & 0o777 == 0o755
     assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("kind", ["tar", "tar.gz"])
+@pytest.mark.parametrize("negative_name", ["project/negative", "project/.git/negative"])
+@pytest.mark.parametrize("oversized_directory", [False, True])
+def test_component_rejects_negative_raw_tar_sizes(tmp_path, kind, negative_name, oversized_directory):
+    import io
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    archive = tmp_path / ("component." + kind)
+    with tarfile.open(archive, "w:gz" if kind == "tar.gz" else "w", format=tarfile.GNU_FORMAT) as package:
+        negative = tarfile.TarInfo(negative_name)
+        negative.type, negative.size = tarfile.DIRTYPE, -(2 * 1024**3)
+        package.addfile(negative)
+        if oversized_directory:
+            oversized = tarfile.TarInfo("project/oversized")
+            oversized.type, oversized.size = tarfile.DIRTYPE, 2 * 1024**3 + 1
+            package.addfile(oversized)
+        selected = tarfile.TarInfo("project/tool")
+        selected.mode, selected.size = 0o755, 2
+        package.addfile(selected, io.BytesIO(b"ok"))
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    before = set(tmp_path.iterdir())
+    with pytest.raises(ValueError, match="archive bounds"):
+        unpack_source(archive, output)
+    assert not output.exists()
+    assert set(tmp_path.iterdir()) == before
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("kind", ["tar", "tar.gz"])
+@pytest.mark.parametrize("directory_name", ["project/empty", "project/.git/empty"])
+def test_component_accepts_zero_raw_tar_directory_size(tmp_path, kind, directory_name):
+    import io
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    archive = tmp_path / ("component." + kind)
+    with tarfile.open(archive, "w:gz" if kind == "tar.gz" else "w", format=tarfile.GNU_FORMAT) as package:
+        directory = tarfile.TarInfo(directory_name)
+        directory.type = tarfile.DIRTYPE
+        package.addfile(directory)
+        selected = tarfile.TarInfo("project/tool")
+        selected.mode, selected.size = 0o755, 2
+        package.addfile(selected, io.BytesIO(b"ok"))
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    unpack_source(archive, output)
+    assert (output / "tool").read_bytes() == b"ok"
+    assert (output / "tool").stat().st_mode & 0o777 == 0o755
+    assert (output / "empty").is_dir() == (directory_name == "project/empty")
+    assert not (output / ".git").exists()
+    assert sha256(archive) == original
+
+
+def component_pax_record(key, value):
+    body = f" {key}={value}\n".encode()
+    length = len(body) + 1
+    while len(str(length)) + len(body) != length:
+        length = len(str(length)) + len(body)
+    return str(length).encode() + body
+
+
+def component_raw_tar(tmp_path, kind, blocks):
+    import gzip
+    archive = tmp_path / ("component." + kind)
+    with (gzip.open(archive, "wb") if kind == "tar.gz" else archive.open("wb")) as stream:
+        for block in blocks:
+            stream.write(block)
+        stream.write(bytes(1024))
+    return archive
+
+
+@pytest.mark.parametrize("kind", ["tar", "tar.gz"])
+@pytest.mark.parametrize("metadata_type", [b"x", b"g", b"X", b"L", b"K"])
+@pytest.mark.parametrize("declared", [-2147483648, 2147483649])
+def test_component_rejects_raw_tar_metadata_before_body_read(tmp_path, monkeypatch, kind, metadata_type, declared):
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    original_processing = tarfile.TarInfo._proc_member
+    def observed(member, package):
+        stream = package.fileobj
+        class ReadObservation:
+            def read(self, amount=-1):
+                if amount < 0 or amount > 2 * 1024**3:
+                    raise AssertionError("unvalidated TAR metadata reached oversized read")
+                return stream.read(amount)
+            def __getattr__(self, name):
+                return getattr(stream, name)
+        package.fileobj = ReadObservation()
+        return original_processing(member, package)
+    monkeypatch.setattr(tarfile.TarInfo, "_proc_member", observed)
+    metadata = tarfile.TarInfo("metadata")
+    metadata.type, metadata.size = metadata_type, declared
+    archive = component_raw_tar(tmp_path, kind, [metadata.tobuf(format=tarfile.GNU_FORMAT)])
+    original = sha256(archive)
+    before = set(tmp_path.iterdir())
+    with pytest.raises(ValueError, match="archive bounds"):
+        unpack_source(archive, tmp_path / "editable")
+    assert set(tmp_path.iterdir()) == before
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("kind", ["tar", "tar.gz"])
+@pytest.mark.parametrize("format", ["pax", "gnu"])
+@pytest.mark.parametrize("extra", [0, 1])
+def test_component_raw_tar_metadata_byte_budget(tmp_path, kind, format, extra):
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    body = component_pax_record("path", "project/tool") if format == "pax" else b"project/tool\0"
+    directory = tarfile.TarInfo("project/.git/padding")
+    directory.type, directory.size = tarfile.DIRTYPE, 2 * 1024**3 - len(body) - 2 + extra
+    metadata = tarfile.TarInfo("metadata")
+    metadata.type, metadata.size = tarfile.XHDTYPE if format == "pax" else tarfile.GNUTYPE_LONGNAME, len(body)
+    tool = tarfile.TarInfo("project/tool")
+    tool.mode, tool.size = 0o755, 2
+    archive = component_raw_tar(tmp_path, kind, [directory.tobuf(format=tarfile.GNU_FORMAT),
+        metadata.tobuf(format=tarfile.GNU_FORMAT), body.ljust(512, b"\0"),
+        tool.tobuf(format=tarfile.GNU_FORMAT), b"ok".ljust(512, b"\0")])
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    if extra:
+        with pytest.raises(ValueError, match="archive bounds"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert (output / "tool").read_bytes() == b"ok"
+        assert (output / "tool").stat().st_mode & 0o777 == 0o755
+        assert not (output / ".git").exists()
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("format", ["pax", "gnu"])
+@pytest.mark.parametrize("raw_count", [150000, 150001])
+def test_component_raw_tar_metadata_entry_budget(tmp_path, format, raw_count):
+    import io
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    archive = tmp_path / "component.tar.gz"
+    with tarfile.open(archive, "w:gz", format=tarfile.GNU_FORMAT, compresslevel=1) as package:
+        for number in range((raw_count - 1) // 2):
+            name = f"project/.git/{number}"
+            body = component_pax_record("path", name) if format == "pax" else name.encode() + b"\0"
+            metadata = tarfile.TarInfo("metadata")
+            metadata.type, metadata.size = tarfile.XHDTYPE if format == "pax" else tarfile.GNUTYPE_LONGNAME, len(body)
+            package.addfile(metadata, io.BytesIO(body))
+            package.addfile(tarfile.TarInfo(name))
+        if raw_count % 2 == 0:
+            directory = tarfile.TarInfo("project/.git/empty")
+            directory.type = tarfile.DIRTYPE
+            package.addfile(directory)
+        tool = tarfile.TarInfo("project/tool")
+        tool.mode, tool.size = 0o755, 2
+        package.addfile(tool, io.BytesIO(b"ok"))
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    if raw_count > 150000:
+        with pytest.raises(ValueError, match="archive bounds"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert (output / "tool").read_bytes() == b"ok"
+        assert (output / "tool").stat().st_mode & 0o777 == 0o755
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("kind", ["tar", "tar.gz"])
+@pytest.mark.parametrize("format", ["pax", "gnu"])
+def test_component_long_tar_paths_and_links_remain_usable(tmp_path, kind, format):
+    import io
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    archive = tmp_path / ("component." + kind)
+    name = "n" * 120 + "/tool"
+    with tarfile.open(archive, "w:gz" if kind == "tar.gz" else "w",
+                      format=tarfile.PAX_FORMAT if format == "pax" else tarfile.GNU_FORMAT) as package:
+        tool = tarfile.TarInfo("project/" + name)
+        tool.mode, tool.size = 0o755, 2
+        package.addfile(tool, io.BytesIO(b"ok"))
+        link = tarfile.TarInfo("project/link")
+        link.type, link.linkname = tarfile.SYMTYPE, name
+        package.addfile(link)
+        hard = tarfile.TarInfo("project/hard")
+        hard.type, hard.linkname = tarfile.LNKTYPE, "project/" + name
+        hard.mode = 0o755
+        package.addfile(hard)
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    unpack_source(archive, output)
+    assert (output / name).read_bytes() == (output / "link").read_bytes() == (output / "hard").read_bytes() == b"ok"
+    assert (output / name).stat().st_mode & 0o777 == 0o755
+    assert (output / "link").is_symlink()
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("field", ["size", "GNU.sparse.realsize"])
+@pytest.mark.parametrize("declared", [-1, 2147483649])
+def test_component_tar_pax_logical_size_stays_bounded(tmp_path, field, declared):
+    import tarfile
+    from rebuild_sources import unpack_source
+    metadata = tarfile.TarInfo("metadata")
+    body = component_pax_record(field, declared)
+    metadata.type, metadata.size = tarfile.XHDTYPE, len(body)
+    tool = tarfile.TarInfo("project/tool")
+    archive = component_raw_tar(tmp_path, "tar", [metadata.tobuf(format=tarfile.GNU_FORMAT),
+        body.ljust(512, b"\0"), tool.tobuf(format=tarfile.GNU_FORMAT)])
+    with pytest.raises(ValueError, match="archive bounds"):
+        unpack_source(archive, tmp_path / "editable")
+    assert not (tmp_path / "editable").exists()
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+def test_component_gnu_sparse_continuation_byte_budget(tmp_path, extra):
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    directory = tarfile.TarInfo("project/.git/padding")
+    directory.type, directory.size = tarfile.DIRTYPE, 2 * 1024**3 - 512 + extra
+    tool = tarfile.TarInfo("project/tool")
+    tool.type, tool.mode = tarfile.GNUTYPE_SPARSE, 0o755
+    header = bytearray(tool.tobuf(format=tarfile.GNU_FORMAT))
+    header[482] = 1
+    header[483:495] = b"00000000002\0"
+    header[148:156] = b"        "
+    header[148:156] = bytes(f"{sum(header):06o}\0 ", "ascii")
+    archive = component_raw_tar(tmp_path, "tar", [directory.tobuf(format=tarfile.GNU_FORMAT), header, bytes(512)])
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    if extra:
+        with pytest.raises(ValueError, match="archive bounds"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert (output / "tool").read_bytes() == b"\0\0"
+        assert (output / "tool").stat().st_mode & 0o777 == 0o755
+    assert sha256(archive) == original
+
+
+@pytest.mark.parametrize("stored_size", [0, 512])
+def test_component_pax_sparse_map_stays_in_declared_body(tmp_path, stored_size):
+    import tarfile
+    from rebuild_sources import unpack_source
+    from source_inputs import sha256
+    body = b"".join(component_pax_record(key, value) for key, value in [
+        ("GNU.sparse.major", "1"), ("GNU.sparse.minor", "0"), ("GNU.sparse.realsize", "2")])
+    metadata = tarfile.TarInfo("metadata")
+    metadata.type, metadata.size = tarfile.XHDTYPE, len(body)
+    tool = tarfile.TarInfo("project/tool")
+    tool.mode, tool.size = 0o755, stored_size
+    archive = component_raw_tar(tmp_path, "tar", [metadata.tobuf(format=tarfile.GNU_FORMAT),
+        body.ljust(512, b"\0"), tool.tobuf(format=tarfile.GNU_FORMAT), b"0\n".ljust(512, b"\0")])
+    original = sha256(archive)
+    output = tmp_path / "editable"
+    if not stored_size:
+        with pytest.raises(ValueError, match="archive bounds"):
+            unpack_source(archive, output)
+        assert not output.exists()
+    else:
+        unpack_source(archive, output)
+        assert (output / "tool").read_bytes() == b"\0\0"
+        assert (output / "tool").stat().st_mode & 0o777 == 0o755
+    assert sha256(archive) == original
+
+
+class _CaptureArchiveWalk:
+    """Count real source iteration without changing member reads."""
+    def __init__(self, archive, work):
+        self.archive, self.work = archive, work
+
+    def __enter__(self):
+        self.archive.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.archive.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.archive, name)
+
+    def __iter__(self):
+        for item in self.archive:
+            self.work["members"] += 1
+            self.work["bytes"] += item.size
+            yield item
+
+    def infolist(self):
+        items = self.archive.infolist()
+        self.work["members"] += len(items)
+        self.work["bytes"] += sum(item.file_size for item in items)
+        return items
+
+
+def _capture_tree(root):
+    import stat
+    return {p.relative_to(root).as_posix(): (p.read_bytes(), stat.S_IMODE(p.stat().st_mode))
+            for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("archive_kind", ["tar", "zip"])
+@pytest.mark.parametrize("variant", ["valid", "empty", "digest", "missing", "duplicate", "type", "oversize",
+                                    "unsafe", "overlay-error", "bpylist2"])
+def test_capture_collects_pinned_notices_in_one_walk_preserving_outputs(tmp_path, monkeypatch, archive_kind, variant):
+    import io
+    import stat
+    import tarfile
+    import types
+    import zipfile
+    import frozen_sources as frozen
+    import native_sources
+    import source_inputs
+    import PyInstaller.archive.readers as readers
+    import PyInstaller.depend.analysis as analysis_module
+
+    owner = "bpylist2" if variant == "bpylist2" else "demo"
+    source = tmp_path / ("demo.tar.gz" if archive_kind == "tar" else "demo.zip")
+    grant = b"Exact upstream grant.\n"
+    records = [("demo-1/demo/payload.py", b"x=1\n", False), ("demo-1/LICENSE", grant, variant == "type")]
+    if variant == "duplicate":
+        records.append(records[-1])
+    if variant == "missing":
+        records.pop()
+    if variant == "oversize":
+        records[-1] = ("demo-1/LICENSE", b"x" * (32 * source_inputs.BLOCK + 1), False)
+    for index in range(8):
+        records.append((f"demo-1/docs/source{index}.txt", b"upstream source\n" * 32768, False))
+    if variant == "bpylist2":
+        records.append(("bpylist2-4.1.1/README.rst", b"Original bpylist2 README grant.\n", False))
+    if archive_kind == "tar":
+        with tarfile.open(source, "w:gz") as archive:
+            for name, data, nonregular in records:
+                item = tarfile.TarInfo(name)
+                item.size = len(data)
+                if nonregular:
+                    item.type, item.size, data = tarfile.SYMTYPE, 0, b""
+                    item.linkname = "demo/payload.py"
+                archive.addfile(item, io.BytesIO(data))
+    else:
+        import warnings
+        with warnings.catch_warnings(), zipfile.ZipFile(source, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            warnings.simplefilter("ignore", UserWarning)
+            for name, data, nonregular in records:
+                item = zipfile.ZipInfo(name)
+                item.external_attr = (stat.S_IFLNK if nonregular else stat.S_IFREG) << 16
+                archive.writestr(item, data, compress_type=zipfile.ZIP_DEFLATED)
+    source_hash = source_inputs.sha256(source)
+    pin = {"url": "https://example.invalid/" + source.name, "size": source.stat().st_size, "sha256": source_hash}
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    cached = cache / (source_hash + "-" + source.name)
+    source.rename(cached)
+    wanted = {} if variant == "empty" else {"demo-1/LICENSE": hashlib.sha256(grant).hexdigest()}
+    if variant in ("digest", "overlay-error"):
+        wanted["demo-1/LICENSE"] = "0" * 64
+    if variant == "unsafe":
+        wanted["../LICENSE"] = "0" * 64
+    wheel_path = tmp_path / (owner + "-1-py3-none-any.whl")
+    with zipfile.ZipFile(wheel_path, "w") as wheel:
+        wheel.writestr("demo/payload.py", b"x=2\n")
+        wheel.writestr("demo-1.dist-info/licenses/LICENSE", b"Wheel grant.\n")
+    installed = tmp_path / "installed.py"
+    installed.write_bytes(b"x=2\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nversion="1.3.0"\n')
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    (engine / "engine").write_bytes(b"synthetic frozen payload")
+    packages = {owner: {"version": "1", "source": pin, "wheels": {"arm64": source_inputs.sha256(wheel_path)},
+                        "notices": wanted, "license": "fixture grant"}}
+    native = {"assets": [{"id": "fixture-provider", **pin, "architectures": [], "owners": []}]}
+    monkeypatch.setattr(frozen, "read_locks", lambda: (packages, native))
+    monkeypatch.setattr(frozen, "cache_directory", lambda: cache)
+    monkeypatch.setattr(frozen, "installed_files", lambda _: {installed.resolve(): (owner, "1", "demo/payload.py")})
+    monkeypatch.setattr(frozen, "package_version", lambda _: "1.3.0")
+    monkeypatch.setattr(frozen, "local_root_inputs", lambda _: [])
+    # Only the freeze/provider boundaries are synthetic; capture, authenticated cache,
+    # wheel comparison, notice validation and publication use production code.
+    class Reader:
+        toc = {"PYZ.pyz": (0, 0, 0, 0, "z")}
+        def __init__(self, *_):
+            pass
+        def open_embedded_archive(self, *_):
+            return types.SimpleNamespace(toc={"demo": None}, extract=lambda *a, **k: b"compiled fixture")
+    monkeypatch.setattr(readers, "CArchiveReader", Reader)
+    monkeypatch.setattr(analysis_module, "get_bootstrap_modules", lambda: [])
+    monkeypatch.setattr(native_sources, "verify_provider_files", lambda *_: None)
+    pyz = types.SimpleNamespace(toc=[("demo", str(installed), "PYMODULE")])
+    executable = types.SimpleNamespace(pkg=types.SimpleNamespace(toc=[]), exefiles=[])
+    collection = types.SimpleNamespace(name=str(engine), toc=[])
+    material, real_tar, real_zip, real_put = frozen.wheel_material, tarfile.open, zipfile.ZipFile, frozen.put
+
+    def separate_material(owner, wheel, source, collected, notices, overlays, *requested):
+        # Independent original sequence: publish wheel material, then open source_members.
+        assert material(owner, wheel, source, collected, notices, overlays) is None
+        return source_inputs.source_members(source, requested[0]) if requested else None
+
+    outcomes = []
+    for separate in (True, False):
+        output = tmp_path / ("original-sequence" if separate else "capture")
+        output.mkdir()
+        work = {"opens": 0, "members": 0, "bytes": 0}
+        def traced_tar(path, *args, **kwargs):
+            archive = real_tar(path, *args, **kwargs)
+            if Path(path) == cached:
+                work["opens"] += 1
+                return _CaptureArchiveWalk(archive, work)
+            return archive
+        class TracedZip(real_zip):
+            def infolist(self):
+                items = super().infolist()
+                if Path(self.filename) == cached:
+                    work["members"] += len(items)
+                    work["bytes"] += sum(item.file_size for item in items)
+                return items
+            def __init__(self, file, *args, **kwargs):
+                super().__init__(file, *args, **kwargs)
+                if Path(self.filename) == cached:
+                    work["opens"] += 1
+        def failing_overlay(root, name, data):
+            if "overlays" in root.parts:
+                raise OSError("fixture overlay publication failed")
+            real_put(root, name, data)
+        with monkeypatch.context() as patch:
+            patch.setattr(tarfile, "open", traced_tar)
+            patch.setattr(zipfile, "ZipFile", TracedZip)
+            if separate:
+                patch.setattr(frozen, "wheel_material", separate_material)
+            if variant == "overlay-error":
+                patch.setattr(frozen, "put", failing_overlay)
+            try:
+                frozen.capture(types.SimpleNamespace(), pyz, executable, collection, project, output, tmp_path,
+                               "arm64", "fixture/repository", {"archive": "fixture-provider", "libpython": "a" * 64}, "b" * 40)
+                error = None
+            except (ValueError, OSError) as exc:
+                error = (type(exc), str(exc))
+        outcomes.append((error, _capture_tree(output), work))
+    assert outcomes[0][:2] == outcomes[1][:2]
+    error, files, work = outcomes[1]
+    if variant in ("valid", "empty", "bpylist2"):
+        assert error is None
+        assert "inventory.json" in files
+        assert "THIRD-PARTY-NOTICES.txt" in files
+    else:
+        assert error is not None
+        assert "inventory.json" not in files
+        assert "ThirdPartyLicenses/demo/demo-1.dist-info/licenses/LICENSE" in files
+        if variant == "overlay-error":
+            assert error == (OSError, "fixture overlay publication failed")
+        else:
+            assert files["overlays/demo/demo/payload.py"][0] == b"x=2\n"
+    if variant == "valid":
+        assert files["ThirdPartyLicenses/demo/upstream/demo-1/LICENSE"][0] == grant
+        assert outcomes[0][2] == {"opens": 2, "members": 20, "bytes": 2 * sum(len(data) for _, data, _ in records)}
+        assert work == {"opens": 1, "members": 10, "bytes": sum(len(data) for _, data, _ in records)}
+    if variant == "bpylist2":
+        assert files["ThirdPartyLicenses/bpylist2/README.rst"][0] == b"Original bpylist2 README grant.\n"
+        assert outcomes[0][2]["opens"] == 3
+        assert work["opens"] == 2
+    if variant == "empty":
+        assert outcomes[0][2] == work
+        assert work["opens"] == 1
+    assert source_inputs.sha256(cached) == source_hash

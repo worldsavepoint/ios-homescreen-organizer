@@ -47,9 +47,78 @@ def unpack_source(archive, output):
                         if info.external_attr >> 16 & 0o111:
                             dest.chmod(0o755)
         else:
-            with tarfile.open(archive) as tar:
+            raw_count, raw_size = 0, 0
+            def consume(amount):
+                nonlocal raw_size
+                if amount < 0 or raw_size + amount > 2 * 1024**3:
+                    raise ValueError("Unexpected upstream archive bounds")
+                raw_size += amount
+
+            class MetadataReader:
+                def __init__(self, stream, account):
+                    self.stream, self.account = stream, account
+                def read(self, amount=-1):
+                    self.account(amount)
+                    return self.stream.read(amount)
+                def __getattr__(self, name):
+                    return getattr(self.stream, name)
+
+            class BoundedTarInfo(tarfile.TarInfo):
+                def _proc_member(self, package):
+                    nonlocal raw_count
+                    raw_count += 1
+                    if raw_count > 150000:
+                        raise ValueError("Unexpected upstream archive bounds")
+                    consume(self.size)
+                    self._stored_size = self.size
+                    return super()._proc_member(package)
+
+                def _pax_size(self, headers):
+                    try:
+                        size = int(headers.get("size", self._stored_size))
+                    except ValueError:
+                        size = 0  # Match tarfile's handling of invalid PAX numbers.
+                    if size < 0:
+                        raise ValueError("Unexpected upstream archive bounds")
+                    consume(max(0, size - self._stored_size))
+                    self._stored_size = max(self._stored_size, size)
+                    return size
+
+                def _apply_pax_info(self, headers, encoding, errors):
+                    self._pax_size(headers)
+                    super()._apply_pax_info(headers, encoding, errors)
+                    if self.size < 0 or self.size > 2 * 1024**3:
+                        raise ValueError("Unexpected upstream archive bounds")
+
+                def _proc_sparse(self, package):
+                    # Old GNU continuation blocks are outside the declared body.
+                    stream = package.fileobj
+                    package.fileobj = MetadataReader(stream, consume)
+                    try:
+                        return super()._proc_sparse(package)
+                    finally:
+                        package.fileobj = stream
+
+                def _proc_gnusparse_10(self, next, headers, package):
+                    # PAX sparse maps must fit the already-accounted stored body.
+                    remaining = next._pax_size(headers)
+                    def account(amount):
+                        nonlocal remaining
+                        if amount < 0 or amount > remaining:
+                            raise ValueError("Unexpected upstream archive bounds")
+                        remaining -= amount
+                    stream = package.fileobj
+                    package.fileobj = MetadataReader(stream, account)
+                    try:
+                        return super()._proc_gnusparse_10(next, headers, package)
+                    finally:
+                        package.fileobj = stream
+
+            with tarfile.open(archive, tarinfo=BoundedTarInfo) as tar:
                 members, seen, size = [], set(), 0
                 for count, item in enumerate(tar, 1):
+                    if item.size < 0:
+                        raise ValueError("Unexpected upstream archive bounds")
                     size += item.size
                     if size > 2 * 1024**3 or count > 150000:
                         raise ValueError("Unexpected upstream archive bounds")

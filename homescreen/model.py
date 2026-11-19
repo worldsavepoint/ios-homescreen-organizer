@@ -665,8 +665,47 @@ class Layout:
                 self._compact_folder(folder)
                 break
 
+    def _remove_selection(self, selected: list[Node], except_folder: Node | None = None) -> bool:
+        if not selected:
+            return True
+        containers = [self.dock, *self.pages, self.bank,
+                      *([self.library] if self.library is not None else [])]
+        for n in self.bank:
+            if n.kind == "folder":
+                containers.extend(n.children)
+        for n in [*self.dock, *(x for p in self.pages for x in p)]:
+            if n.kind == "folder":
+                containers.extend(n.children)
+        wanted = {node.id for node in selected}
+        locations = {}
+        for source in containers:
+            for index, node in enumerate(source):
+                if node.id in wanted:
+                    locations.setdefault(node.id, (source, index))
+        if len(locations) < len(selected):
+            return False
+        removals = {}
+        for node in selected:
+            source, index = locations[node.id]
+            removals.setdefault(id(source), (source, set()))[1].add(index)
+            self.pins.pop(node.id, None)
+        for source, indices in removals.values():
+            source[:] = [node for index, node in enumerate(source) if index not in indices]
+            if not source:
+                self._compact_source_folder(source, except_folder=except_folder)
+        return True
+
     def move_many(self, ids: list[str], target: str, before: str | None = None) -> None:
         """Append a selection dropped on a folder across available subpages."""
+        if (before is None and target in ("bank", "library") and isinstance(ids, list)
+                and (target != "library" or self.library is not None)
+                and all(isinstance(item, str) for item in ids) and len(set(ids)) == len(ids)):
+            selected = [self.nodes.get(item) for item in ids]
+            if (all(node is not None and node.kind != "folder"
+                    and self._destination_problem(node.kind, target) is None for node in selected)
+                    and self._remove_selection(selected)):
+                self._target(target).extend(selected)
+                return
         if target.startswith("folder:") and target.count(":") == 1 and before is None:
             folder = self.get(target)
             if folder.kind != "folder":
@@ -675,12 +714,13 @@ class Layout:
             for node in selected:
                 if problem := self._destination_problem(node.kind, target):
                     raise LayoutError(problem)
-            for node in selected:
-                source, index = self.locate(node.id)
-                source.pop(index)
-                self.pins.pop(node.id, None)
-                if not source:
-                    self._compact_source_folder(source, except_folder=folder)
+            if not self._remove_selection(selected, except_folder=folder):
+                for node in selected:
+                    source, index = self.locate(node.id)
+                    source.pop(index)
+                    self.pins.pop(node.id, None)
+                    if not source:
+                        self._compact_source_folder(source, except_folder=folder)
             if selected:
                 origins = [i for i, page in enumerate(folder.children) if page]
                 pages = [folder.children[i] for i in origins]

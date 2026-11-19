@@ -21,8 +21,8 @@ import tempfile
 import tomllib
 import zipfile
 
-from source_inputs import (HEX, cache_directory, canonical, fetch, json_bytes, read_locks, relative_name,
-                           sha256, source_member, source_members)
+from source_inputs import (BLOCK, HEX, cache_directory, canonical, fetch, json_bytes, read_locks, relative_name,
+                           sha256, source_member)
 
 NOTICE = re.compile(r"^(?:licenses?|licences?|copying|copyright|notice|authors|patents)(?:[._-].*)?$", re.I)
 
@@ -43,7 +43,7 @@ def installed_files(packages):
     return result
 
 
-def wheel_material(owner, wheel, source, collected, notices, overlays):
+def wheel_material(owner, wheel, source, collected, notices, overlays, source_notices=None):
     """Keep grants verbatim and editable files that differ from the release source."""
     names = set(wheel.namelist())
     for name in sorted(names):
@@ -53,6 +53,25 @@ def wheel_material(owner, wheel, source, collected, notices, overlays):
     # Index only needed source suffixes, so two differently nested packages cannot collide.
     candidates = {name.rsplit("/", 1)[-1] for name in collected}
     original = defaultdict(set)
+    grants, notice_error = {}, None
+
+    def collect_notice(name, size, regular, stream):
+        nonlocal notice_error
+        if not source_notices or name not in source_notices or notice_error is not None:
+            return
+        # Defer notice failures until wheel overlays are published, as in capture's
+        # original separate source_members pass.
+        try:
+            if name in grants or not regular or not 0 <= size <= 32 * BLOCK:
+                raise ValueError("Unexpected source notice size, type or duplicate")
+            with stream() as source_file:
+                data = source_file.read(32 * BLOCK + 1)
+            if len(data) != size or (source_notices[name] is not None
+                                    and digest(data).hexdigest() != source_notices[name]):
+                raise ValueError("Different embedded source license")
+            grants[name] = data
+        except Exception as error:
+            notice_error = error
 
     def consider(name, stream):
         if name.rsplit("/", 1)[-1] not in candidates:
@@ -68,17 +87,28 @@ def wheel_material(owner, wheel, source, collected, notices, overlays):
     if zipfile.is_zipfile(source):
         with zipfile.ZipFile(source) as archive:
             for info in archive.infolist():
+                regular = not info.is_dir() and stat.S_IFMT(info.external_attr >> 16) in (0, stat.S_IFREG)
+                collect_notice(info.filename, info.file_size, regular, lambda: archive.open(info))
                 if not info.is_dir():
                     consider(info.filename, lambda: archive.open(info))
     else:
         with tarfile.open(source) as archive:
             for info in archive:
+                collect_notice(info.name, info.size, info.isfile(), lambda: archive.extractfile(info))
                 if info.isfile():
                     consider(info.name, lambda: archive.extractfile(info))
     for name in sorted(collected & names):
         data = wheel.read(name)
         if digest(data).hexdigest() not in original[name]:
             put(overlays / owner, name, data)
+    if source_notices is not None:
+        for member in source_notices:
+            relative_name(member)
+        if notice_error is not None:
+            raise notice_error
+        if grants.keys() != source_notices.keys():
+            raise ValueError("Missing embedded source license")
+        return grants
 
 
 def put(root, name, data):
@@ -563,8 +593,9 @@ def capture(analysis, pyz, executable, collection, root, output, wheel_dir, arch
             record("file", name, path, kind, sha256(final))
         for owner, wheel in sorted(opened.items()):
             source = fetch(packages[owner]["source"], cache)
-            wheel_material(owner, wheel, source, editable[owner], notices, overlays)
-            for member, data in source_members(source, packages[owner].get("notices", {})).items():
+            grants = wheel_material(owner, wheel, source, editable[owner], notices, overlays,
+                                    packages[owner].get("notices", {}))
+            for member, data in grants.items():
                 put(notices / owner / "upstream", member, data)
             if owner == "developer-disk-image":
                 metadata = next(n for n in wheel.namelist() if n.endswith(".dist-info/METADATA"))

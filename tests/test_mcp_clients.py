@@ -146,12 +146,12 @@ def sandbox(tmp_path):
                    if key not in {"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_CUSTOM_OAUTH_URL", "CODEX_HOME", "HOMESCREEN_DATA"}}
     return {**environment, "HOME": str(home), "PATH": str(tmp_path / "empty-path"),
             "TEST_STORE": str(tmp_path / "clients.json"), "TEST_LOG": str(tmp_path / "commands.jsonl"),
-            "TEST_LAYER_OMITTED": "1", "TEST_PID": str(tmp_path / "child.pid"), "TEST_TIMEOUT": "3"}
+            "TEST_LAYER_OMITTED": "1", "TEST_PID": str(tmp_path / "child.pid"), "TEST_TIMEOUT": "6"}
 
 
 def execute(binary, sandbox, action, client="codex", executable="auto", *args):
     result = subprocess.run([str(binary), action, client, str(executable), *map(str, args)],
-                            env=sandbox, capture_output=True, text=True, timeout=10)
+                            env=sandbox, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

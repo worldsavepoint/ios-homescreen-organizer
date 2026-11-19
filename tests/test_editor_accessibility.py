@@ -281,3 +281,70 @@ assert.equal(noIcon.firstChild.querySelector('img'),null);
 fixture.device_id='synthetic';fixture.diff.has_changes=false;fixture.history.undo=false;
 fixture.library=['A','B','C'].map((name,i)=>({id:'lib.'+name,name,kind:'app',icon:i<2?'icon.'+name:null}));
 """)
+
+
+@pytest.fixture(params=[False, True], ids=['light', 'dark'])
+def editor_contrast(request):
+    css = (WEB / 'app.css').read_text()
+    roots = re.findall(r':root\s*\{([^{}]*)\}', css)
+    colors = dict(re.findall(r'(--[\w-]+)\s*:\s*([^;]+)', roots[0]))
+    if request.param:
+        colors.update(re.findall(r'(--[\w-]+)\s*:\s*([^;]+)', roots[1]))
+
+    def declarations(selector):
+        blocks = re.findall(r'(?m)^' + re.escape(selector) + r'\s*\{([^{}]*)\}', css)
+        return dict(re.findall(r'([\w-]+)\s*:\s*([^;]+)', ';'.join(blocks)))
+
+    def rgb(value):
+        value = value.strip()
+        if value.startswith('var('):
+            return rgb(colors[value[4:-1]])
+        value = value.lstrip('#')
+        if len(value) == 3:
+            value = ''.join(c * 2 for c in value)
+        return [int(value[i:i + 2], 16) for i in (0, 2, 4)]
+
+    def ratio(foreground, background, opacity=1):
+        foreground = [a * opacity + b * (1 - opacity) for a, b in zip(foreground, background)]
+
+        def luminance(values):
+            values = [c / 255 for c in values]
+            values = [c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4 for c in values]
+            return sum(c * w for c, w in zip(values, (.2126, .7152, .0722)))
+
+        a, b = sorted((luminance(foreground), luminance(background)))
+        return (b + .05) / (a + .05)
+
+    return declarations, rgb, ratio
+
+
+@pytest.mark.parametrize('selector,surface', [
+    ('.page-head .num', '--phone'), ('.page-head .slots', '--phone'),
+    ('.fpage .num', '--phone'), ('.page-head .slots.over', '--phone'),
+    ('.summary .problem', '--panel'), ('.problems', '--panel'),
+    ('.menu .menu-foot', '--panel'), ('.menu .menu-foot', '--panel-2'),
+])
+def test_enabled_caption_validation_and_recovery_text_contrast(editor_contrast, selector, surface):
+    declarations, rgb, ratio = editor_contrast
+    foreground, background = rgb(declarations(selector)['color']), rgb('var(' + surface + ')')
+    if selector == '.menu .menu-foot' and surface == '--panel-2':
+        brightness = float(re.search(r'brightness\(([^)]+)\)', declarations('button:hover:not(:disabled)')['filter'])[1])
+        foreground, background = [[c * brightness for c in color] for color in (foreground, background)]
+    assert ratio(foreground, background) >= 4.5
+
+
+@pytest.mark.parametrize('surface', ['--phone', '--panel'])
+def test_search_nonmatch_names_keep_enabled_text_contrast(editor_contrast, surface):
+    declarations, rgb, ratio = editor_contrast
+    dim = declarations('.item.dim')
+    name = declarations('.item .name') | declarations('.item.dim .name')
+    opacity = float(dim.get('opacity', 1)) * float(name.get('opacity', 1))
+    assert ratio(rgb(name.get('color', 'var(--fg)')), rgb('var(' + surface + ')'), opacity) >= 4.5
+
+
+def test_pending_operation_text_contrasts_over_the_lightest_content(editor_contrast):
+    declarations, rgb, ratio = editor_contrast
+    busy = declarations('.busy')
+    scrim = [float(n) for n in re.findall(r'[\d.]+', busy['background'])]
+    background = [a * scrim[3] + 255 * (1 - scrim[3]) for a in scrim[:3]]
+    assert ratio(rgb(busy['color']), background) >= 4.5
