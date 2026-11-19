@@ -300,7 +300,7 @@ actor Gate {
      scroll.reflectScrolledClipView(scroll.contentView)
      try await settle()
      assert(scroll.contentView.bounds.minY > 100)
-     consent.observeEnd(CGRect(x:0,y:20,width:20,height:2),viewport:CGSize(width:600,height:300))
+     assert(consent.hasReadToEnd, "scrolling the actual consent text to the bottom completes reading")
     } else {
      assert(consent.hasReadToEnd, "visible short content can complete reading")
     }
@@ -341,6 +341,71 @@ actor Gate {
    NotificationCenter.default.post(name:NSLocale.currentLocaleDidChangeNotification,object:nil)
    try await settle()
    assert(consent.accepted)
+  case "consent-view-layout":
+   NSApplication.shared.setActivationPolicy(.accessory)
+   let preferences = MemoryPreferences()
+   preferences.set(CommandLine.arguments[3],forKey:"screenOrganizer.language")
+   let localization = Localization(catalogDirectory:directory,defaults:preferences,preferredLanguages:["zh-Hans"])
+   let consent = LaunchConsent()
+   let action = CommandLine.arguments[6]
+   let view = NSHostingView(rootView:ConsentView(consent:consent,onContinue:{},onDecline:{})
+    .frame(maxWidth:.infinity,maxHeight:.infinity)
+    .environmentObject(localization).frame(minWidth:1000,minHeight:action == "startup" ? 0 : 680))
+   let size = NSSize(width:Double(CommandLine.arguments[4])!,height:Double(CommandLine.arguments[5])!)
+   let window = NSWindow(contentRect:NSRect(origin:.zero,size:size),styleMask:[.titled],backing:.buffered,defer:false)
+   window.contentView = view
+   window.orderFront(nil)
+   defer { window.orderOut(nil) }
+   func scrollView(_ node: NSView) -> NSScrollView? {
+    if let scroll = node as? NSScrollView { return scroll }
+    return node.subviews.compactMap(scrollView).first
+   }
+   func settle(_ label: String) async throws {
+    view.layoutSubtreeIfNeeded()
+    try await Task.sleep(nanoseconds:150_000_000)
+    view.layoutSubtreeIfNeeded()
+    let scroll = scrollView(view)!
+    print(label, localization.locale, "document", scroll.documentView!.frame, "viewport", scroll.contentView.bounds,
+          "read", consent.hasReadToEnd, "agreed", consent.agreed)
+    fflush(stdout)
+   }
+   try await settle("initial")
+   let scroll = scrollView(view)!
+   if action == "startup" {
+    scroll.scrollerStyle = .overlay
+    try await settle("overlay scrollers")
+    assert(scroll.documentView!.frame.height > scroll.contentView.bounds.height + 40)
+    assert(!consent.hasReadToEnd && !consent.canContinue)
+    window.setContentSize(NSSize(width:1000,height:680))
+    try await settle("resized")
+   } else if action == "locale" {
+    assert(scroll.documentView!.frame.height <= scroll.contentView.bounds.height + 1)
+    assert(consent.hasReadToEnd && !consent.canContinue)
+    consent.setAgreed(true); assert(consent.canContinue)
+    localization.setPreference("de")
+    try await settle("long language")
+    let longScroll = scrollView(view)!
+    assert(longScroll.documentView!.frame.height > longScroll.contentView.bounds.height + 40)
+    assert(!consent.hasReadToEnd && !consent.agreed && !consent.canContinue)
+    consent.setAgreed(true); assert(!consent.agreed)
+    let end = longScroll.documentView!.frame.height - longScroll.contentView.bounds.height
+    longScroll.contentView.scroll(to:NSPoint(x:0,y:end))
+    longScroll.reflectScrolledClipView(longScroll.contentView)
+    try await settle("long scrolled")
+    assert(consent.hasReadToEnd && !consent.canContinue)
+    consent.setAgreed(true); assert(consent.canContinue)
+    longScroll.contentView.scroll(to:.zero)
+    longScroll.reflectScrolledClipView(longScroll.contentView)
+    try await settle("read language at top")
+    assert(consent.hasReadToEnd && consent.agreed && consent.canContinue)
+    localization.setPreference("zh-Hans")
+    try await settle("short language")
+    assert(!consent.agreed && !consent.canContinue)
+   }
+   assert(scrollView(view)!.documentView!.frame.height <= scrollView(view)!.contentView.bounds.height + 1)
+   assert(consent.hasReadToEnd, "the complete visible agreement enables its checkbox")
+   assert(!consent.canContinue && !consent.accepted)
+   consent.setAgreed(true); assert(consent.canContinue && consent.accept())
   case "bridge":
    let origin = URL(string: "http://127.0.0.1:8765/#token=secret")!
    let message: [String:Any] = ["action":"openMCPSetup"]
@@ -911,6 +976,26 @@ def test_hosted_consent_resets_for_system_locale_and_preference_changes(native_b
             catalog["consent." + key] = catalog["consent." + key] * 25 if length == "long" else "Visible text."
         path.write_text(json.dumps(catalog))
     result = subprocess.run([str(native_binary), "consent-view-refresh", str(catalogs), length],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("locale,width,height,action", [
+    ("zh-Hans", 1000, 680, "initial"),
+    ("zh-Hans", 1360, 860, "initial"),
+    ("zh-Hans", 1000, 500, "startup"),
+    ("zh-Hans", 1000, 680, "locale"),
+])
+def test_hosted_consent_uses_visible_production_agreement(native_binary, tmp_path, locale, width, height, action):
+    catalogs = tmp_path / "consent-catalogs"
+    shutil.copytree(ROOT / "homescreen/web/locales", catalogs)
+    if action == "locale":
+        path = catalogs / "de.json"
+        catalog = json.loads(path.read_text())
+        catalog["consent.clientData"] += ("\n" + catalog["consent.deviceInterfaces"]) * 12
+        path.write_text(json.dumps(catalog))
+    result = subprocess.run([str(native_binary), "consent-view-layout", str(catalogs),
+                             locale, str(width), str(height), action],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 

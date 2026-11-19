@@ -119,7 +119,7 @@ The primary commands are `home-screen-organizer` and `home-screen-mcp`. Existing
 
 **Jonathan Kats** created Homescreen. The original app, editor, screenshots and SpringBoard research come from the [upstream project](https://github.com/kats1123/homescreen-mcp) and its contributors. This fork maintains device sessions, backups, the local editor, the Mac launcher and distribution. Thanks to [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) for the USB interface.
 
-The original Homescreen source is [MIT licensed](LICENSE). Copyright © 2026 Jonathan Kats. The bundled Python engine is distributed under GPL version 3 or later. Each release includes the component licenses and matching source archive with rebuild instructions. [Download Corresponding Source](https://github.com/worldsavepoint/ios-homescreen-organizer/releases/download/v1.3.0/home-screen-organizer-1.3.0-corresponding-source.tar.gz).
+The original Homescreen source is [MIT licensed](LICENSE). Copyright © 2026 Jonathan Kats. The bundled Python engine is distributed under GPL version 3 or later. Each release includes the component licenses and matching source archive with rebuild instructions. [Download Corresponding Source](https://github.com/worldsavepoint/ios-homescreen-organizer/releases/download/v1.3.1/home-screen-organizer-1.3.1-corresponding-source.tar.gz).
 
 [Report a fork issue](https://github.com/worldsavepoint/ios-homescreen-organizer/issues) with installation method, reproduction steps and a redacted error. [Upstream source](https://github.com/kats1123/homescreen-mcp) · [upstream issues](https://github.com/kats1123/homescreen-mcp/issues) · [upstream releases](https://github.com/kats1123/homescreen-mcp/releases).
 

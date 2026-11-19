@@ -39,6 +39,7 @@ private struct ConsentLanguage: Hashable {
 private struct ConsentEnd: Equatable {
     let language: ConsentLanguage
     let frame: CGRect
+    let viewport: CGSize
 }
 
 private struct ConsentEndKey: PreferenceKey {
@@ -49,6 +50,7 @@ private struct ConsentEndKey: PreferenceKey {
 struct ConsentView: View {
     @EnvironmentObject private var localization: Localization
     @ObservedObject var consent: LaunchConsent
+    @State private var observedLanguage: ConsentLanguage?
     var reviewing = false
     var onContinue: () -> Void
     var onDecline: () -> Void
@@ -76,11 +78,16 @@ struct ConsentView: View {
                             Text(localization.t("consent." + key))
                                 .fixedSize(horizontal: false, vertical: true)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(GeometryReader { text in
+                                    if key == paragraphs.last {
+                                        let frame = text.frame(in: .named("consentViewport"))
+                                        Color.clear.preference(key: ConsentEndKey.self,
+                                            value: ConsentEnd(language: language,
+                                                frame: CGRect(x: frame.minX, y: frame.maxY - 2, width: frame.width, height: 2),
+                                                viewport: viewport.size))
+                                    }
+                                })
                         }
-                        Color.clear.frame(height: 2).background(GeometryReader { end in
-                            Color.clear.preference(key: ConsentEndKey.self,
-                                value: ConsentEnd(language: language, frame: end.frame(in: .named("consentViewport"))))
-                        })
                     }
                     .padding(20)
                 }
@@ -92,14 +99,20 @@ struct ConsentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
                 .onPreferenceChange(ConsentEndKey.self) { end in
                     guard let end, end.language == language else { return }
-                    consent.observeEnd(end.frame, viewport: viewport.size)
+                    if observedLanguage != end.language {
+                        consent.languageChanged()
+                        observedLanguage = end.language
+                    }
+                    consent.observeEnd(end.frame, viewport: end.viewport)
                 }
             }
             .frame(minHeight: 180)
             if reviewing {
                 HStack { Spacer(); Button(localization.t("common.close"), action: onContinue).keyboardShortcut(.cancelAction) }
             } else {
-                Text(localization.t("consent.readToEnd")).font(.callout).foregroundStyle(.secondary)
+                if !consent.hasReadToEnd {
+                    Text(localization.t("consent.readToEnd")).font(.callout).foregroundStyle(.secondary)
+                }
                 Toggle(localization.t("consent.agree"), isOn: Binding(get: { consent.agreed }, set: consent.setAgreed))
                     .disabled(!consent.hasReadToEnd)
                 HStack {
@@ -112,6 +125,5 @@ struct ConsentView: View {
         }
         .padding(32)
         .frame(maxWidth: 820, maxHeight: 720)
-        .onChange(of: language) { _, _ in consent.languageChanged() }
     }
 }
