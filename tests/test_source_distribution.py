@@ -225,10 +225,10 @@ def test_local_refreeze_records_actual_substitution_and_stays_outside_release(tm
 
 def test_signed_inventory_and_source_header_are_required(tmp_path):
     from source_archive import check_zip
-    from test_mcp_bundle import assets
+    from test_mcp_bundle import VERSION, assets
     folder = assets(tmp_path)
-    package = folder / "home-screen-organizer-1.3.0-macos-arm64.zip"
-    altered = {"arch": "arm64", "version": "1.3.0"}
+    package = folder / f"home-screen-organizer-{VERSION}-macos-arm64.zip"
+    altered = {"arch": "arm64", "version": VERSION}
     with pytest.raises(ValueError, match="signed source inventory"):
         check_zip(package, altered)
     pins = json.loads((ROOT / "macapp/sources/python.json").read_bytes())
