@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 import pytest
 
@@ -715,7 +716,8 @@ def test_claude_unreadable_snapshot_does_not_remove_registration(native_mcp_bina
 
 def fake_engine(tmp_path):
     path = tmp_path / 'engine "引用" folder\'s'
-    path.write_text(f"#!{sys.executable}\n" + '''import json, os, signal, sys, time
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    path.write_text(f"#!{sys.executable}\nRELEASE_VERSION = {version!r}\n" + '''import json, os, signal, sys, time
 from pathlib import Path
 time.sleep(float(os.environ.get("TEST_ENGINE_STARTUP_DELAY", "0")))
 Path(os.environ["TEST_PID"]).write_text(str(os.getpid()))
@@ -731,7 +733,7 @@ for line in sys.stdin:
     if os.environ.get("TEST_ENGINE") == "closed":
         sys.exit(0)
     if message["method"] == "initialize":
-        result = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "wrong" if os.environ.get("TEST_ENGINE") == "identity" else "ios-homescreen-mcp", "version": "1.3.0"}}
+        result = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "wrong" if os.environ.get("TEST_ENGINE") == "identity" else "ios-homescreen-mcp", "version": RELEASE_VERSION}}
         if os.getenv("TEST_ENGINE") == "version": result["protocolVersion"] = "unsupported"
         if os.getenv("TEST_ENGINE") == "capability": result["capabilities"] = {}
         if os.getenv("TEST_ENGINE") == "info": result["serverInfo"]["version"] = 1
