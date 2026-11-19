@@ -3,112 +3,146 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Home Screen Organizer</title>
+<title data-i18n="app.name">Screen Organizer</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='11' height='11' rx='3' fill='%23ff9f0a'/%3E%3Crect x='18' y='3' width='11' height='11' rx='3' fill='%2330d158'/%3E%3Crect x='3' y='18' width='11' height='11' rx='3' fill='%230a84ff'/%3E%3Crect x='18' y='18' width='11' height='11' rx='3' fill='%23bf5af2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header class="bar top">
+<header class="bar top" inert>
   <div class="brand">
     <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="3" width="11" height="11" rx="3" fill="#ff9f0a"/><rect x="18" y="3" width="11" height="11" rx="3" fill="#30d158"/><rect x="3" y="18" width="11" height="11" rx="3" fill="#0a84ff"/><rect x="18" y="18" width="11" height="11" rx="3" fill="#bf5af2"/></svg>
-    <span>Home Screen Organizer</span>
+    <span><span data-i18n="app.name">Screen Organizer</span><small class="subtitle" data-i18n="app.subtitle">for iOS</small></span>
   </div>
   <div class="menu-wrap">
-    <button id="device-btn" class="device-btn" aria-haspopup="true" title="Choose a device"><span id="device">No device</span><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button id="device-btn" class="device-btn static" disabled tabindex="-1"><span id="device" data-i18n="editor.noDevice">No device</span><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
     <div class="menu device-menu" id="device-menu" hidden></div>
   </div>
   <div class="spacer"></div>
-  <input id="search" type="search" placeholder="Search apps" autocomplete="off" spellcheck="false">
+  <button id="mcp-setup" data-i18n="mcp.title" data-i18n-title="mcp.openSetup">MCP Setup</button>
+  <select id="language-select" data-i18n-aria-label="common.language" data-i18n-title="common.language"></select>
+  <input id="search" type="search" placeholder="Search apps" data-i18n-placeholder="editor.search" autocomplete="off" spellcheck="false">
   <div class="group">
-    <button id="undo" title="Undo (⌘Z)" aria-label="Undo"><svg viewBox="0 0 20 20"><path d="M8 5 3 9.5 8 14M3.5 9.5H12a5 5 0 0 1 0 10H9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-    <button id="redo" title="Redo (⇧⌘Z)" aria-label="Redo"><svg viewBox="0 0 20 20"><path d="m12 5 5 4.5-5 4.5M16.5 9.5H8a5 5 0 0 0 0 10h3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button id="undo" title="Undo (⌘Z)" data-i18n-title="editor.undoShortcut" aria-label="Undo" data-i18n-aria-label="editor.undo"><svg viewBox="0 0 20 20"><path d="M8 5 3 9.5 8 14M3.5 9.5H12a5 5 0 0 1 0 10H9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button id="redo" title="Redo (⇧⌘Z)" data-i18n-title="editor.redoShortcut" aria-label="Redo" data-i18n-aria-label="editor.redo"><svg viewBox="0 0 20 20"><path d="m12 5 5 4.5-5 4.5M16.5 9.5H8a5 5 0 0 0 0 10h3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
   </div>
   <div class="menu-wrap">
-    <button id="organize-btn" aria-haspopup="true">Organize ▾</button>
+    <button id="organize-btn" aria-controls="organize-menu" aria-expanded="false" data-i18n="editor.organize">Organize ▾</button>
     <div class="menu" id="organize-menu" hidden>
-      <button data-op="optimize_usage">Optimize by app usage</button>
-      <button data-op="sort_color">Sort by color</button>
-      <button data-op="sort_alpha">Sort A–Z</button>
-      <button data-op="group_categories">Group by App Store category…</button>
-      <button data-op="sort_folders">Sort inside folders A–Z</button>
-      <button data-op="remove_empty">Remove empty pages and folders</button>
-      <label class="check"><input type="checkbox" id="keep-first" checked> Leave page 1 alone</label>
+      <button data-op="optimize_usage" data-i18n="editor.optimizeUsage">Optimize by app usage</button>
+      <button data-op="sort_color" data-i18n="editor.sortColor">Sort by color</button>
+      <button data-op="sort_alpha" data-i18n="editor.sortAlpha">Sort A–Z</button>
+      <button data-op="group_categories" data-i18n="editor.groupCategories">Group by App Store category…</button>
+      <button data-op="sort_folders" data-i18n="editor.sortFolders">Sort inside folders A–Z</button>
+      <button data-op="remove_empty" data-i18n="editor.removeEmpty">Remove empty pages and folders</button>
+      <label class="check"><input type="checkbox" id="keep-first" checked> <span data-i18n="editor.keepFirst">Leave page 1 alone</span></label>
     </div>
   </div>
-  <button id="reset">Reset</button>
-  <button id="backups-btn">Backups</button>
-  <button id="help" title="How it works" aria-label="Help">?</button>
-  <button id="read" class="primary">Read device</button>
+  <button id="reset" data-i18n="editor.reset">Reset</button>
+  <button id="backups-btn" data-i18n="editor.backups">Backups</button>
+  <button id="help" title="How it works" data-i18n-title="editor.helpTitle" aria-label="Help" data-i18n-aria-label="common.help">?</button>
+  <button id="read" class="primary" data-i18n="editor.readDevice">Read device</button>
 </header>
 
-<main id="main">
-  <p id="read-only-notice" role="status" hidden>Read-only mode: device writes are disabled. Draft changes stay on this Mac.</p>
+<main id="main" inert>
+  <p id="read-only-notice" role="status" hidden data-i18n="editor.readOnlyNotice">Read-only mode: device writes are disabled. Draft changes stay on this Mac.</p>
   <section id="empty" class="empty" hidden>
     <div class="empty-card">
-      <h1>Arrange your Home Screen</h1>
-      <p>Connect your iPhone or iPad with a cable, unlock it and tap <b>Trust</b> if asked. Then read its Home Screen. Nothing changes on the device until you choose Apply.</p>
-      <button class="primary big" id="read-empty">Read device</button>
+      <h1 data-i18n="editor.arrangeTitle">Arrange your Home Screen</h1>
+      <p data-i18n="editor.connectHint"></p>
+      <div id="draft-recovery" hidden></div>
+      <button class="primary big" id="read-empty" data-i18n="editor.readDevice">Read device</button>
     </div>
   </section>
   <section id="board" hidden>
     <div class="dock-row">
-      <span class="label">Dock</span>
+      <span class="label" data-i18n="editor.dock">Dock</span>
       <div class="dock grid-dock" id="dock" data-target="dock"></div>
     </div>
     <div class="pages" id="pages"></div>
     <div class="bank-row">
-      <div class="bank-head"><span class="label">App Bank</span><span class="count" id="bank-count"></span>
-        <span class="hint-inline">Park apps, folders or widgets here while you rearrange. Empty it before applying.</span></div>
+      <div class="bank-head"><span class="label" data-i18n="editor.bank">App Bank</span><span class="count" id="bank-count"></span>
+        <span class="hint-inline" data-i18n="editor.bankHint">Park apps, folders or widgets here while you rearrange. Empty it before applying.</span></div>
       <div class="bank" id="bank"></div>
     </div>
   </section>
   <aside id="library-panel" hidden>
     <section class="usage" id="usage"></section>
     <div class="lib-head">
-      <h2>App Library</h2>
+      <h2 data-i18n="editor.library">App Library</h2>
       <span class="count" id="lib-count"></span>
     </div>
-    <p class="hint">Apps here are off your Home Screen but still installed. Drag apps in or out.</p>
+    <p class="hint" data-i18n="editor.libraryHint">Apps here are off your Home Screen but still installed. Drag apps in or out.</p>
     <div class="lib-list" id="library" data-target="library"></div>
   </aside>
 </main>
 
 <div id="selection-bar" class="floating" hidden>
   <span id="sel-count"></span>
-  <button id="sel-folder">New folder</button>
-  <button id="sel-library">To App Library</button>
-  <button id="sel-unpin" title="Let these flow with the rest again (closes their gaps)">Close gaps</button>
-  <button id="sel-clear">Clear</button>
+  <button id="sel-place" data-i18n="editor.moveItem">Move</button>
+  <button id="sel-folder" data-i18n="editor.newFolder">New folder</button>
+  <button id="sel-library" data-i18n="editor.toLibrary">To App Library</button>
+  <button id="sel-unpin" title="Let these flow with the rest again (closes their gaps)" data-i18n-title="editor.closeGapsHint" data-i18n="editor.closeGaps">Close gaps</button>
+  <button id="sel-clear" data-i18n="editor.clear">Clear</button>
 </div>
 
 <aside id="drawer" class="drawer" hidden>
   <div class="drawer-head">
-    <input id="folder-name" aria-label="Folder name">
-    <button id="drawer-close" aria-label="Close">✕</button>
+    <input id="folder-name" aria-label="Folder name" data-i18n-aria-label="editor.folderName">
+    <button id="drawer-close" aria-label="Close" data-i18n-aria-label="common.close">✕</button>
   </div>
   <div id="folder-pages" class="folder-pages"></div>
   <div class="drawer-foot">
-    <button id="folder-add-page">Add folder page</button>
-    <button id="folder-dissolve" class="danger">Remove folder</button>
+    <button id="folder-add-page" data-i18n="editor.addFolderPage">Add folder page</button>
+    <button id="folder-dissolve" class="danger" data-i18n="editor.removeFolder">Remove folder</button>
   </div>
 </aside>
 
-<footer class="bar bottom">
-  <div id="summary" class="summary">No changes</div>
+<footer class="bar bottom" inert>
+  <div id="summary" class="summary" data-i18n="editor.noChanges">No changes</div>
   <div class="spacer"></div>
-  <button id="review" class="primary" disabled>Review & Apply</button>
+  <button id="review" class="primary" disabled data-i18n="editor.reviewApply">Review & Apply</button>
 </footer>
 
 <div id="modal" class="modal" hidden>
-  <div class="modal-card" role="dialog" aria-modal="true">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <h2 id="modal-title"></h2>
     <div id="modal-body"></div>
     <div class="modal-actions" id="modal-actions"></div>
   </div>
 </div>
+<div id="operation-status" class="visually-hidden" role="status" aria-atomic="true"></div>
 <div id="toast" class="toast" hidden></div>
-<div id="busy" class="busy" hidden><div class="spinner"></div><span id="busy-text">Working…</span></div>
+<div id="busy" class="busy" role="dialog" aria-modal="true" aria-labelledby="busy-text" tabindex="-1" hidden><div class="spinner"></div><span id="busy-text" data-i18n="common.working">Working…</span></div>
 
+<div id="consent-dialog" class="modal onboarding" hidden>
+  <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="consent-title">
+    <div class="onboarding-brand" id="consent-brand"></div>
+    <h2 id="consent-title" data-i18n="consent.title"></h2>
+    <h3 data-i18n="consent.disclaimer"></h3>
+    <div id="consent-text" class="consent-text" tabindex="0" data-i18n-aria-label="consent.disclaimer">
+      <p data-i18n="consent.affiliation"></p><p data-i18n="consent.trademarks"></p>
+      <p data-i18n="consent.deviceInterfaces"></p><p data-i18n="consent.backups"></p>
+      <p data-i18n="consent.warranty"></p><p data-i18n="consent.clientData"></p>
+    </div>
+    <p class="hint" data-i18n="consent.readToEnd"></p>
+    <label class="check"><input id="consent-agree" type="checkbox"><span data-i18n="consent.agree"></span></label>
+    <div class="modal-actions"><button id="consent-decline" data-i18n="consent.decline"></button><button id="consent-continue" class="primary" disabled data-i18n="consent.continue"></button></div>
+    <p id="consent-declined" role="status" hidden data-i18n="consent.declined"></p>
+    <select id="consent-language-select" data-i18n-aria-label="common.language"></select>
+  </section>
+</div>
+<div id="mcp-dialog" class="modal onboarding" hidden>
+  <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="mcp-title">
+    <div class="onboarding-brand" id="mcp-brand"></div>
+    <h2 id="mcp-title" tabindex="-1" data-i18n="mcp.title"></h2>
+    <p data-i18n="mcp.intro"></p><p data-i18n="mcp.lifecycle"></p>
+    <p data-i18n="mcp.browserSetup"></p><p class="hint" data-i18n="mcp.sourceHint"></p>
+    <div id="mcp-examples"></div><p id="mcp-copy-status" role="status"></p>
+    <div class="modal-actions"><button id="mcp-close" data-i18n="common.close"></button></div>
+  </section>
+</div>
+<script src="/static/i18n.js"></script>
+<script src="/static/onboarding.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -2,22 +2,26 @@
 
 [README](../README.md) · [简体中文](MCP.zh-CN.md) · [How it works](HOW-IT-WORKS.md)
 
-Home Screen Organizer exposes a local **stdio MCP server** for inspecting layouts, editing drafts, sorting, previews and backups. The client launches the process on the Mac connected to your device. No HTTP endpoint or API key is required.
+Screen Organizer exposes a local **stdio MCP server** for inspecting layouts, editing drafts, sorting, previews and backups. The client launches the process on the Mac connected to your device. No HTTP endpoint or API key is required.
 
 ## Choose a launch method
 
 | Installation | Executable | Arguments |
 | --- | --- | --- |
-| Mac app in Applications | `/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine` | `mcp` |
+| Mac app in Applications | `/Applications/Screen Organizer.app/Contents/Resources/engine/engine` | `mcp` |
 | [Source installation](../macapp/BUILDING.md#source-installation) | `/absolute/path/ios-homescreen-organizer/.venv/bin/home-screen-mcp` | None |
 | Standalone MCPB | Client-managed `server/launch.sh` | Managed by the bundle manifest |
 
-Use an absolute executable path in client settings. If the app is elsewhere, use its actual path. In the Mac app, **Device → MCP** provides **Copy Launch Command**, **Copy Cursor / Claude JSON**, **Copy Codex TOML** and **Copy VS Code / Copilot JSON** using that app’s current location. All copied configurations set `HOMESCREEN_READ_ONLY=1`.
+Open **MCP Setup** in the app after accepting the launch agreement. The client panel detects Codex and Claude Code and can register, inspect and update this server. If a client executable is missing, install it using its official guide or choose its executable in the panel. **Read-only** is the default. Register uses the mode selected in **Advanced settings** and the existing **stdio** engine.
+
+**Advanced settings** show the current engine path and access mode and copy a launch command, Cursor / Claude JSON, Codex TOML, VS Code JSON or Copilot JSON. Exports use the selected mode; Apply-enabled mode sets both `HOMESCREEN_READ_ONLY=0` and `HOMESCREEN_ALLOW_APPLY=1`. Configuration status records a saved registration; the separate startup check initializes and discovers tools; live connection status comes from client-reported state.
+
+Use an absolute executable path in client settings. After upgrading from the old app name or moving the app, select **Update** in the client panel or replace the old engine path with `/Applications/Screen Organizer.app/Contents/Resources/engine/engine`. The package name, commands, server ID, Registry namespace and saved-data location stay compatible. **Device → MCP** also offers read-only configuration shortcuts. Any local stdio MCP client can use the settings below; consult its official configuration guide for its destination.
 
 The client starts and maintains the stdio process. A terminal launch waits for MCP input; it does not open the editor:
 
 ```sh
-HOMESCREEN_READ_ONLY=1 '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+HOMESCREEN_READ_ONLY=1 '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
 
 For a source install, the equivalent is:
@@ -30,7 +34,7 @@ The stable server ID is `ios-homescreen-mcp`. The legacy commands `ios-homescree
 
 ## Client guides
 
-Keep existing servers when adding these entries. Restart or reconnect the client after changing its configuration, then confirm that Home Screen Organizer’s tools appear.
+Keep existing servers when adding these entries. Restart or reconnect the client after changing its configuration, then confirm that Screen Organizer’s tools appear.
 
 <a id="codex"></a>
 
@@ -41,15 +45,16 @@ Register the bundled engine from a terminal:
 
 ```sh
 codex mcp add ios-homescreen-mcp --env HOMESCREEN_READ_ONLY=1 -- \
-  '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+  '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
 
 Or add this to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.ios-homescreen-mcp]
-command = "/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine"
+command = "/Applications/Screen Organizer.app/Contents/Resources/engine/engine"
 args = ["mcp"]
+environment_id = "local"
 
 [mcp_servers.ios-homescreen-mcp.env]
 HOMESCREEN_READ_ONLY = "1"
@@ -70,7 +75,7 @@ Use the JSON below in Cursor’s `~/.cursor/mcp.json` (global) or `.cursor/mcp.j
 {
   "mcpServers": {
     "ios-homescreen-mcp": {
-      "command": "/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine",
+      "command": "/Applications/Screen Organizer.app/Contents/Resources/engine/engine",
       "args": ["mcp"],
       "env": { "HOMESCREEN_READ_ONLY": "1" }
     }
@@ -82,7 +87,7 @@ For Claude Code, register the same server with:
 
 ```sh
 claude mcp add --env HOMESCREEN_READ_ONLY=1 --transport stdio ios-homescreen-mcp -- \
-  '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+  '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
 
 For a source install, replace `command` with the absolute `.venv/bin/home-screen-mcp` path and omit `args`; use that executable without `mcp` in the CLI command. See [Cursor MCP configuration](https://cursor.com/docs/mcp), [Claude Desktop local servers](https://modelcontextprotocol.io/docs/develop/connect-local-servers) and [Claude Code MCP](https://code.claude.com/docs/en/mcp).
@@ -94,14 +99,29 @@ For a source install, replace `command` with the absolute `.venv/bin/home-screen
 <details>
 <summary><strong>VS Code / Copilot — native MCP configuration</strong></summary>
 
-For personal use, add the following to `~/.copilot/mcp-config.json`. If `COPILOT_HOME` is set, use `$COPILOT_HOME/mcp-config.json`. A workspace can instead use `.mcp.json` at its root.
+For VS Code workspace settings, add the server to `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "ios-homescreen-mcp": {
+      "type": "stdio",
+      "command": "/Applications/Screen Organizer.app/Contents/Resources/engine/engine",
+      "args": ["mcp"],
+      "env": { "HOMESCREEN_READ_ONLY": "1" }
+    }
+  }
+}
+```
+
+For personal Copilot settings, add the following to `~/.copilot/mcp-config.json`. If `COPILOT_HOME` is set, use `$COPILOT_HOME/mcp-config.json`. A workspace can instead use `.mcp.json` at its root.
 
 ```json
 {
   "mcpServers": {
     "ios-homescreen-mcp": {
       "type": "stdio",
-      "command": "/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine",
+      "command": "/Applications/Screen Organizer.app/Contents/Resources/engine/engine",
       "args": ["mcp"],
       "env": { "HOMESCREEN_READ_ONLY": "1" },
       "tools": ["*"]
@@ -165,6 +185,8 @@ home-screen-organizer apply <apply_token>
 ```
 
 The CLI asks you to type `yes`. Use the token from the latest `diff`. For assistant writes, configure **both** `HOMESCREEN_READ_ONLY=0` and `HOMESCREEN_ALLOW_APPLY=1`, then restart the server. Its instructions require an explicit user request; the environment gates are enforced by the server and do not add a separate confirmation dialog. Apply checks the token, validates the draft, refreshes device identity/layout, saves a backup and verifies readback. Restore uses matching backup provenance. After an interrupted or mismatching write, read the device again.
+
+Since 1.2.1, pinned backups require saved grid dimensions for Restore. Trusted unpinned legacy backups remain supported. Restore maps saved pin coordinates and requires every item footprint to fit the loaded grid.
 
 ## Distribution and discovery
 

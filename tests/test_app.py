@@ -109,15 +109,16 @@ def test_app_api_guards_and_ops(dict_phone, tmp_path, monkeypatch):
     assert c.post("/api/read", json={}).status_code == 401
     assert TestClient(ui.app, base_url="http://evil.example").get("/api/state").status_code == 403
     h = {"X-Token": ui.TOKEN}
-    v = c.post("/api/read", json={}, headers=h).json()
+    v = c.get("/api/state", headers=h).json()
+    v = c.post("/api/read", json={"binding": v["binding"]}, headers=h).json()
     assert v["loaded"] and v["library"] is not None
     app_id = next(x["id"] for x in v["pages"][2] if x["kind"] == "app")
-    v = c.post("/api/op", json={"op": "move", "args": {"id": app_id, "target": "library"}}, headers=h).json()
+    v = c.post("/api/op", json={"binding": v["binding"], "op": "move", "args": {"id": app_id, "target": "library"}}, headers=h).json()
     assert v["diff"]["to_app_library"] == 1 and v["history"]["undo"] == 1
     wid = next(x["id"] for p in v["pages"] for x in p if x["kind"] == "widget")
-    bad = c.post("/api/op", json={"op": "move", "args": {"id": wid, "target": "dock"}}, headers=h)
+    bad = c.post("/api/op", json={"binding": v["binding"], "op": "move", "args": {"id": wid, "target": "dock"}}, headers=h)
     assert bad.status_code == 400 and "dock" in bad.json()["error"]
-    r = c.post("/api/apply", json={"token": v["diff"]["apply_token"]}, headers=h).json()
+    r = c.post("/api/apply", json={"binding": v["binding"], "token": v["diff"]["apply_token"]}, headers=h).json()
     assert r["result"]["ok"]
     assert c.get("/api/backups", headers=h).json()["backups"]
     assert c.get("/icon", params={"id": app_id}, headers=h).status_code == 200
@@ -204,7 +205,7 @@ def test_widget_configuration_ids_survive_writes(tmp_path):
 # ---- gaps ---------------------------------------------------------------------------------
 
 from pathlib import Path
-IOS27 = Path(__file__).parent / "fixtures" / "ios27.2-sim-IconState.plist"
+IOS27 = Path(__file__).parent / "fixtures" / "ios27-layout.plist"
 
 def _gap_layout():
     from fake_phone import app as mkapp, widget
@@ -265,20 +266,23 @@ def test_gaps_round_trip_dict_format(tmp_path):
 
 
 def test_gaps_remembered_when_device_cannot_report_them(tmp_path):
-    """A real phone never reports gaps; gaps set in Homescreen must survive a re-read."""
-    path = tmp_path / "phone.plist"
-    path.write_bytes(plistlib.dumps(_gap_layout()))           # list format: no gap info
-    s = Session(FileSource(path), tmp_path / "data")
+    from fake_phone import app
+    from test_live_frame import FrameSource
+
+    source = FrameSource(False)
+    source.metrics = None
+    source.raw = _gap_layout()
+    s = Session(source, tmp_path / "data")
     asyncio.run(s.read())
     assert s.gaps_readable is False
     s.edit(lambda lay: lay.pin("com.g.a5", 1, 23))
     assert asyncio.run(s.apply(s.require().token()))["ok"]
-    asyncio.run(s.read())                                     # phone reports no gaps...
-    assert s.require().pins == {"com.g.a5": 23}               # ...but Homescreen remembers it
-    # a gap that no longer fits (page changed on the phone) is dropped, not forced
-    page = _gap_layout()
-    page[1] = page[1] + [{"bundleIdentifier": f"com.g.x{i}", "displayIdentifier": f"com.g.x{i}", "displayName": "X"} for i in range(13)]
-    path.write_bytes(plistlib.dumps(page))
+    assert next(iter(source.payloads[0]["listMetadata"].values()))["fixedLocations"] == {"com.g.a5": 23}
+    asyncio.run(s.read())
+    assert s.require().pins == {"com.g.a5": 23}
+    # Reflow a page that has grown too full for its remembered gap.
+    source.raw = _gap_layout()
+    source.raw[1].extend(app(f"com.g.x{i}", f"X{i}") for i in range(13))
     asyncio.run(s.read())
     assert s.require().validate() == []
 
@@ -298,7 +302,7 @@ class HiddenWebClipPhone:
     async def read(self):
         return [list(p) for p in self.state], list(self.apps)  # installed apps only
 
-    async def write(self, state, library, pins=None):
+    async def write(self, state, library, pins=None, grid=None):
         self.writes += 1
         listed = {x.get("displayIdentifier") for x in library}
         state = [list(p) for p in state]

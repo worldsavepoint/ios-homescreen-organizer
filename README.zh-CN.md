@@ -1,10 +1,10 @@
-<h1 align="center">主屏幕整理</h1>
-<p align="center"><strong>Home Screen Organizer · 在 Mac 上整理 iPhone 或 iPad 的主屏幕。</strong><br>macOS 14+ · Apple silicon 与 Intel · 支持 iOS 16+</p>
+<h1 align="center">屏幕整理</h1>
+<p align="center"><strong>Screen Organizer · for iOS · 在 Mac 上整理 iPhone 或 iPad 的主屏幕。</strong><br>macOS 14+ · Apple silicon 与 Intel · 支持 iOS 16+</p>
 
 <p align="center">
   <a href="https://github.com/worldsavepoint/ios-homescreen-organizer/releases"><img alt="发行版" src="https://img.shields.io/badge/download-Releases-blue"></a>
   <a href="#compatibility"><img alt="支持 iOS 16 及以上版本" src="https://img.shields.io/badge/iOS-16%2B-007AFF"></a>
-  <a href="LICENSE"><img alt="MIT 许可证" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <a href="LICENSE"><img alt="原始源码采用 MIT 许可证" src="https://img.shields.io/badge/original_source-MIT-blue"></a>
   <a href="macapp/BUILDING.md"><img alt="macOS 14 或更高版本" src="https://img.shields.io/badge/macOS-14%2B-222222"></a>
 </p>
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
@@ -14,9 +14,9 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/app-dark.png">
-  <img alt="主屏幕整理编辑器：App 图标、小组件、App 资源库和使用情况" src="docs/app-light.png" width="1200">
+  <img alt="屏幕整理编辑器：App 图标、小组件、App 资源库和使用情况" src="docs/app-light.png" width="1200">
 </picture>
-<p align="center"><sub>界面截图来自 Jonathan Kats 的上游 <a href="https://github.com/kats1123/homescreen-mcp">Homescreen 项目</a>。</sub></p>
+<p align="center"><sub>使用合成布局展示当前编辑器。界面基于 Jonathan Kats 的上游 <a href="https://github.com/kats1123/homescreen-mcp">Homescreen 项目</a>。</sub></p>
 
 ## 可以做什么
 
@@ -40,7 +40,7 @@
 | Intel | `home-screen-organizer-<version>-macos-x86_64.dmg` |
 | 支持 MCPB 的客户端 | `home-screen-organizer-<version>-macos.mcpb` — 包含两种架构；[安装指南](docs/MCP.zh-CN.md#standalone-mcpb) |
 
-打开 DMG，将 <strong>Home Screen Organizer（主屏幕整理）</strong>拖入 <strong>Applications（应用程序）</strong>。也可选择 ZIP 压缩包。App 已包含 Python 引擎和依赖，需要 <strong>macOS 14 或更高版本</strong>。
+打开 DMG，将 <strong>Screen Organizer（屏幕整理）</strong>拖入 <strong>Applications（应用程序）</strong>。也可选择 ZIP 压缩包。App 已包含 Python 引擎和依赖，需要 <strong>macOS 14 或更高版本</strong>。
 
 App 使用 <strong>ad-hoc 签名</strong>。若 macOS 要求批准，请在 <strong>系统设置 → 隐私与安全性 → 仍要打开</strong>中允许，然后重新启动。
 
@@ -56,7 +56,7 @@ shasum -a 256 --check --ignore-missing SHA256SUMS.txt
 
 ## 快速开始
 
-1. 打开主屏幕整理，通过 USB 连接并解锁 iPhone 或 iPad；出现提示时，轻点 <strong>信任</strong>。
+1. 打开屏幕整理，选择语言，将协议滚动至末尾并勾选同意。每次启动都会显示协议；拒绝后 App 退出。通过 USB 连接并解锁 iPhone 或 iPad，出现提示时轻点 <strong>信任</strong>。
 2. 选择设备，点击 <strong>Read（读取）</strong>，从当前布局创建草稿。
 3. 拖动项目或选择排序操作，清空 <strong>App Bank 暂存区</strong>，再检查布局差异。
 4. <strong>应用前：</strong>在设备上取消隐藏主屏幕页面（长按主屏幕后轻点页面圆点），并在编辑器中重新建立需要的空位。选择 <strong>Review & Apply（审阅并应用）</strong>，保存备份、写入草稿并回读核对。
@@ -86,13 +86,15 @@ HOMESCREEN_READ_ONLY=1 .venv/bin/home-screen-organizer ui
 
 ## 使用 MCP 助手
 
-在 Mac App 中选择 <strong>Device（设备）→ MCP</strong>，复制启动命令或 <strong>Codex、Cursor、Claude、VS Code / Copilot</strong> 配置。复制的配置默认以只读模式启动。
+打开 App 的 <strong>MCP 配置</strong>，通过原生客户端面板注册或更新 <strong>Codex、Claude Code</strong>，或复制适用于 <strong>Cursor、Claude Desktop、VS Code / Copilot</strong> 及其他 stdio 客户端的设置。新注册默认只读；高级设置展示并导出所选访问模式。配置状态、启动检查与实时连接状态分别显示。
 
 任何本地 stdio MCP 客户端都可以启动 App 内置引擎：
 
 ```sh
-HOMESCREEN_READ_ONLY=1 '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+HOMESCREEN_READ_ONLY=1 '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
+
+从旧名称升级或移动 App 后，请在 MCP 配置中选择<strong>更新</strong>，或修改客户端的可执行文件路径。发行文件名、命令与已保存的数据保持兼容。
 
 源码安装使用 `.venv/bin/home-screen-mcp`。可让助手“按颜色整理 App”或“生成将最常用 App 放到第一页的草稿”。应用前检查 `diff` 与预览。
 
@@ -105,6 +107,7 @@ HOMESCREEN_READ_ONLY=1 '/Applications/Home Screen Organizer.app/Contents/Resourc
 ## 开发与深入了解
 
 - [源码安装、原生构建与发行](macapp/BUILDING.md)
+- [提交或新增翻译](docs/TRANSLATING.md) — 英语、简体中文、繁體中文、西班牙语、德语、法语、俄语和葡萄牙语共用语言目录。
 - [USB 协议、小组件、空位与使用估算](docs/HOW-IT-WORKS.md)
 - [本地编辑器会话与 API](docs/LOCAL-EDITOR.md)
 - [布局模式与诊断](docs/COMPATIBILITY.md)
@@ -116,19 +119,19 @@ HOMESCREEN_READ_ONLY=1 '/Applications/Home Screen Organizer.app/Contents/Resourc
 
 <strong>Jonathan Kats</strong> 创建了 Homescreen。原始 App、编辑器、截图和 SpringBoard 研究来自[上游项目](https://github.com/kats1123/homescreen-mcp)及其贡献者。本 fork 维护设备会话、备份、本地编辑器、Mac 启动器与发行流程。感谢 [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 提供 USB 接口。
 
-[MIT](LICENSE) · Copyright © 2026 Jonathan Kats。保留原始许可证与版权声明。
+Homescreen 原始源码采用 [MIT 许可证](LICENSE)。Copyright © 2026 Jonathan Kats。随附的 Python 引擎按 GPL 第 3 版或更高版本分发。发行版附有各组件的许可证、对应源码和重新构建说明。[下载对应源码](https://github.com/worldsavepoint/ios-homescreen-organizer/releases/download/v1.3.0/home-screen-organizer-1.3.0-corresponding-source.tar.gz)。
 
 [反馈本 fork 的问题](https://github.com/worldsavepoint/ios-homescreen-organizer/issues)时，请附安装方式、复现步骤及脱敏后的错误信息。[上游源码](https://github.com/kats1123/homescreen-mcp) · [上游问题反馈](https://github.com/kats1123/homescreen-mcp/issues) · [上游发行版](https://github.com/kats1123/homescreen-mcp/releases)。
 
 ## 免责声明
 
-Home Screen Organizer 与 Apple Inc. 无关联，未获其认可或赞助。
+Screen Organizer 与 Apple Inc. 无关联，未获其认可或赞助。
 
 Mac、macOS、iPhone、iPad 和 Screen Time 是 Apple Inc. 的商标。IOS 是 Cisco 在美国及其他国家或地区的商标或注册商标，由 Apple 经许可使用。
 
-本工具使用的私有设备接口可能随 iOS 更新而变化。应用或恢复布局前会保存主屏幕布局备份，并尝试通过回读核对结果。请另行保留 iPhone 或 iPad 最新的完整备份。使用风险由使用者自行承担；软件依据 [MIT 许可证](LICENSE)按原样（AS IS）提供。
+本工具使用的私有设备接口可能随 iOS 更新而变化。应用或恢复布局前会保存主屏幕布局备份，并尝试通过回读核对结果。请另行保留 iPhone 或 iPad 最新的完整备份。适用的担保条款见随附的许可证。
 
 <p align="center">
   <sub>README 访问计数</sub><br>
-  <a href="https://github.com/journey-ad/Moe-Counter"><img src="https://count.moeyy.cn/@worldsavepoint.homescreen?theme=gelbooru&amp;padding=7&amp;scale=0.7&amp;darkmode=auto" alt="Home Screen Organizer README 访问计数 — Moe Counter" width="320"></a>
+  <a href="https://github.com/journey-ad/Moe-Counter"><img src="https://count.moeyy.cn/@worldsavepoint.homescreen?theme=gelbooru&amp;padding=7&amp;scale=0.7&amp;darkmode=auto" alt="Screen Organizer README 访问计数 — Moe Counter" width="320"></a>
 </p>

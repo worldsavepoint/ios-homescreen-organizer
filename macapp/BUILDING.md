@@ -1,4 +1,4 @@
-# Building Home Screen Organizer
+# Building Screen Organizer
 
 [README](../README.md) · [中文 README](../README.zh-CN.md) · [MCP client setup](../docs/MCP.md) · [Protocol and data sources](../docs/HOW-IT-WORKS.md)
 
@@ -71,7 +71,7 @@ builds use Python 3.12 with architecture-specific, hash-checked dependencies.
 ## Intel dependencies
 
 Use a native Intel Mac with Python 3.12. Install Xcode command line tools
-(`clang`, `make`, `lipo` and `otool`), `curl`, Perl and `rustup`, then run:
+(`clang`, `make`, `lipo` and `otool`), Perl and `rustup`, then run:
 
 ```sh
 bash macapp/prepare_intel.sh python3.12 "$PWD/build/dependencies/x86_64"
@@ -88,12 +88,12 @@ The other dependency versions match the arm64 pins.
 - `OUTPUT_DIR/requirements-build.lock`: a complete, hashed Intel wheel lock,
   including the locally built cryptography wheel's hash.
 - `OUTPUT_DIR/wheels/`: the compiled cryptography wheel used by `--find-links`.
-- `OUTPUT_DIR/OPENSSL-LICENSE.txt`: the verified OpenSSL license included in the Intel app.
+- `OUTPUT_DIR/OPENSSL-LICENSE.txt`: the standalone OpenSSL build notice. The Intel app embeds the matching grant from the authenticated `ThirdPartyLicenses/native/openssl/4.0.3/openssl-4.0.3/LICENSE.txt` captured during its freeze.
 
 The committed `requirements-build-x86_64.lock` contains the Intel wheel and
 build-tool pins; `requirements-cryptography-x86_64.lock` pins the cryptography
 source archive and its hash. The generated lock combines these inputs with the
-compiled wheel. Keep the generated lock and wheel together for installation.
+compiled wheel. Keep the generated directory together for reuse. Its private build-path record associates the wheel and lock with the original compilation directories.
 
 ## Building the app
 
@@ -104,15 +104,35 @@ macapp/build.sh
 `macapp/build.sh` selects `arm64` or `x86_64` from `uname -m`. Set
 `HOMESCREEN_BUILD_ARCH=arm64` or `HOMESCREEN_BUILD_ARCH=x86_64` to select the
 matching native host architecture explicitly. `HOMESCREEN_BUILD_PYTHON` selects
-the Python 3.12 executable.
+a previously extracted, verified release Python executable. The default downloads and checks the pinned native CPython distribution.
 
-The script creates a fresh temporary virtual environment, installs wheels from
+The release script exports the clean Git commit into a private build directory, creates a fresh temporary virtual environment, installs wheels from
 the architecture's hashed lock, adds the local source, and rebuilds the Python
-engine and Swift launcher. On Intel, it calls `prepare_intel.sh` when
-`build/dependencies/x86_64/requirements-build.lock` is missing. The app bundle
-includes `dependencies.txt` (the installed package inventory), the installed
-`requirements-build.lock`, and the MIT license. Intel bundles also include the
+engine and Swift launcher. On Intel, it calls `prepare_intel.sh` when the recorded
+Intel wheel or generated lock needs preparation. The app bundle
+includes `dependencies.txt` (the installed package inventory), its release wheel lock, the original MIT license, and the combined engine’s distribution notice and upstream license texts. Intel bundles also include the
 cryptography source lock and `OPENSSL-LICENSE.txt`.
+
+## Language resources
+
+Run `python3.12 tools/check_translations.py` with Node.js installed before building.
+The build copies every manifest-registered shared catalog to
+`Screen Organizer.app/Contents/Resources/Localization`, generates each language’s
+`<code>.lproj/InfoPlist.strings` from `app.name`, and sets `CFBundleLocalizations`
+from the same manifest. Native consent can therefore load translations before
+starting the engine. English and other non-Chinese display names are **Screen
+Organizer**; Chinese names are **屏幕整理** and **螢幕整理**.
+
+Verify a completed or extracted app against the current source catalogs:
+
+```sh
+python3.12 macapp/release.py check-localization --app 'build/arm64/Screen Organizer.app'
+```
+
+Follow the [translation contribution guide](../docs/TRANSLATING.md) to add a
+language. Runtime menus and packaging follow the manifest; CI validates catalog
+coverage, placeholders and both native packages. The standalone MCPB retains the
+engine’s web catalogs and stable `server/<arch>/` layout.
 
 ## Updating dependencies
 
@@ -164,26 +184,25 @@ a native Intel Mac. Use a fresh virtual environment for each release build.
 
 ## Signing and build outputs
 
-The build script applies **ad-hoc signing** (`codesign --sign -`) to the app and
+The build script strips the Swift executable’s debug symbols and applies **ad-hoc signing** (`codesign --sign -`) to the app and
 native engine. The standalone MCPB preserves the native signatures and is unsigned
 as an outer archive. Release checksums cover the complete downloaded files.
 
 The Swift package includes a request/URL validation harness. A full `build.sh` run
-creates `build/<arch>/Home Screen Organizer.app` and
+creates `build/<arch>/Screen Organizer.app` and
 `build/<arch>/home-screen-organizer-<version>.dmg`, where `<arch>` is `arm64`
-or `x86_64`. Install and launch the resulting app as a separate step.
+or `x86_64`. Install and launch the resulting app as a separate step. After replacing an older app, update the engine path in **MCP Setup** or your client configuration. Release asset basenames and all existing public identifiers stay unchanged.
 
 ## Release archives
 
-After `macapp/build.sh`, assemble the distributable files:
+The build stages the native DMG, ZIP and checksum manifest in `build/release/<arch>`. It checks ZIP members, nested archives, plists and frozen Python modules for local build paths. It mounts the disk image read-only and compares its signed app with the extracted ZIP before installing the verified archives. Verify the resulting files:
 
 ```sh
-python3.12 macapp/release.py package --arch "$(uname -m)"
 cd "build/release/$(uname -m)"
 shasum -a 256 --check SHA256SUMS.txt
 ```
 
-The package command checks the bundle version and architecture, preserves executable
+To recreate the archives from a completed build, use the locked build environment and run `.venv/bin/python macapp/release.py package --arch "$(uname -m)"`. The package command checks the bundle version and architecture, checks the staged ZIP against the locations recorded alongside the app build, preserves executable
 permissions in the ZIP, and produces the following in `build/release/<arch>/`:
 
 - `home-screen-organizer-<version>-macos-<arch>.dmg`
@@ -201,10 +220,11 @@ For end-user installation and per-client stdio configuration, see the
 [MCP setup guide](../docs/MCP.md#standalone-mcpb).
 
 The standalone `home-screen-organizer-<version>-macos.mcpb` contains both native
-engines, their bundled dependencies, the MIT license and per-architecture license
-and dependency records. It requires macOS 14 or later. An MCPB-compatible client
+engines, their dependencies, the original MIT license and the complete per-architecture notice trees. The combined engine is distributed under GPL version 3 or later. It requires macOS 14 or later. An MCPB-compatible client
 can install this archive directly; Python and a separate app installation are not
-required. The launcher selects `arm64` or `x86_64` from the Mac's native architecture.
+required. The launcher selects `arm64` or `x86_64` using the architecture reported
+to its process. An Intel client running under Rosetta on Apple silicon launches the
+`x86_64` engine.
 
 MCPB stdio configuration runs `/bin/sh` with the extracted `server/launch.sh`.
 The manifest configures `HOMESCREEN_READ_ONLY=1`; the launcher defaults to that value
@@ -221,8 +241,6 @@ To assemble a bundle from the two downloaded native Actions artifacts:
 python3.12 macapp/release.py collect --input-dir artifacts --output-dir release
 python3.12 macapp/mcp_bundle.py --assets-dir release --output-dir release \
   --repository worldsavepoint/ios-homescreen-organizer
-python3.12 macapp/release.py verify --input-dir release \
-  --repository worldsavepoint/ios-homescreen-organizer
 ```
 
 `artifacts/` must contain the `home-screen-organizer-macos-arm64` and
@@ -237,7 +255,10 @@ The output adds these files beside the four native archives:
 - `home-screen-organizer-<version>-macos.mcpb`
 - `server.json`, identifying `io.github.worldsavepoint/home-screen-organizer` and
   the exact versioned GitHub MCPB URL and SHA256.
-- `SHA256SUMS.txt`, covering all four native archives, the MCPB and `server.json`.
+- `SHA256SUMS.txt`, covering the native archives, MCPB and Registry metadata.
+
+The source assembly step below adds the versioned Corresponding Source archive
+and its digest to the shared checksum manifest.
 
 To check a locally extracted bundle on the matching native Mac:
 
@@ -246,8 +267,24 @@ ditto -x -k release/home-screen-organizer-<version>-macos.mcpb extracted-mcpb
 python3.12 macapp/check_mcp.py -- /bin/sh "$PWD/extracted-mcpb/server/launch.sh"
 ```
 
-The check initializes the server and lists tools with a startup deadline and a
-fresh temporary read-only data directory, then terminates the server.
+The check initializes the server, compares its version with the project version, and lists tools using a temporary layout fixture, read-only data directory and startup deadline. It then terminates the server.
+
+## Corresponding Source
+
+The AVIF source pins use the official libaom 3.14.1 and libwebp 1.6.0 release archives. The libyuv snapshot comes from the fixed-commit GitHub mirror; `macapp/sources/native.json` records its primary Chromium repository and commit separately from that download URL. The pinned libaom and libyuv inputs retain the upstream file contents and executable bits, and the libwebp release supplies the matching C sources, build inputs and grants with its generated Autotools files.
+
+The app includes `THIRD-PARTY-NOTICES.txt` and `ThirdPartyLicenses/` in its Resources directory. The MCPB includes the same explanatory notice at its root and copies each signed notice tree to `licenses/<architecture>/ThirdPartyLicenses/`. The original source remains available under Jonathan Kats’s MIT license.
+
+Each native build writes `build/<architecture>/source-inputs.zip` alongside the build directory’s app. CI uploads these sanitized inputs in separate architecture artifacts. A canonical source inventory is included in the signed app and copied into the MCPB. After both native builds and MCPB assembly, create the single matching source download with the exact clean checkout:
+
+```sh
+VERSION=$(python3.12 macapp/release.py version)
+COMMIT=$(git rev-parse HEAD)
+python3.12 macapp/source_archive.py assemble --inputs artifacts --release release --version "$VERSION" --commit "$COMMIT" --repository worldsavepoint/ios-homescreen-organizer
+python3.12 macapp/release.py verify --input-dir release --tag "v$VERSION" --commit "$COMMIT" --repository worldsavepoint/ios-homescreen-organizer
+```
+
+`HOMESCREEN_SOURCE_CACHE` selects a directory for SHA-verified immutable downloads. `HOMESCREEN_WHEELHOUSE` selects an existing local wheelhouse verified against the release lock. Updated dependency versions require new source hashes, notice checks and a freeze on each native architecture. Chardet uses its publisher’s pure-Python wheel. Rebuilding an editable component, preparing Cargo for offline use and replacing the pylzss shared library are described in the [source archive guide](SOURCE.md).
 
 ## Automatic releases
 
@@ -272,8 +309,9 @@ To publish a new version:
 1. Set `project.version` in `pyproject.toml` to the new SemVer release version.
 2. Merge the contribution into `main`, or push its matching `v<version>` tag.
 3. After both native builds and standalone MCPB checks pass, CI publishes both
-   DMGs, both ZIPs, the dual-architecture MCPB, `server.json` and the shared
-   `SHA256SUMS.txt` in a GitHub release targeted at the exact built commit.
+   DMGs, both ZIPs, the dual-architecture MCPB, the Corresponding Source archive,
+   `server.json` and the shared `SHA256SUMS.txt` in a GitHub release targeted
+   at the exact built commit.
 4. A following job validates and publishes the released `server.json` to the
    official MCP Registry using GitHub OIDC authentication.
 

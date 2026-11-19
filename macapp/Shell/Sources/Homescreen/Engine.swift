@@ -1,34 +1,48 @@
 import Foundation
+import Combine
 
 /// Runs the bundled engine (Contents/Resources/engine/engine) as a child process serving the
 /// editor on a free localhost port, and stops it when the app quits.
 @MainActor
 final class Engine: ObservableObject {
+    struct Failure: Equatable {
+        let key: String
+        var parameters: [String: String] = [:]
+        var details: String = ""
+    }
     enum State: Equatable {
         case starting
         case ready(URL)
-        case failed(String)
+        case failed(Failure)
     }
 
     @Published private(set) var state: State = .starting
     private var process: Process?
     private var log = Data()
+    private let executableURL: URL
+    private let environment: [String: String]
 
-    static var executable: URL {
+    init(executableURL: URL = Engine.executable, environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.executableURL = executableURL
+        self.environment = environment
+    }
+
+    nonisolated static var executable: URL {
         Bundle.main.resourceURL!.appendingPathComponent("engine/engine")
     }
 
-    static var dataFolder: URL {
+    nonisolated static var dataFolder: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/homescreen-mcp")
     }
 
-    func start() {
+    func start(consent: LaunchConsent) {
+        guard consent.accepted else { return }
         stop()
         state = .starting
         log = Data()
-        guard FileManager.default.isExecutableFile(atPath: Self.executable.path) else {
-            state = .failed("The engine is missing from the app bundle (\(Self.executable.path)).")
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            state = .failed(Failure(key: "native.engineMissing", parameters: ["path": executableURL.path]))
             return
         }
         let port: Int
@@ -41,13 +55,13 @@ final class Engine: ObservableObject {
             healthSecret = try EngineSecurity.makeToken()
             challenge = try EngineSecurity.makeToken()
         } catch {
-            state = .failed("Couldn't prepare the local engine: \(error.localizedDescription)")
+            state = .failed(Failure(key: "native.prepareError", details: error.localizedDescription))
             return
         }
         let p = Process()
-        p.executableURL = Self.executable
+        p.executableURL = executableURL
         p.arguments = ["ui", "--port", String(port), "--no-browser"]
-        var env = ProcessInfo.processInfo.environment
+        var env = environment
         env["HOMESCREEN_APP"] = "1"
         env["HOMESCREEN_UI_TOKEN"] = token
         env["HOMESCREEN_HEALTH_SECRET"] = healthSecret
@@ -65,13 +79,13 @@ final class Engine: ObservableObject {
                 guard let self, self.process === proc else { return }
                 self.process = nil
                 let tail = String(decoding: self.log.suffix(4000), as: UTF8.self)
-                self.state = .failed("The engine stopped (exit \(proc.terminationStatus)).\n\n\(tail)")
+                self.state = .failed(Failure(key: "native.engineStopped", parameters: ["status": String(proc.terminationStatus)], details: tail))
             }
         }
         do {
             try p.run()
         } catch {
-            state = .failed("Couldn't start the engine: \(error.localizedDescription)")
+            state = .failed(Failure(key: "native.launchError", details: error.localizedDescription))
             return
         }
         process = p
@@ -103,15 +117,14 @@ final class Engine: ObservableObject {
                     return
                 }
                 stop()
-                state = .failed("The local server failed authentication. Restart Home Screen Organizer to try again.")
+                state = .failed(Failure(key: "native.authenticationFailed"))
                 return
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         if process === p {
             stop()
-            state = .failed("The engine didn't start within a minute.\n\n"
-                            + String(decoding: log.suffix(4000), as: UTF8.self))
+            state = .failed(Failure(key: "native.engineTimeout", details: String(decoding: log.suffix(4000), as: UTF8.self)))
         }
     }
 

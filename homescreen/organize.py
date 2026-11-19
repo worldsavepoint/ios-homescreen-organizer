@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .model import Layout, LayoutError, Node
+from .private_store import ensure_private_directory, open_private_directory, open_private_file
 
 COLOR_ORDER = ["red", "orange", "yellow", "green", "teal", "blue", "purple", "pink",
                "white", "gray", "black", "unknown"]
@@ -30,14 +30,16 @@ def pack(lay: Layout, items: list[Node], start_page: int = 0) -> None:
     lay.unpin_pages(start_page)
     kept = lay.pages[:start_page]
     pages: list[list[Node]] = [[]]
-    used = 0
+    uniform = True
     for n in items:
-        if used + n.slots > lay.page_slots and pages[-1]:
+        single = lay.dims(n) == (1, 1)
+        if pages[-1] and ((len(pages[-1]) >= lay.grid.slots) if uniform and single
+                         else lay.place([*pages[-1], n])[1]):
             pages.append([])
-            used = 0
+            uniform = True
         pages[-1].append(n)
-        used += n.slots
-    lay.pages = kept + [p for p in pages if p]
+        uniform = uniform and single
+    lay.repack_pages(kept + [p for p in pages if p])
 
 
 def _split(lay: Layout, keep_first_page: bool) -> tuple[int, list[Node], list[Node]]:
@@ -46,6 +48,11 @@ def _split(lay: Layout, keep_first_page: bool) -> tuple[int, list[Node], list[No
     fixed = [n for n in nodes if n.kind in ("widget", "folder")]
     loose = [n for n in nodes if n.kind in ("app", "webclip", "other")]
     return start, fixed, loose
+
+
+def color_ids(lay: Layout, keep_first_page: bool) -> list[str]:
+    _, _, loose = _split(lay, keep_first_page)
+    return [node.id for node in loose if node.bundle_id]
 
 
 def by_color(lay: Layout, colors: dict[str, dict[str, Any]], keep_first_page: bool = True) -> None:
@@ -68,8 +75,9 @@ def alphabetical(lay: Layout, keep_first_page: bool = True, folders_first: bool 
 
 def sort_folder_contents(lay: Layout) -> None:
     """A-Z inside every folder, refilled in full folder pages."""
+    placed = {x.id for p in lay.pages for x in p} | {x.id for x in lay.dock}
     for n in list(lay.nodes.values()):
-        if n.kind == "folder" and n.id in {x.id for p in lay.pages for x in p} | {x.id for x in lay.dock}:
+        if n.kind == "folder" and n.id in placed:
             items = sorted((c for p in n.children for c in p), key=lambda c: c.name.lower())
             lay.refold(n, items)
 
@@ -83,7 +91,7 @@ def into_folders(lay: Layout, groups: dict[str, list[str]], keep_first_page: boo
     existing = {n.name.lower(): n for p in lay.pages for n in p if n.kind == "folder"}
     filed: dict[str, list[str]] = {}
     for name, ids in groups.items():
-        ids = [i for i in ids if i in allowed]
+        ids = [i for i in dict.fromkeys(ids) if i in allowed]
         folder = existing.get(name.lower())
         if folder is None and len(ids) < min_size:
             continue
@@ -97,13 +105,12 @@ def into_folders(lay: Layout, groups: dict[str, list[str]], keep_first_page: boo
             folder = lay.get(fid)
             existing[name.lower()] = folder
         else:
-            for i in ids:
-                page = folder.children[-1] if folder.children else None
-                if page is None or len(page) >= lay.grid.folder:
-                    folder.children.append([])
-                lay.move(i, f"{folder.id}:{len(folder.children)}")
-        filed[folder.name] = [lay.nodes[i].name for i in ids]
-    lay.pages = [p for p in lay.pages if p] or [[]]  # filing can empty a page
+            lay.move_many(ids, folder.id)
+        filed.setdefault(folder.name, []).extend(lay.nodes[i].name for i in ids)
+        allowed.difference_update(ids)
+    lay.remove_empty_pages()
+    if not lay.pages:
+        lay.insert_page(1)
     return {"filed": filed, "count": sum(len(v) for v in filed.values())}
 
 
@@ -115,35 +122,30 @@ LOOKUP = "https://itunes.apple.com/lookup?"
 def fetch_categories(bundle_ids: list[str], cache: Path, country: str = "us") -> dict[str, str]:
     """Primary App Store genre per bundle id, via Apple's public lookup API. Only bundle ids are
     sent. Results (and misses, as "") are cached so each id is asked about once."""
-    cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    cache.parent.chmod(0o700)
-    try:
-        fd = os.open(cache, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        known: dict[str, str] = {}
-    else:
-        with os.fdopen(fd) as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            known = json.load(stream)
-    todo = [b for b in bundle_ids if b not in known and not b.startswith("com.apple.")]
-    for i in range(0, len(todo), 100):
-        chunk = todo[i:i + 100]
-        url = LOOKUP + urllib.parse.urlencode({"bundleId": ",".join(chunk), "country": country, "entity": "software"})
-        with urllib.request.urlopen(url, timeout=20) as r:
-            data = json.load(r)
-        found = {res.get("bundleId"): res.get("primaryGenreName", "") for res in data.get("results", [])}
-        for b in chunk:
-            known[b] = found.get(b, "")
-    for b in bundle_ids:
-        if b.startswith("com.apple.") and b not in known:
-            known[b] = "Apple"
-    fd, temporary = tempfile.mkstemp(prefix=".categories-", dir=cache.parent)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            stream.write(json.dumps(known, indent=1, sort_keys=True))
-        os.replace(temporary, cache)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    from .session import _private_replace
+    bundle_ids = list(dict.fromkeys(bundle_ids))
+    ensure_private_directory(cache.parent)
+    with open_private_directory(cache.parent) as directory:
+        try:
+            fd = open_private_file(cache.parent, cache, directory_fd=directory)
+        except FileNotFoundError:
+            known: dict[str, str] = {}
+        else:
+            with os.fdopen(fd) as stream:
+                known = json.load(stream)
+        todo = [b for b in bundle_ids if b not in known and not b.startswith("com.apple.")]
+        for i in range(0, len(todo), 100):
+            chunk = todo[i:i + 100]
+            url = LOOKUP + urllib.parse.urlencode({"bundleId": ",".join(chunk), "country": country, "entity": "software"})
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = json.load(r)
+            found = {res.get("bundleId"): res.get("primaryGenreName", "") for res in data.get("results", [])}
+            for b in chunk:
+                known[b] = found.get(b, "")
+        for b in bundle_ids:
+            if b.startswith("com.apple.") and b not in known:
+                known[b] = "Apple"
+        _private_replace(cache, json.dumps(known, indent=1, sort_keys=True).encode(), directory_fd=directory)
     return {b: known.get(b, "") for b in bundle_ids}
 
 
@@ -152,8 +154,8 @@ def category_groups(lay: Layout, categories: dict[str, str], keep_first_page: bo
     groups: dict[str, list[str]] = {}
     for p in lay.pages[start:]:
         for n in p:
-            if n.kind == "app" and categories.get(n.id):
-                groups.setdefault(categories[n.id], []).append(n.id)
+            if n.kind == "app" and categories.get(n.bundle_id):
+                groups.setdefault(categories[n.bundle_id], []).append(n.id)
     return groups
 
 

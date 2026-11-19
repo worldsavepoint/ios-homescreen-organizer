@@ -1,4 +1,4 @@
-"""Entry point of the engine bundled inside Home Screen Organizer.app.
+"""Entry point of the engine bundled inside Screen Organizer.app.
 
     engine ui --port N --no-browser   the editor's local server (the app starts this)
     engine mcp                        the MCP server, for AI assistants

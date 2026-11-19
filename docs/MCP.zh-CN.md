@@ -2,22 +2,26 @@
 
 [README](../README.zh-CN.md) · [English](MCP.md) · [工作原理](HOW-IT-WORKS.md)
 
-Home Screen Organizer（主屏幕整理）提供本地 <strong>stdio MCP 服务器</strong>，支持查看布局、编辑草稿、排序、预览和备份。客户端在连接设备的 Mac 上启动进程，无需 HTTP 地址或 API 密钥。
+Screen Organizer（屏幕整理）提供本地 <strong>stdio MCP 服务器</strong>，支持查看布局、编辑草稿、排序、预览和备份。客户端在连接设备的 Mac 上启动进程，无需 HTTP 地址或 API 密钥。
 
 ## 选择启动方式
 
 | 安装方式 | 可执行文件 | 参数 |
 | --- | --- | --- |
-| Applications 中的 Mac App | `/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine` | `mcp` |
+| Applications 中的 Mac App | `/Applications/Screen Organizer.app/Contents/Resources/engine/engine` | `mcp` |
 | [源码安装](../macapp/BUILDING.md#source-installation) | `/absolute/path/ios-homescreen-organizer/.venv/bin/home-screen-mcp` | 无 |
 | 独立 MCPB | 客户端管理的 `server/launch.sh` | 由清单管理 |
 
-客户端设置中使用可执行文件的绝对路径。若 App 安装在其他位置，请采用实际路径。Mac App 的 <strong>Device（设备）→ MCP</strong> 菜单可根据当前位置生成 <strong>Copy Launch Command</strong>、<strong>Copy Cursor / Claude JSON</strong>、<strong>Copy Codex TOML</strong> 和 <strong>Copy VS Code / Copilot JSON</strong>。所有复制的配置均设置 `HOMESCREEN_READ_ONLY=1`。
+同意启动协议后，打开 App 的<strong>MCP 配置</strong>。客户端面板检测 Codex 和 Claude Code，可注册、检查和更新此服务器。未找到客户端时，请按官方指南安装或在面板中选择可执行文件。默认模式为<strong>只读</strong>。注册时采用<strong>高级设置</strong>中选定的访问模式和现有的 <strong>stdio</strong> 引擎。
+
+<strong>高级设置</strong>显示当前引擎路径与访问模式，可复制启动命令、Cursor / Claude JSON、Codex TOML、VS Code JSON 或 Copilot JSON。导出内容采用所选模式；启用应用时设置 `HOMESCREEN_READ_ONLY=0` 与 `HOMESCREEN_ALLOW_APPLY=1`。配置状态表示已保存的注册；独立启动检查执行初始化与工具发现；实时连接状态来自客户端报告。
+
+客户端设置采用绝对路径。从旧 App 名称升级或移动 App 后，请在客户端面板选择<strong>更新</strong>，或将旧引擎路径改为 `/Applications/Screen Organizer.app/Contents/Resources/engine/engine`。包名、命令、服务器 ID、Registry 命名空间与数据目录保持兼容。<strong>设备 → MCP</strong>还提供只读配置快捷菜单。任何本地 stdio MCP 客户端都可采用下述设置；具体配置位置请参阅其官方指南。
 
 客户端负责启动并维护 stdio 进程。直接在终端运行时，进程等待 MCP 输入，不会打开编辑器：
 
 ```sh
-HOMESCREEN_READ_ONLY=1 '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+HOMESCREEN_READ_ONLY=1 '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
 
 源码安装使用：
@@ -30,7 +34,7 @@ HOMESCREEN_READ_ONLY=1 /absolute/path/ios-homescreen-organizer/.venv/bin/home-sc
 
 ## 客户端指南
 
-添加配置时保留已有服务器。修改后重启或重新连接客户端，并确认主屏幕整理的工具已出现。
+添加配置时保留已有服务器。修改后重启或重新连接客户端，并确认屏幕整理的工具已出现。
 
 <a id="codex"></a>
 
@@ -41,15 +45,16 @@ HOMESCREEN_READ_ONLY=1 /absolute/path/ios-homescreen-organizer/.venv/bin/home-sc
 
 ```sh
 codex mcp add ios-homescreen-mcp --env HOMESCREEN_READ_ONLY=1 -- \
-  '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+  '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
 
 或将以下内容添加到 `~/.codex/config.toml`：
 
 ```toml
 [mcp_servers.ios-homescreen-mcp]
-command = "/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine"
+command = "/Applications/Screen Organizer.app/Contents/Resources/engine/engine"
 args = ["mcp"]
+environment_id = "local"
 
 [mcp_servers.ios-homescreen-mcp.env]
 HOMESCREEN_READ_ONLY = "1"
@@ -70,7 +75,7 @@ HOMESCREEN_READ_ONLY = "1"
 {
   "mcpServers": {
     "ios-homescreen-mcp": {
-      "command": "/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine",
+      "command": "/Applications/Screen Organizer.app/Contents/Resources/engine/engine",
       "args": ["mcp"],
       "env": { "HOMESCREEN_READ_ONLY": "1" }
     }
@@ -82,7 +87,7 @@ Claude Code 可通过以下命令注册：
 
 ```sh
 claude mcp add --env HOMESCREEN_READ_ONLY=1 --transport stdio ios-homescreen-mcp -- \
-  '/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine' mcp
+  '/Applications/Screen Organizer.app/Contents/Resources/engine/engine' mcp
 ```
 
 源码安装将 `command` 改为 `.venv/bin/home-screen-mcp` 的绝对路径并省略 `args`；CLI 命令使用该文件且不附加 `mcp` 参数。参见 [Cursor MCP 配置](https://cursor.com/docs/mcp)、[Claude Desktop 本地服务器](https://modelcontextprotocol.io/docs/develop/connect-local-servers)和 [Claude Code MCP](https://code.claude.com/docs/en/mcp)。
@@ -94,14 +99,29 @@ claude mcp add --env HOMESCREEN_READ_ONLY=1 --transport stdio ios-homescreen-mcp
 <details>
 <summary><strong>VS Code / Copilot — 原生 MCP 配置</strong></summary>
 
-个人配置使用 `~/.copilot/mcp-config.json`；若已设置 `COPILOT_HOME`，使用 `$COPILOT_HOME/mcp-config.json`。工作区也可采用根目录中的 `.mcp.json`。
+在 VS Code 工作区的 `.vscode/mcp.json` 中添加服务器：
+
+```json
+{
+  "servers": {
+    "ios-homescreen-mcp": {
+      "type": "stdio",
+      "command": "/Applications/Screen Organizer.app/Contents/Resources/engine/engine",
+      "args": ["mcp"],
+      "env": { "HOMESCREEN_READ_ONLY": "1" }
+    }
+  }
+}
+```
+
+Copilot 个人配置使用 `~/.copilot/mcp-config.json`；若已设置 `COPILOT_HOME`，使用 `$COPILOT_HOME/mcp-config.json`。工作区也可采用根目录中的 `.mcp.json`。
 
 ```json
 {
   "mcpServers": {
     "ios-homescreen-mcp": {
       "type": "stdio",
-      "command": "/Applications/Home Screen Organizer.app/Contents/Resources/engine/engine",
+      "command": "/Applications/Screen Organizer.app/Contents/Resources/engine/engine",
       "args": ["mcp"],
       "env": { "HOMESCREEN_READ_ONLY": "1" },
       "tools": ["*"]
@@ -165,6 +185,8 @@ home-screen-organizer apply <apply_token>
 ```
 
 CLI 要求输入 `yes`，令牌取自最新的 `diff`。若需要助手写入，同时设置 <strong>`HOMESCREEN_READ_ONLY=0`</strong> 和 <strong>`HOMESCREEN_ALLOW_APPLY=1`</strong>，再重启服务器。工具说明要求用户明确提出写入请求；环境开关由服务器强制检查，不会额外弹出确认对话框。应用时检查令牌、校验草稿、刷新设备身份和布局、保存备份并核对回读。恢复时检查备份来源匹配。写入中断或结果不匹配后，请重新读取设备。
+
+从 1.2.1 起，恢复含固定位置的备份需要备份中保存的网格尺寸。可信且不含固定位置的旧版备份仍受支持。恢复时映射保存的位置坐标，并要求每个项目的占用范围都能放入当前读取的网格。
 
 <a id="distribution-and-discovery"></a>
 

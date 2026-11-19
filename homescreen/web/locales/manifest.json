@@ -1,0 +1,67 @@
+{
+  "default": "en",
+  "languages": [
+    {
+      "code": "en",
+      "name": "English",
+      "aliases": [
+        "en"
+      ]
+    },
+    {
+      "code": "zh-Hans",
+      "name": "简体中文",
+      "aliases": [
+        "zh",
+        "zh-Hans",
+        "zh-CN",
+        "zh-SG"
+      ]
+    },
+    {
+      "code": "zh-Hant",
+      "name": "繁體中文",
+      "aliases": [
+        "zh-Hant",
+        "zh-TW",
+        "zh-HK",
+        "zh-MO"
+      ]
+    },
+    {
+      "code": "es",
+      "name": "Español",
+      "aliases": [
+        "es"
+      ]
+    },
+    {
+      "code": "de",
+      "name": "Deutsch",
+      "aliases": [
+        "de"
+      ]
+    },
+    {
+      "code": "fr",
+      "name": "Français",
+      "aliases": [
+        "fr"
+      ]
+    },
+    {
+      "code": "ru",
+      "name": "Русский",
+      "aliases": [
+        "ru"
+      ]
+    },
+    {
+      "code": "pt",
+      "name": "Português",
+      "aliases": [
+        "pt"
+      ]
+    }
+  ]
+}

@@ -45,7 +45,7 @@ class MemorySource:
             self.state[1].reverse()
         return copy.deepcopy(self.state), None
 
-    async def write(self, state, library, pins=None):
+    async def write(self, state, library, pins=None, grid=None):
         self.io += 1
         self.writes += 1
         self.state = copy.deepcopy(state)
@@ -441,7 +441,7 @@ def test_backup_exclusive_creation_does_not_overwrite(tmp_path, monkeypatch):
 def test_backup_sync_failure_prevents_device_write(tmp_path, monkeypatch):
     session, source = loaded(tmp_path)
 
-    def sync_failure(path):
+    def sync_failure(path, **kwargs):
         raise OSError("synthetic storage error")
 
     monkeypatch.setattr("homescreen.session._sync_directory", sync_failure)
@@ -455,9 +455,9 @@ def test_first_backup_syncs_new_directory_ancestors(tmp_path, monkeypatch):
     synced = []
     original = __import__("homescreen.session", fromlist=["_sync_directory"])._sync_directory
 
-    def sync(path):
+    def sync(path, **kwargs):
         synced.append(path)
-        original(path)
+        original(path, **kwargs)
 
     monkeypatch.setattr("homescreen.session._sync_directory", sync)
     session._backup(source.state, None, "before-apply")

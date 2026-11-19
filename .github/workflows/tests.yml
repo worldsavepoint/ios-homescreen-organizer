@@ -1,4 +1,4 @@
-name: Home Screen Organizer
+name: Screen Organizer
 
 on:
   pull_request:
@@ -72,15 +72,20 @@ jobs:
           digest.update(b"abc")
           assert digest.finalize().hex() == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
           PYTHON
+      - name: Validate shared translation catalogs
+        run: .venv/bin/python tools/check_translations.py
       - name: Validate layouts, draft edits, backups and editor routes
         run: .venv/bin/python -m pytest -q tests
+      - name: Locate the release Python distribution
+        run: python macapp/native_sources.py --arch "$BUILD_ARCH" --destination "$RUNNER_TEMP/release-python"
       - name: Build and verify the Mac app
         env:
-          HOMESCREEN_BUILD_PYTHON: python
+          HOMESCREEN_BUILD_PYTHON: ${{ runner.temp }}/release-python/bin/python3.12
           HOMESCREEN_BUILD_ARCH: ${{ matrix.arch }}
         run: |
           macapp/build.sh
-          APP="$PWD/build/$BUILD_ARCH/Home Screen Organizer.app"
+          APP="$PWD/build/$BUILD_ARCH/Screen Organizer.app"
+          python macapp/release.py check-localization --app "$APP"
           "$APP/Contents/Resources/engine/engine" --help
           test -f "$APP/Contents/Resources/engine/_internal/homescreen/web/index.html"
           test -f "$APP/Contents/Resources/engine/_internal/homescreen/simulator_icon.m"
@@ -90,19 +95,29 @@ jobs:
           codesign --verify --deep --strict "$APP"
           hdiutil verify build/"$BUILD_ARCH"/home-screen-organizer-*.dmg
       - name: Check packaged MCP initialization and tools
-        run: python macapp/check_mcp.py -- "build/$BUILD_ARCH/Home Screen Organizer.app/Contents/Resources/engine/engine" mcp
-      - name: Assemble release archives and checksums
+        run: python macapp/check_mcp.py -- "build/$BUILD_ARCH/Screen Organizer.app/Contents/Resources/engine/engine" mcp
+      - name: Verify release archives and checksums
         run: |
-          python macapp/release.py package --arch "$BUILD_ARCH"
           ditto -x -k build/release/"$BUILD_ARCH"/home-screen-organizer-*-macos-"$BUILD_ARCH".zip "$RUNNER_TEMP/home-screen-organizer-archive"
-          codesign --verify --deep --strict "$RUNNER_TEMP/home-screen-organizer-archive/Home Screen Organizer.app"
+          python macapp/release.py check-localization --app "$RUNNER_TEMP/home-screen-organizer-archive/Screen Organizer.app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/home-screen-organizer-archive/Screen Organizer.app"
+          python macapp/check_mcp.py -- "$RUNNER_TEMP/home-screen-organizer-archive/Screen Organizer.app/Contents/Resources/engine/engine" mcp
           cd build/release/"$BUILD_ARCH"
           shasum -a 256 --check SHA256SUMS.txt
+      - name: Upload matching native source inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: home-screen-organizer-sources-${{ matrix.arch }}
+          path: build/${{ matrix.arch }}/source-inputs.zip
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload installable archives
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: home-screen-organizer-macos-${{ matrix.arch }}
           path: build/release/${{ matrix.arch }}/*
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
@@ -110,7 +125,7 @@ jobs:
     name: Assemble standalone MCP distribution
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -120,7 +135,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: home-screen-organizer-macos-*
+          pattern: home-screen-organizer-*
           path: artifacts
           merge-multiple: false
       - name: Verify native archives and assemble MCP bundle
@@ -130,6 +145,8 @@ jobs:
         run: |
           python macapp/release.py collect --tag "v$VERSION" --input-dir "$PWD/artifacts" --output-dir "$PWD/release"
           python macapp/mcp_bundle.py --assets-dir "$PWD/release" --output-dir "$PWD/release" --repository "$REPOSITORY"
+          python macapp/source_archive.py assemble --inputs "$PWD/artifacts" --release "$PWD/release" --version "$VERSION" --commit "$GITHUB_SHA" --repository "$REPOSITORY"
+          python macapp/release.py verify --tag "v$VERSION" --commit "$GITHUB_SHA" --repository "$REPOSITORY" --input-dir "$PWD/release"
           cd release
           sha256sum --check SHA256SUMS.txt
           python -m zipfile -e home-screen-organizer-*-macos.mcpb "$RUNNER_TEMP/mcpb-manifest"
@@ -147,6 +164,26 @@ jobs:
         with:
           name: home-screen-organizer-distribution
           path: release/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare MCP smoke artifact
+        env:
+          VERSION: ${{ needs.test.outputs.version }}
+        run: |
+          BUNDLE="home-screen-organizer-$VERSION-macos.mcpb"
+          SMOKE="$RUNNER_TEMP/mcp-smoke"
+          mkdir "$SMOKE"
+          awk -v name="$BUNDLE" '$2 == name && NF == 2 { print; count++ } END { if (count != 1) exit 1 }' release/SHA256SUMS.txt > "$SMOKE/SHA256SUMS.txt"
+          cp "release/$BUNDLE" "$SMOKE/$BUNDLE"
+          cd "$SMOKE"
+          shasum -a 256 --check SHA256SUMS.txt
+      - name: Upload MCP smoke artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: home-screen-organizer-mcp-smoke
+          path: ${{ runner.temp }}/mcp-smoke/*
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
@@ -174,7 +211,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: home-screen-organizer-distribution
+          name: home-screen-organizer-mcp-smoke
           path: release
       - name: Extract and initialize the native bundled engine
         run: |
@@ -183,6 +220,15 @@ jobs:
           shasum -a 256 --check SHA256SUMS.txt
           ditto -x -k home-screen-organizer-*-macos.mcpb "$RUNNER_TEMP/mcpb"
           cd ..
+          python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          source = Path("homescreen/web/locales")
+          target = Path(os.environ["RUNNER_TEMP"]) / "mcpb/server" / os.environ["BUILD_ARCH"] / "_internal/homescreen/web/locales"
+          manifest = json.loads((source / "manifest.json").read_text())
+          for name in ["manifest", *(item["code"] for item in manifest["languages"])]:
+              assert (target / f"{name}.json").read_bytes() == (source / f"{name}.json").read_bytes()
+          PYTHON
           lipo "$RUNNER_TEMP/mcpb/server/$BUILD_ARCH/engine" -verify_arch "$BUILD_ARCH"
           codesign --verify --deep --strict "$RUNNER_TEMP/mcpb/server/$BUILD_ARCH/engine"
           python macapp/check_mcp.py -- /bin/sh "$RUNNER_TEMP/mcpb/server/launch.sh"

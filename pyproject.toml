@@ -1,7 +1,7 @@
 [project]
 name = "home-screen-organizer"
-version = "1.2.0"
-description = "Arrange your iPhone Home Screen from your Mac: drag-and-drop app, CLI and MCP server. Keeps App Library apps in the App Library."
+version = "1.3.0"
+description = "Screen Organizer for iOS: arrange iPhone and iPad Home Screens from your Mac with a localized app, CLI and stdio MCP server."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -42,4 +42,4 @@ build-backend = "setuptools.build_meta"
 packages = ["homescreen"]
 
 [tool.setuptools.package-data]
-homescreen = ["web/*", "simulator_icon.m"]
+homescreen = ["web/*", "web/locales/*.json", "simulator_icon.m"]

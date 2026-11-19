@@ -21,17 +21,20 @@ def setup_binary(tmp_path_factory):
     folder = tmp_path_factory.mktemp("mcp-setup")
     harness = folder / "main.swift"
     harness.write_text('''import Foundation
-let setup = MCPSetup(executablePath: CommandLine.arguments[1])
+let mode: MCPAccessMode = CommandLine.arguments.count > 2 ? .applyEnabled : .readOnly
+let setup = MCPSetup(executablePath: CommandLine.arguments[1], mode: mode)
 let output = ["launch": setup.launchCommand,
               "json": setup.cursorClaudeJSON,
               "toml": setup.codexTOML,
-              "vscode": setup.vscodeJSON]
+              "vscode": setup.vscodeJSON,
+              "editor": setup.editorJSON,
+              "copilot": setup.copilotJSON]
 let data = try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
 print(String(decoding: data, as: UTF8.self))
 ''')
     binary = folder / "mcp-setup"
     result = subprocess.run(["swiftc", "-module-cache-path", str(folder / "modules"),
-                             str(source), str(harness), "-o", str(binary)],
+                             str(source), *[str(source.with_name(name)) for name in ("MCPClientManager.swift", "MCPSubprocess.swift", "MCPEntryStore.swift", "MCPRegistrationJournal.swift", "MCPJSON.swift")], str(harness), "-o", str(binary)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     return binary
@@ -53,7 +56,9 @@ def test_client_formats_preserve_engine_and_read_only_environment(setup_binary, 
     output = generate(setup_binary, executable)
     expected = {"command": executable, "args": ["mcp"], "env": {"HOMESCREEN_READ_ONLY": "1"}}
     assert json.loads(output["json"]) == {"mcpServers": {"ios-homescreen-mcp": expected}}
-    assert tomllib.loads(output["toml"]) == {"mcp_servers": {"ios-homescreen-mcp": expected}}
+    assert tomllib.loads(output["toml"]) == {"mcp_servers": {"ios-homescreen-mcp": {**expected,"environment_id":"local"}}}
+    assert json.loads(output["editor"]) == {"servers": {"ios-homescreen-mcp": {"type": "stdio", **expected}}}
+    assert output["copilot"] == output["vscode"]
     assert json.loads(output["vscode"]) == {
         "mcpServers": {"ios-homescreen-mcp": {"type": "stdio", "tools": ["*"], **expected}}
     }
@@ -71,6 +76,19 @@ print(json.dumps({"args": sys.argv[1:], "read_only": os.environ.get("HOMESCREEN_
                             env={**os.environ, "HOMESCREEN_READ_ONLY": "0"})
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"args": ["mcp"], "read_only": "1"}
+
+
+def test_apply_mode_exports_match_registration_environment(setup_binary):
+    result = subprocess.run([str(setup_binary), "/synthetic engine", "apply"], capture_output=True, text=True, check=True)
+    output = json.loads(result.stdout)
+    expected = {"HOMESCREEN_READ_ONLY": "0", "HOMESCREEN_ALLOW_APPLY": "1"}
+    assert json.loads(output["json"])["mcpServers"]["ios-homescreen-mcp"]["env"] == expected
+    assert json.loads(output["vscode"])["mcpServers"]["ios-homescreen-mcp"]["env"] == expected
+    assert json.loads(output["editor"])["servers"]["ios-homescreen-mcp"]["env"] == expected
+    assert json.loads(output["copilot"])["mcpServers"]["ios-homescreen-mcp"]["env"] == expected
+    codex = tomllib.loads(output["toml"])["mcp_servers"]["ios-homescreen-mcp"]
+    assert codex["env"] == expected and codex["environment_id"] == "local"
+    assert output["launch"] == "HOMESCREEN_READ_ONLY=0 HOMESCREEN_ALLOW_APPLY=1 '/synthetic engine' mcp"
 
 
 def test_public_command_names_keep_legacy_aliases():

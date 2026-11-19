@@ -40,8 +40,8 @@ bytestruct==0.2.0 --hash=sha256:ecec23ffd5f51b2f188276be83a8cb2a17910b746a0957a3
 certifi==2026.10.23 --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
 # cffi-2.1.1-cp312-cp312-macosx_11_0_arm64.whl
 cffi==2.1.1 --hash=sha256:f81b3b8f3d4e343550fa4baa0e479bba9f2d29ce9c2e9b51d1ce1718d7442fcf
-# chardet-7.7.0-cp312-cp312-macosx_11_0_arm64.whl
-chardet==7.7.0 --hash=sha256:7df40e5267a4e9952ecb39cc23109c389fca61fc27a6e807ec9ea894a41e83d7
+# chardet-7.7.0-py3-none-any.whl
+chardet @ https://files.pythonhosted.org/packages/cc/75/88a3eb36264375ff951bd2f9397c409727ab6aa6a18e1bd933851571d421/chardet-7.7.0-py3-none-any.whl --hash=sha256:11cf9b719ea3675a2a7d8a3071bbe4d7ea24b26bfe39a51588d515ddd05cacad
 # charset_normalizer-3.5.2-cp312-cp312-macosx_10_13_universal2.whl
 charset-normalizer==3.5.2 --hash=sha256:ed2a239c0ea213acc1908150a3037257083c7c083128f1a4cec2ec4b97dca491
 # click-8.5.1-py3-none-any.whl

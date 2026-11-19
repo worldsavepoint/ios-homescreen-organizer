@@ -40,13 +40,17 @@ async def run(args: argparse.Namespace) -> int:
         print(f"{d['items_moved']} items moved, pages {d['pages_before']} -> {d['pages_after']}.")
         if not _confirm("This writes the draft to the phone (a backup is saved first)."):
             return 1
-        _print(await s.apply(args.token))
+        result = await s.apply(args.token)
+        _print(result)
+        return 0 if result["ok"] else 1
     elif args.cmd == "backups":
         print("\n".join(s.backups()) or "no backups yet")
     elif args.cmd == "restore":
         if not _confirm(f"This writes backup {args.name} to the phone."):
             return 1
-        _print(await s.restore(args.name))
+        result = await s.restore(args.name)
+        _print(result)
+        return 0 if result["ok"] else 1
     elif args.cmd == "probe":
         # Dump the raw icon state in every format version, to learn what this iOS exposes
         # (e.g. whether App Library-only apps are marked somewhere).
@@ -87,7 +91,7 @@ def main() -> None:
     sub.add_parser("probe", help="dump raw icon state in every format version (read-only)")
     d = sub.add_parser("diagnose", help="read-only USB compatibility check; never pair or write layout")
     d.add_argument("--expected-version", help="stop before reading layout if iOS differs")
-    u = sub.add_parser("ui", help="open Home Screen Organizer in your browser")
+    u = sub.add_parser("ui", help="open Screen Organizer in your browser")
     u.add_argument("--port", type=int, default=8765)
     u.add_argument("--no-browser", action="store_true")
     args = p.parse_args()
@@ -97,6 +101,9 @@ def main() -> None:
         return
     try:
         sys.exit(asyncio.run(run(args)))
+    except PermissionError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
     except (LayoutError, ValueError, TimeoutError) as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(2)

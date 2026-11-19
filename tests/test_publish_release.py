@@ -18,15 +18,11 @@ def publish(tmp_path, state="", tag_target="", corrupt=False, tag="v1.2.0", api_
     version = tag.removeprefix("v")
     names = [f"home-screen-organizer-{version}-macos-{arch}.{extension}"
              for arch in ("arm64", "x86_64") for extension in ("dmg", "zip")]
-    names += [f"home-screen-organizer-{version}-macos.mcpb", "server.json"]
+    names += [f"home-screen-organizer-{version}-macos.mcpb", f"home-screen-organizer-{version}-corresponding-source.tar.gz", "server.json"]
     if omit_intel:
         names = [name for name in names if "x86_64" not in name]
-    for name in names:
-        (assets / name).write_bytes(b"release fixture")
-    (assets / "server.json").write_text(json.dumps({
-        "name": "io.github.worldsavepoint/home-screen-organizer", "version": version, "packages": [{
-            "registryType": "mcpb", "identifier": f"https://github.com/example/project/releases/download/{tag}/home-screen-organizer-{version}-macos.mcpb",
-            "fileSha256": hashlib.sha256(b"release fixture").hexdigest(), "transport": {"type": "stdio"}}]}))
+    from source_fixture import release_source
+    target = release_source(assets, version, tmp_path / "project")
     (assets / "SHA256SUMS.txt").write_text("".join(
         f"{hashlib.sha256((assets / name).read_bytes()).hexdigest()}  {name}\n" for name in names))
     if corrupt:
@@ -54,15 +50,11 @@ if args[0] == "api":
 ''')
     gh.chmod(0o755)
     scripts = tmp_path / "project/macapp"
-    scripts.mkdir(parents=True)
-    for name in ("publish_release.sh", "release.py"):
-        (scripts / name).write_bytes((ROOT / "macapp" / name).read_bytes())
-    (scripts.parent / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
     result = subprocess.run(["bash", str(scripts / SCRIPT.name), str(assets), str(notes)],
                             capture_output=True, text=True, env={
         **os.environ, "PATH": f"{binary}:{Path(sys.executable).parent}:{os.environ['PATH']}",
-        "GH_CALL_LOG": str(log), "RELEASE_STATE": state, "TAG_TARGET": tag_target,
-        "GH_REPO": "example/project", "RELEASE_TAG": tag, "RELEASE_TARGET": TARGET,
+        "GH_CALL_LOG": str(log), "RELEASE_STATE": state, "TAG_TARGET": target if tag_target == TARGET else tag_target,
+        "GH_REPO": "example/project", "RELEASE_TAG": tag, "RELEASE_TARGET": target,
         "API_ERROR": "1" if api_error else "0",
     })
     calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -74,12 +66,13 @@ def test_new_release_targets_built_commit(tmp_path):
     assert result.returncode == 0, result.stderr
     creation = next(args for args in calls if args[:2] == ["release", "create"])
     assert creation[2] == "v1.2.0"
-    assert creation[creation.index("--target") + 1] == TARGET
-    assert creation[-7:] == ["./home-screen-organizer-1.2.0-macos-arm64.dmg",
+    assert creation[creation.index("--title") + 1] == "Screen Organizer v1.2.0"
+    assert creation[creation.index("--target") + 1] == subprocess.check_output(["git", "-C", tmp_path / "project", "rev-parse", "HEAD"], text=True).strip()
+    assert creation[-8:] == ["./home-screen-organizer-1.2.0-macos-arm64.dmg",
                             "./home-screen-organizer-1.2.0-macos-arm64.zip",
                             "./home-screen-organizer-1.2.0-macos-x86_64.dmg",
                             "./home-screen-organizer-1.2.0-macos-x86_64.zip",
-                            "./home-screen-organizer-1.2.0-macos.mcpb", "server.json", "SHA256SUMS.txt"]
+                            "./home-screen-organizer-1.2.0-macos.mcpb", "./home-screen-organizer-1.2.0-corresponding-source.tar.gz", "server.json", "SHA256SUMS.txt"]
 
 
 def test_published_version_is_retained(tmp_path):
@@ -95,6 +88,7 @@ def test_existing_draft_uploads_assets_then_publishes(tmp_path):
     assert [args[1] for args in mutations] == ["upload", "edit"]
     assert "--clobber" in mutations[0]
     assert "--draft=false" in mutations[1]
+    assert mutations[1][mutations[1].index("--title") + 1] == "Screen Organizer v1.2.0"
 
 
 def test_tag_at_another_commit_requires_new_version(tmp_path):

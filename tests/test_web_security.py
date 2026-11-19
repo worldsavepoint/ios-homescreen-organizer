@@ -43,20 +43,20 @@ def test_public_assets_never_disclose_launch_token(web):
     assert "window.HS_TOKEN" not in client.get("/").text
 
 
-def test_bootstrap_creates_private_cookie_and_health_requires_header(web):
+def test_bootstrap_returns_editor_credential_and_health_requires_launch_header(web):
     ui, client = web
     assert client.get("/v1/health").status_code == 401
     assert client.post("/v1/authenticate").status_code == 401
     h = {"X-Token": ui.TOKEN, "Origin": "http://127.0.0.1:8765"}
     response = client.post("/v1/authenticate", headers=h)
     assert response.status_code == 200
-    cookie = response.headers["set-cookie"].lower()
-    assert "httponly" in cookie and "samesite=strict" in cookie and "path=/" in cookie
-    assert client.get("/api/state").status_code == 200
-    assert client.get("/v1/health").status_code == 401  # cookies cannot impersonate readiness
+    assert "set-cookie" not in response.headers
+    editor = {"X-Editor-Session": response.json()["credential"]}
+    assert client.get("/api/state", headers=editor).status_code == 200
+    assert client.get("/v1/health", headers=editor).status_code == 401
     assert client.get("/v1/health", headers=h).json() == {"app": "homescreen", "ready": True}
-    assert client.post("/api/read", headers={"Origin": "http://127.0.0.1:8765"}).json()["loaded"]
-    assert client.post("/api/read").status_code == 403  # cookie writes require same-origin proof
+    assert client.post("/api/read", json={"binding": ui.session().binding}, headers={**editor, "Origin": h["Origin"]}).json()["loaded"]
+    assert client.post("/api/read", headers=editor).status_code == 403
 
 
 @pytest.mark.parametrize("origin", ["https://evil.example", "null", "http://localhost:8765", "http://127.0.0.1:9999"])
@@ -100,7 +100,7 @@ def test_icons_are_limited_to_loaded_layout_including_widgets(web, monkeypatch):
     monkeypatch.setattr(ui.session(), "icon", icon)
     assert client.get("/icon?id=com.unknown.app", headers=h).status_code == 404
     assert calls == []
-    client.post("/api/read", headers=h)
+    client.post("/api/read", headers=h, json={"binding": ui.session().binding})
     lay = ui.session().require()
     widget = next(n for n in lay.nodes.values() if n.kind == "widget")
     widget.raw["elements"][0]["containerBundleIdentifier"] = "com.widget.actual-container"
@@ -116,7 +116,7 @@ def test_readonly_is_visible_and_write_routes_reject_before_session(web, monkeyp
     monkeypatch.setenv("HOMESCREEN_READ_ONLY", "1")
     h = {"X-Token": ui.TOKEN}
     assert client.get("/api/state", headers=h).json()["read_only"] is True
-    assert client.post("/api/read", headers=h).json()["read_only"] is True
+    assert client.post("/api/read", headers=h, json={"binding": ui.session().binding}).json()["read_only"] is True
     async def forbidden(*args):
         pytest.fail("read-only request reached a device write method")
     monkeypatch.setattr(ui.session(), "apply", forbidden)
@@ -129,14 +129,14 @@ def test_readonly_is_visible_and_write_routes_reject_before_session(web, monkeyp
 def test_preview_widget_size_cannot_inject_attributes(web, tmp_path):
     from homescreen import preview
     ui, client = web
-    client.post("/api/read", headers={"X-Token": ui.TOKEN})
+    client.post("/api/read", headers={"X-Token": ui.TOKEN}, json={"binding": ui.session().binding})
     lay = ui.session().require()
     widget = next(n for n in lay.nodes.values() if n.kind == "widget")
     widget.raw["gridSize"] = 'small" onclick="alert(1)'
     out = asyncio.run(preview.render(ui.session(), tmp_path / "preview.html", show_original=False))
     html = out.read_text()
     assert 'onclick="alert(1)' not in html
-    assert '<div class="widget w-small">' in html
+    assert '<div class="widget w-small" style="grid-row:' in html
 
 
 @pytest.mark.parametrize("path", ["/api/op", "/api/read", "/api/apply", "/api/device", "/api/restore"])
@@ -146,28 +146,34 @@ def test_operations_cannot_run_without_authentication(web, path):
 
 
 def test_cli_browser_receives_fragment_but_console_does_not(web, monkeypatch, capsys):
-    import sys
-    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlsplit
+    import uvicorn
     ui, _ = web
     opened = []
     monkeypatch.setattr(ui.config, "enable_device_switching", lambda: None)
-    monkeypatch.setattr(ui.threading, "Timer", lambda delay, fn, args: SimpleNamespace(start=lambda: opened.append(args[0])))
-    monkeypatch.setitem(sys.modules, "uvicorn", SimpleNamespace(run=lambda *a, **kw: None))
-    ui.main(port=8765)
-    assert opened == ["http://127.0.0.1:8765/#token=launch-test-secret"]
+    def receive(url):
+        parts = urlsplit(url)
+        opened.append((parts.hostname, parts.port, parse_qs(parts.fragment).get("token") == [ui.TOKEN]))
+    async def finish(server):
+        server.should_exit = True
+    monkeypatch.setattr(ui.webbrowser, "open", receive)
+    monkeypatch.setattr(uvicorn.Server, "main_loop", finish)
+    ui.main(port=0)
+    assert len(opened) == 1 and opened[0][0] == "127.0.0.1" and opened[0][1] > 0 and opened[0][2]
     assert ui.TOKEN not in capsys.readouterr().out
 
 
-def test_browser_cookie_cannot_authorize_foreign_origin_or_bootstrap(web):
+def test_editor_credential_requires_its_origin_and_bootstrap_requires_launch_token(web):
     ui, client = web
     own = {"Origin": "http://127.0.0.1:8765"}
-    client.post("/v1/authenticate", headers={**own, "X-Token": ui.TOKEN})
-    assert client.get("/api/state").status_code == 200
-    foreign = {"Origin": "http://localhost:8888"}
+    reply = client.post("/v1/authenticate", headers={**own, "X-Token": ui.TOKEN})
+    editor = {"X-Editor-Session": reply.json()["credential"]}
+    assert client.get("/api/state", headers=editor).status_code == 200
+    foreign = {**editor, "Origin": "http://localhost:8888"}
     assert client.get("/api/state", headers=foreign).status_code == 403
     assert client.post("/api/read", headers=foreign).status_code == 403
-    assert client.post("/v1/authenticate", headers=own).status_code == 401
-    assert client.get("/v1/health", headers=own).status_code == 401
+    assert client.post("/v1/authenticate", headers={**own, **editor}).status_code == 401
+    assert client.get("/v1/health", headers={**own, **editor}).status_code == 401
 
 
 @pytest.fixture
@@ -215,8 +221,9 @@ def test_ui_credentials_cannot_bypass_challenge_health_mode(challenged_web):
 @pytest.mark.parametrize("path", ["/v1/authenticate", "/api/auth"])
 def test_authenticate_keeps_canonical_and_legacy_routes(web, path):
     ui, client = web
-    assert client.post(path, headers={"X-Token": ui.TOKEN}).status_code == 200
-    assert client.get("/api/state").status_code == 200
+    reply = client.post(path, headers={"X-Token": ui.TOKEN})
+    assert reply.status_code == 200
+    assert client.get("/api/state", headers={"X-Editor-Session": reply.json()["credential"]}).status_code == 200
 
 
 @pytest.mark.parametrize("path", ["/v1/health", "/health"])
@@ -299,9 +306,11 @@ vm.runInNewContext(source + "\nauthentication.then(() => console.log(JSON.string
   URLSearchParams, console, calls,
   location: {hash: '#token=secret', pathname: '/', search: ''},
   history: {replaceState: (...args) => calls.push(['history', ...args])},
-  fetch: async (path, options) => {calls.push(['fetch', path, options.headers['X-Token']]); return {ok: true};},
+  fetch: async (path, options) => {calls.push(['fetch', path, options.headers['X-Token'] === 'secret']);
+    return {ok: true, json: async () => ({credential: 'editor-fixture'})};},
+  sessionStorage: {removeItem() {}, setItem: (key, value) => calls.push(['save', value === 'editor-fixture'])},
 });
 '''
     result = subprocess.run([executable, "-e", harness], input=json.dumps({"source": source}),
                             text=True, capture_output=True, check=True)
-    assert json.loads(result.stdout) == [["history", None, "", "/"], ["fetch", "/v1/authenticate", "secret"]]
+    assert json.loads(result.stdout) == [["history", None, "", "/"], ["fetch", "/v1/authenticate", True], ["save", True]]

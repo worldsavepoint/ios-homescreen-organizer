@@ -8,7 +8,8 @@ import subprocess
 from pathlib import Path
 
 from .device import FileSource, PhoneSource, SimSource, Source
-from .session import Session
+from .session import Session, _publish_exclusive, _private_replace
+from .private_store import ensure_private_directory, open_private_directory, open_private_file
 
 DATA = Path(os.environ.get("HOMESCREEN_DATA") or Path.home() / "Library/Application Support/homescreen-mcp")
 
@@ -42,30 +43,39 @@ _current: str | None = None
 LAST_DEVICE = DATA / "last-device.txt"
 
 
+def _read_private(path):
+    with os.fdopen(open_private_file(DATA, path), "rb") as stream:
+        return stream.read()
+
+
 def enable_device_switching() -> None:
     global _switching, _current
     if os.environ.get("HOMESCREEN_FIXTURE") or os.environ.get("HOMESCREEN_SIM") or os.environ.get("HOMESCREEN_UDID"):
         return  # a pinned source: nothing to switch between
+    ensure_private_directory(DATA)
     _switching = True
     _adopt_shared_draft()
-    if LAST_DEVICE.exists():
-        _current = LAST_DEVICE.read_text().strip() or None
+    try:
+        _current = _read_private(LAST_DEVICE).decode().strip() or None
+    except FileNotFoundError:
+        pass
 
 
 def _adopt_shared_draft() -> None:
     """Carry the single shared draft (CLI / older versions) over as its device's own draft."""
     import plistlib
-    import shutil
     shared = DATA / "draft.plist"
     try:
-        dev = plistlib.loads(shared.read_bytes()).get("device") if shared.exists() else None
+        data = _read_private(shared)
+        dev = plistlib.loads(data).get("device")
     except Exception:
         return
-    if dev and dev != "unselected":
+    if isinstance(dev, str) and dev and dev != "unselected":
         target = DATA / "drafts" / f"{''.join(c if c.isalnum() or c in '-._' else '_' for c in dev)}.plist"
-        if not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(shared, target)
+        try:
+            _publish_exclusive(target, data, root=DATA)
+        except FileExistsError:
+            pass
 
 
 def switching() -> bool:
@@ -78,35 +88,48 @@ def current_device() -> str | None:
 
 def select_device(udid: str) -> Session:
     global _current
+    ensure_private_directory(DATA)
+    selected = _device_session(udid) if _switching else session()
+    _private_replace(LAST_DEVICE, udid.encode(), root=DATA)
     _current = udid
-    DATA.mkdir(parents=True, exist_ok=True)
-    LAST_DEVICE.write_text(udid)
-    return session()
+    return selected
 
 
 def known_devices() -> dict[str, dict]:
     """Devices with a saved draft: {udid: {"name", "version", "model"}}."""
     import plistlib
+    ensure_private_directory(DATA)
     out = {}
-    for f in sorted((DATA / "drafts").glob("*.plist")) if (DATA / "drafts").exists() else []:
+    with open_private_directory(DATA, DATA / "drafts") as directory:
+        names = sorted(name for name in os.listdir(directory) if name.endswith(".plist"))
+    for name in names:
+        f = DATA / "drafts" / name
         try:
-            blob = plistlib.loads(f.read_bytes())
+            blob = plistlib.loads(_read_private(f))
         except Exception:
             continue
+        if not isinstance(blob, dict):
+            continue
+        device = blob.get("device")
         info = blob.get("info", {})
-        if blob.get("device"):
-            out[blob["device"]] = {"name": info.get("DeviceName"), "version": info.get("ProductVersion"),
-                                   "model": info.get("ProductType")}
+        if not isinstance(device, str) or not device or not isinstance(info, dict):
+            continue
+        out[device] = {"name": info.get("DeviceName"), "version": info.get("ProductVersion"),
+                       "model": info.get("ProductType")}
     return out
+
+
+def _device_session(device: str | None) -> Session:
+    key = device or ""
+    if key not in _sessions:
+        _sessions[key] = Session(PhoneSource(device), DATA, device=device or "unselected")
+    return _sessions[key]
 
 
 def session() -> Session:
     global _session
     if _switching:
-        key = _current or ""
-        if key not in _sessions:
-            _sessions[key] = Session(PhoneSource(_current), DATA, device=_current or "unselected")
-        return _sessions[key]
+        return _device_session(_current)
     if _session is None:
         _session = Session(make_source(), DATA)
     return _session

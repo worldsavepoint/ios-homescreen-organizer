@@ -68,6 +68,24 @@ enum NavigationPolicy {
     }
 }
 
+/// Only the active editor's main frame may request these two native UI actions.
+enum NativeBridge {
+    enum Action: Equatable { case openMCPSetup, setLanguage(String) }
+
+    static func action(_ body: Any, frameURL: URL?, isMainFrame: Bool, origin: URL) -> Action? {
+        guard isMainFrame, let frameURL,
+              NavigationPolicy.destination(frameURL, origin: origin) == .embedded,
+              let message = body as? [String: Any] else { return nil }
+        switch message["action"] as? String {
+        case "openMCPSetup": return .openMCPSetup
+        case "setLanguage":
+            guard let preference = message["preference"] as? String else { return nil }
+            return .setLanguage(preference)
+        default: return nil
+        }
+    }
+}
+
 /// Keep readiness checks on the chosen loopback origin.
 final class HealthSessionDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask,

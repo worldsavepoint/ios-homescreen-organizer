@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "macapp/mcp_bundle.py"
 VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
 BUNDLE = f"home-screen-organizer-{VERSION}-macos.mcpb"
-RESOURCES = "Home Screen Organizer.app/Contents/Resources/"
+RESOURCES = "Screen Organizer.app/Contents/Resources/"
 ENGINE = b'#!/bin/sh\nprintf \'%s\\n\' "$HOMESCREEN_READ_ONLY" "$@"\n'
 
 
@@ -34,18 +34,21 @@ def assets(tmp_path, extra=None):
         prefix = f"home-screen-organizer-{VERSION}-macos-{arch}"
         (folder / f"{prefix}.dmg").write_bytes(b"disk fixture")
         with zipfile.ZipFile(folder / f"{prefix}.zip", "w") as archive:
-            member(archive, "Home Screen Organizer.app/Contents/Info.plist", plistlib.dumps({
+            member(archive, "Screen Organizer.app/Contents/Info.plist", plistlib.dumps({
                 "CFBundleShortVersionString": VERSION, "HomeScreenOrganizerReleaseVersion": VERSION,
                 "HomeScreenOrganizerArchitecture": arch}))
             member(archive, RESOURCES + "engine/engine", ENGINE, stat.S_IFREG | 0o755)
             member(archive, RESOURCES + "engine/_internal/libsigned.dylib", b"signed native bytes\x00" + arch.encode(), stat.S_IFREG | 0o755)
             member(archive, RESOURCES + "engine/_internal/current", b"libsigned.dylib", stat.S_IFLNK | 0o777)
             member(archive, RESOURCES + "engine/_internal/example.dist-info/licenses/LICENSE", b"third party notice")
-            for name in ("LICENSE", "dependencies.txt", "requirements-build.lock"):
+            for name in ("LICENSE", "dependencies.txt", "requirements-build.lock", "THIRD-PARTY-NOTICES.txt", "SourceInventory.json",
+                         "ThirdPartyLicenses/components.json", "ThirdPartyLicenses/h11/LICENSE.txt"):
                 member(archive, RESOURCES + name, b"notice " + name.encode())
             if arch == "x86_64":
                 for name in ("OPENSSL-LICENSE.txt", "requirements-cryptography-x86_64.lock"):
                     member(archive, RESOURCES + name, b"Intel notice")
+            for catalog in (ROOT / "homescreen/web/locales").glob("*.json"):
+                member(archive, RESOURCES + "engine/_internal/homescreen/web/locales/" + catalog.name, catalog.read_bytes())
             if extra:
                 extra(archive, arch)
     checksum(folder)
@@ -82,12 +85,19 @@ def test_bundle_contains_both_signed_engines_modes_symlinks_and_notices(tmp_path
             assert archive.read(prefix + "_internal/example.dist-info/licenses/LICENSE") == b"third party notice"
             assert archive.read(f"licenses/{arch}/LICENSE") == b"notice LICENSE"
             assert archive.read(f"licenses/{arch}/dependencies.txt") == b"notice dependencies.txt"
+            for catalog in (ROOT / "homescreen/web/locales").glob("*.json"):
+                assert archive.read(prefix + "_internal/homescreen/web/locales/" + catalog.name) == catalog.read_bytes()
         assert archive.read("licenses/x86_64/OPENSSL-LICENSE.txt") == b"Intel notice"
+        assert archive.read("THIRD-PARTY-NOTICES.txt") == b"notice THIRD-PARTY-NOTICES.txt"
+        assert archive.read("licenses/arm64/ThirdPartyLicenses/h11/LICENSE.txt") == b"notice ThirdPartyLicenses/h11/LICENSE.txt"
         assert archive.read("LICENSE") == (ROOT / "LICENSE").read_bytes()
         assert stat.S_IMODE(archive.getinfo("server/launch.sh").external_attr >> 16) == 0o755
         manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["license"] == "GPL-3.0-or-later"
     assert manifest["manifest_version"] == "0.3"
     assert manifest["version"] == VERSION
+    assert manifest["name"] == "home-screen-organizer"
+    assert manifest["display_name"] == "Screen Organizer"
     assert manifest["author"]["name"] == "Jonathan Kats"
     assert manifest["server"] == {"type": "binary", "entry_point": "server/launch.sh", "mcp_config": {
         "command": "/bin/sh", "args": ["${__dirname}/server/launch.sh"], "env": {"HOMESCREEN_READ_ONLY": "1"}}}
@@ -96,7 +106,7 @@ def test_bundle_contains_both_signed_engines_modes_symlinks_and_notices(tmp_path
     assert server["$schema"] == "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
     assert server["name"] == "io.github.worldsavepoint/home-screen-organizer"
     assert server["version"] == VERSION
-    assert server["title"] == "Home Screen Organizer"
+    assert server["title"] == "Screen Organizer"
     assert server["packages"] == [{"registryType": "mcpb", "identifier":
         f"https://github.com/worldsavepoint/ios-homescreen-organizer/releases/download/v{VERSION}/{BUNDLE}",
         "fileSha256": hashlib.sha256((output / BUNDLE).read_bytes()).hexdigest(), "transport": {"type": "stdio"}}]
@@ -199,3 +209,99 @@ def test_dangling_or_cyclic_symlink_fails_before_output(tmp_path, target):
     result = assemble(folder, output)
     assert result.returncode != 0
     assert not output.exists()
+
+
+@pytest.mark.parametrize("target", [b"missing/../engine", b"engine/../engine"])
+def test_link_intermediate_components_require_directories(tmp_path, target):
+    folder = assets(tmp_path, lambda archive, arch: member(
+        archive, RESOURCES + "engine/invalid", target, stat.S_IFLNK | 0o777))
+    output = tmp_path / "distribution"
+    assert assemble(folder, output).returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("canonical,alias", [("X/Y", "x/y"), ("Caf\u00e9/Y", "Cafe\u0301/Y")])
+def test_link_alias_cannot_retarget_the_sibling_architecture(tmp_path, canonical, alias):
+    def graph(archive, arch):
+        prefix = RESOURCES + "engine/"
+        member(archive, prefix + "safe/z/", b"", stat.S_IFDIR | 0o755)
+        member(archive, prefix + canonical, b"../safe", stat.S_IFLNK | 0o777)
+        member(archive, prefix + "x86_64/engine", b"in-tree decoy")
+        member(archive, prefix + "escape", (alias + "/z/../../../x86_64/engine").encode(), stat.S_IFLNK | 0o777)
+    folder = assets(tmp_path, graph)
+    output = tmp_path / "distribution"
+    assert assemble(folder, output).returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("other", ["name", "NaMe", "Cafe\u0301"])
+def test_archive_alias_collisions_fail_before_output(tmp_path, other):
+    first = "Caf\u00e9" if other.startswith("Cafe") else "Name"
+    def collision(archive, arch):
+        member(archive, RESOURCES + "engine/" + first, b"first")
+        member(archive, RESOURCES + "engine/" + other, b"second")
+    folder = assets(tmp_path, collision)
+    output = tmp_path / "distribution"
+    assert assemble(folder, output).returncode != 0
+    assert not output.exists()
+
+
+def test_publish_checks_mcpb_members_against_signed_native_zips(tmp_path):
+    sys.path.insert(0, str(ROOT / "macapp"))
+    from mcp_bundle import verify_bundle
+    folder = assets(tmp_path)
+    output = tmp_path / "dist"
+    assert assemble(folder, output).returncode == 0
+    bundle = output / BUNDLE
+    verify_bundle(bundle, folder, VERSION, "worldsavepoint/ios-homescreen-organizer",
+                  (ROOT / "LICENSE").read_bytes(), (ROOT / "macapp/mcp_launcher.sh").read_bytes())
+    with zipfile.ZipFile(bundle, "a") as modified:
+        modified.writestr("server/arm64/unexpected.py", b"unexpected")
+    with pytest.raises(ValueError, match="bundle"):
+        verify_bundle(bundle, folder, VERSION, "worldsavepoint/ios-homescreen-organizer",
+                      (ROOT / "LICENSE").read_bytes(), (ROOT / "macapp/mcp_launcher.sh").read_bytes())
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "missing-row", "tampered"])
+def test_smoke_artifact_selects_only_the_verified_bundle_and_its_checksum(tmp_path, damage):
+    import re
+    import textwrap
+    workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+    assembly = workflow.split("\n  assemble:\n", 1)[1].split("\n  mcp-bundle:\n", 1)[0]
+    match = re.search(r"      - name: Prepare MCP smoke artifact\n(?P<step>.*?)(?=      - |\Z)", assembly, re.S)
+    assert match, "Assembly must prepare a separate verified smoke pair"
+    body = textwrap.dedent(match["step"].split("        run: |\n", 1)[1])
+    assert assembly.index("Validate official MCPB manifest") < match.start()
+    smoke_job = workflow.split("\n  mcp-bundle:\n", 1)[1].split("\n  release:\n", 1)[0]
+    publication = workflow.split("\n  release:\n", 1)[1].split("\n  registry:\n", 1)[0]
+    assert "name: home-screen-organizer-mcp-smoke" in smoke_job
+    assert "name: home-screen-organizer-distribution" not in smoke_job
+    assert "name: home-screen-organizer-distribution" in publication
+    for title in ("Upload complete distribution", "Upload MCP smoke artifact", "Upload installable archives", "Upload matching native source inputs"):
+        section = workflow.split("      - name: " + title + "\n", 1)[1].split("\n      - ", 1)[0].split("\n\n  ", 1)[0]
+        assert "compression-level: 0" in section
+    release = tmp_path / "release"
+    release.mkdir()
+    payloads = {BUNDLE: b"the verified bundle", BUNDLE + ".backup": b"decoy bundle", "corresponding-source.tar.gz": b"large source", "server.json": b"metadata"}
+    for name, data in payloads.items():
+        (release / name).write_bytes(data)
+    manifest = release / "SHA256SUMS.txt"
+    manifest.write_text("".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in payloads.items()
+                                 if damage != "missing-row" or name != BUNDLE))
+    original_manifest = manifest.read_bytes()
+    if damage == "missing":
+        (release / BUNDLE).unlink()
+    elif damage == "tampered":
+        (release / BUNDLE).write_bytes(b"different bytes")
+    temporary = tmp_path / "runner-temp"
+    temporary.mkdir()
+    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=tmp_path,
+                            env={**os.environ, "VERSION": VERSION, "RUNNER_TEMP": str(temporary)}, capture_output=True, text=True)
+    assert (result.returncode == 0) == (damage is None), result.stderr
+    assert manifest.read_bytes() == original_manifest
+    assert (release / "corresponding-source.tar.gz").read_bytes() == b"large source"
+    if damage is None:
+        staged = temporary / "mcp-smoke"
+        assert sorted(p.name for p in staged.iterdir()) == sorted([BUNDLE, "SHA256SUMS.txt"])
+        assert (staged / BUNDLE).read_bytes() == payloads[BUNDLE]
+        assert (staged / "SHA256SUMS.txt").read_text() == f"{hashlib.sha256(payloads[BUNDLE]).hexdigest()}  {BUNDLE}\n"

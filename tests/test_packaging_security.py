@@ -49,6 +49,73 @@ def test_category_cache_is_private_even_if_preexisting(tmp_path):
     assert cache.parent.stat().st_mode & 0o777 == 0o700
 
 
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_automatic_preview_preserves_aliased_user_document(tmp_path, monkeypatch, alias):
+    import asyncio
+    from homescreen import server
+    from homescreen.session import Session
+    from test_integrity import MemorySource
+    source = MemorySource()
+    session = Session(source, tmp_path / "data")
+    asyncio.run(session.read())
+    async def no_icon(_):
+        return None
+    monkeypatch.setattr(session, "icon", no_icon)
+    monkeypatch.setattr(server, "session", lambda: session)
+    monkeypatch.setattr(server, "DATA", session.dir)
+    monkeypatch.setenv("HOMESCREEN_READ_ONLY", "1")
+    output = session.dir / "preview.html"
+    assert asyncio.run(server.render_preview())["path"] == str(output)
+    assert output.read_text().startswith("<!doctype html>")
+    output.unlink()
+    outside = tmp_path / "document.txt"
+    outside.write_bytes(b"retain user document\n")
+    outside.chmod(0o640)
+    if alias == "symlink":
+        output.symlink_to(outside)
+        with pytest.raises((OSError, PermissionError)):
+            asyncio.run(server.render_preview())
+    else:
+        os.link(outside, output)
+        assert asyncio.run(server.render_preview())["path"] == str(output)
+        assert output.stat().st_ino != outside.stat().st_ino
+    assert outside.read_bytes() == b"retain user document\n"
+    assert outside.stat().st_mode & 0o777 == 0o640
+    assert source.writes == 0
+
+
+def test_category_cache_refresh_preserves_outside_hardlink_mode(tmp_path):
+    cache = tmp_path / "cache" / "categories.json"
+    cache.parent.mkdir(mode=0o700)
+    outside = tmp_path / "user.json"
+    outside.write_text('{"com.apple.test":"Apple"}')
+    outside.chmod(0o640)
+    os.link(outside, cache)
+    assert fetch_categories(["com.apple.test"], cache) == {"com.apple.test": "Apple"}
+    assert outside.stat().st_mode & 0o777 == 0o640
+    assert outside.read_text() == '{"com.apple.test":"Apple"}'
+    assert cache.stat().st_ino != outside.stat().st_ino
+    assert cache.stat().st_mode & 0o777 == 0o600
+
+
+def test_category_lookup_retains_directory_across_parent_replacement(tmp_path, monkeypatch):
+    import json
+    from homescreen import organize
+    cache = tmp_path / "cache" / "categories.json"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original = cache.parent.with_name("retained")
+    def response(*args, **kwargs):
+        cache.parent.rename(original)
+        cache.parent.symlink_to(outside, target_is_directory=True)
+        return io.BytesIO(json.dumps({"results": [{"bundleId": "synthetic.app", "primaryGenreName": "Work"}]}).encode())
+    monkeypatch.setattr(organize.urllib.request, "urlopen", response)
+    assert fetch_categories(["synthetic.app"], cache) == {"synthetic.app": "Work"}
+    assert list(outside.iterdir()) == []
+    assert json.loads((original / cache.name).read_bytes()) == {"synthetic.app": "Work"}
+    assert (original / cache.name).stat().st_mode & 0o777 == 0o600
+
+
 @pytest.mark.skipif(shutil.which("swiftc") is None, reason="Swift compiler unavailable")
 def test_swift_backend_authentication_and_navigation(tmp_path):
     # This harness runs only pure request/URL validation, never the app or a server.
@@ -104,6 +171,11 @@ def test_build_recreates_environment_and_requires_locked_hashes(tmp_path):
     uname.chmod(0o755)
     fake_python = fake_bin / "python3.12"
     fake_python.write_text('''#!/bin/zsh
+if [[ "$1" == */source_checkout.py ]]; then
+  mkdir -p "$3/macapp"
+  print -r -- "0123456789012345678901234567890123456789"
+  exit 0
+fi
 if [[ "$1" != "-m" || "$2" != "venv" ]]; then exit 80; fi
 mkdir -p "$3/bin"
 cat > "$3/bin/python" <<'SCRIPT'
@@ -116,7 +188,8 @@ chmod +x "$3/bin/python"
     fake_python.chmod(0o755)
     result = subprocess.run(["zsh", str(ROOT / "macapp/build.sh")], capture_output=True, text=True,
                             env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                                 "HOMESCREEN_BUILD_VENV": str(build_venv), "HOMESCREEN_BUILD_ARCH": "arm64", "COMMAND_LOG": str(log)})
+                                 "HOMESCREEN_BUILD_VENV": str(build_venv), "HOMESCREEN_BUILD_PYTHON": str(fake_python),
+                                 "HOMESCREEN_BUILD_ARCH": "arm64", "COMMAND_LOG": str(log)})
     assert result.returncode == 79, result.stdout + result.stderr
     install = log.read_text()
     assert "--require-hashes" in install
