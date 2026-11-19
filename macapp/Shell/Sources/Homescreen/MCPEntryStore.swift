@@ -292,7 +292,7 @@ struct MCPEntryStore {
 
     private func initialize(_ io: inout MCPChildIO) throws {
         try io.send(["id": 1, "method": "initialize", "params": ["clientInfo": [
-            "name": "screen_organizer", "title": "Screen Organizer", "version": "1.3.0"]]])
+            "name": "screen_organizer", "title": "Screen Organizer", "version": "1.3.1"]]])
         let handshake = try io.receive(1, mcp: false)
         guard handshake["userAgent"] is String else { throw MCPClientOperationCode.unsupportedClient }
         try io.send(["method": "initialized", "params": [:]])
